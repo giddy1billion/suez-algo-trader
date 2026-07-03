@@ -1,6 +1,7 @@
 """
 Telegram Bot — Full management interface via aiogram 3.x.
 Provides interactive controls, real-time alerts, and portfolio management.
+ALL settings configurable in real-time via Telegram.
 
 Commands:
     /start       - Welcome + status overview
@@ -19,10 +20,16 @@ Commands:
     /resume      - Resume bot trading
     /strategy    - Show/switch active strategy
     /risk        - Show risk parameters
+    /config      - View all settings (e.g., /config risk)
+    /set         - Universal setter (e.g., /set momentum_fast_ema 8)
     /setrisk     - Set risk param (e.g., /setrisk max_daily_loss_pct 0.05)
     /setstrategy - Switch strategy (momentum|mean_reversion|ml)
     /setsymbols  - Change symbols (e.g., /setsymbols AAPL,TSLA,BTC/USD)
     /setinterval - Change cycle interval (e.g., /setinterval 120)
+    /settf       - Change timeframe (e.g., /settf 15Min)
+    /setlookback - Change lookback (e.g., /setlookback 500)
+    /setauto     - Configure automation (e.g., /setauto train 12)
+    /setnotify   - Toggle alerts (e.g., /setnotify signal on)
     /backtest    - Backtrader backtest (e.g., /backtest AAPL 30)
     /backtestvbt - VectorBT backtest (e.g., /backtestvbt AAPL 30)
     /sweep       - Parameter sweep (e.g., /sweep TSLA 60)
@@ -69,6 +76,9 @@ _runtime_changes = {
     "risk_updates": {},         # dict: risk param updates (e.g., {"max_daily_loss_pct": 0.03})
     "trigger_backtest": False,  # bool: run backtest next cycle
     "trigger_train": False,     # bool: trigger ML retraining
+    "timeframe": None,          # str: new timeframe
+    "lookback": None,           # int: new lookback bars
+    "config_updates": {},       # dict: general settings updates
 }
 _runtime_lock = threading.Lock()
 
@@ -87,6 +97,10 @@ def get_runtime_changes() -> dict:
         _runtime_changes["risk_updates"] = {}
         _runtime_changes["trigger_backtest"] = False
         _runtime_changes["trigger_train"] = False
+        _runtime_changes["timeframe"] = None
+        _runtime_changes["lookback"] = None
+        _runtime_changes["config_updates"] = {}
+        return changes
         return changes
 
 
@@ -166,10 +180,16 @@ async def cmd_help(message: Message):
         "/strategy - View active strategy\n"
         "/risk - View risk parameters\n\n"
         "<b>Configuration:</b>\n"
+        "/config [category] - View all settings\n"
+        "/set PARAM VALUE - Change any setting\n"
         "/setrisk PARAM VALUE - Set risk param\n"
         "/setstrategy NAME - Switch strategy\n"
         "/setsymbols SYM1,SYM2 - Change symbols\n"
-        "/setinterval SECS - Change cycle interval\n\n"
+        "/setinterval SECS - Change cycle interval\n"
+        "/settf TIMEFRAME - Change timeframe\n"
+        "/setlookback BARS - Change lookback\n"
+        "/setauto TYPE HOURS - Configure automation\n"
+        "/setnotify TYPE on|off - Toggle alerts\n\n"
         "<b>Backtesting & ML:</b>\n"
         "/backtest [SYMBOL] [DAYS] - Backtrader backtest\n"
         "/backtestvbt [SYMBOL] [DAYS] - VectorBT backtest\n"
@@ -673,6 +693,456 @@ async def cmd_setinterval(message: Message):
         _runtime_changes["interval"] = new_interval
 
     await message.answer(f"Interval change requested: {new_interval}s\nWill take effect on next cycle.")
+
+
+@router.message(Command("config"))
+async def cmd_config(message: Message):
+    """Show all current configuration, grouped by category.
+    Usage: /config [category]
+    Categories: risk, strategy, ml, auto, notify, all
+    """
+    if not _is_authorized(message):
+        return
+
+    from config.settings import settings
+
+    parts = message.text.split()
+    category = parts[1].lower() if len(parts) > 1 else "all"
+
+    sections = {}
+
+    sections["strategy"] = (
+        f"<b>📊 Strategy</b>\n"
+        f"  Active:    {settings.active_strategy}\n"
+        f"  Symbols:   {settings.trading_symbols}\n"
+        f"  Timeframe: {settings.timeframe}\n"
+        f"  Lookback:  {settings.lookback_bars} bars\n"
+        f"  Interval:  {settings.trading_interval}s\n"
+    )
+
+    sections["risk"] = (
+        f"<b>🛡️ Risk</b>\n"
+        f"  Max risk/trade:   {settings.max_position_size_pct:.0%}\n"
+        f"  Daily loss limit: {settings.max_daily_loss_pct:.0%}\n"
+        f"  Max exposure:     {settings.max_portfolio_exposure:.0%}\n"
+        f"  Max single stock: {settings.max_single_stock_pct:.0%}\n"
+        f"  Max leverage:     {settings.max_leverage:.1f}x\n"
+        f"  Stop-loss:        {settings.default_stop_loss_pct:.0%}\n"
+        f"  Take-profit:      {settings.default_take_profit_pct:.0%}\n"
+        f"  Max positions:    {settings.max_open_positions}\n"
+        f"  Max orders/day:   {settings.max_orders_per_day}\n"
+    )
+
+    sections["momentum"] = (
+        f"<b>📈 Momentum Params</b>\n"
+        f"  Fast EMA:       {settings.momentum_fast_ema}\n"
+        f"  Slow EMA:       {settings.momentum_slow_ema}\n"
+        f"  RSI Period:     {settings.momentum_rsi_period}\n"
+        f"  RSI Oversold:   {settings.momentum_rsi_oversold}\n"
+        f"  RSI Overbought: {settings.momentum_rsi_overbought}\n"
+        f"  ATR Period:     {settings.momentum_atr_period}\n"
+        f"  ATR SL Mult:    {settings.momentum_atr_sl_mult}x\n"
+        f"  ATR TP Mult:    {settings.momentum_atr_tp_mult}x\n"
+    )
+
+    sections["ml"] = (
+        f"<b>🧠 ML</b>\n"
+        f"  Model Path:     {settings.ml_model_path}\n"
+        f"  Retrain Every:  {settings.ml_retrain_interval_hours}h\n"
+        f"  Min Confidence: {settings.ml_min_confidence:.0%}\n"
+    )
+
+    sections["auto"] = (
+        f"<b>⚙️ Automation</b>\n"
+        f"  Auto-backtest: every {settings.auto_backtest_interval_hours}h {'(disabled)' if settings.auto_backtest_interval_hours == 0 else ''}\n"
+        f"  Auto-train:    every {settings.auto_train_interval_hours}h {'(disabled)' if settings.auto_train_interval_hours == 0 else ''}\n"
+        f"  Auto-sweep:    every {settings.auto_sweep_interval_hours}h {'(disabled)' if settings.auto_sweep_interval_hours == 0 else ''}\n"
+        f"  Train bars:    {settings.auto_train_bars}\n"
+    )
+
+    sections["notify"] = (
+        f"<b>🔔 Notifications</b>\n"
+        f"  On trade:  {'✅' if settings.notify_on_trade else '❌'}\n"
+        f"  On error:  {'✅' if settings.notify_on_error else '❌'}\n"
+        f"  On signal: {'✅' if settings.notify_on_signal else '❌'}\n"
+    )
+
+    if category == "all":
+        text = "\n".join(sections.values())
+    elif category in sections:
+        text = sections[category]
+    else:
+        text = (
+            f"Unknown category: {category}\n\n"
+            f"<b>Available:</b> strategy, risk, momentum, ml, auto, notify, all"
+        )
+
+    await message.answer(text, parse_mode=ParseMode.HTML)
+
+
+@router.message(Command("set"))
+async def cmd_set(message: Message):
+    """Universal config setter — change any setting in real-time.
+    Usage: /set PARAM VALUE
+
+    Examples:
+        /set timeframe 15Min
+        /set lookback 500
+        /set momentum_fast_ema 8
+        /set momentum_slow_ema 21
+        /set ml_min_confidence 0.70
+        /set auto_backtest_interval_hours 3
+        /set notify_on_signal true
+        /set max_daily_loss_pct 0.03
+    """
+    if not _is_authorized(message):
+        return
+
+    from config.settings import settings
+
+    parts = message.text.split(maxsplit=2)
+    if len(parts) < 3:
+        await message.answer(
+            "<b>Usage:</b> /set PARAM VALUE\n\n"
+            "<b>Examples:</b>\n"
+            "  /set timeframe 15Min\n"
+            "  /set lookback 500\n"
+            "  /set momentum_fast_ema 8\n"
+            "  /set momentum_slow_ema 21\n"
+            "  /set ml_min_confidence 0.70\n"
+            "  /set auto_backtest_interval_hours 3\n"
+            "  /set auto_train_interval_hours 12\n"
+            "  /set notify_on_signal true\n"
+            "  /set max_daily_loss_pct 0.03\n"
+            "  /set default_stop_loss_pct 0.04\n\n"
+            "Use /config to see all current values.",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    param = parts[1].lower()
+    raw_value = parts[2].strip()
+
+    # --- Map of all settable parameters ---
+    # These are the settings fields that can be changed at runtime
+    SETTABLE_PARAMS = {
+        # Trading Loop
+        "timeframe": {"type": "choice", "choices": ["1Min", "5Min", "15Min", "30Min", "1Hour", "4Hour", "1Day"]},
+        "lookback": {"type": "int", "min": 50, "max": 5000, "field": "lookback_bars"},
+        "interval": {"type": "int", "min": 10, "max": 3600, "field": "trading_interval"},
+        # Momentum
+        "momentum_fast_ema": {"type": "int", "min": 2, "max": 100},
+        "momentum_slow_ema": {"type": "int", "min": 5, "max": 500},
+        "momentum_rsi_period": {"type": "int", "min": 2, "max": 100},
+        "momentum_rsi_oversold": {"type": "int", "min": 5, "max": 50},
+        "momentum_rsi_overbought": {"type": "int", "min": 50, "max": 95},
+        "momentum_atr_period": {"type": "int", "min": 2, "max": 100},
+        "momentum_atr_sl_mult": {"type": "float", "min": 0.5, "max": 10.0},
+        "momentum_atr_tp_mult": {"type": "float", "min": 0.5, "max": 20.0},
+        # Mean Reversion
+        "mean_rev_bb_period": {"type": "int", "min": 5, "max": 100},
+        "mean_rev_bb_std": {"type": "float", "min": 0.5, "max": 5.0},
+        "mean_rev_zscore_entry": {"type": "float", "min": 0.5, "max": 5.0},
+        "mean_rev_zscore_exit": {"type": "float", "min": 0.0, "max": 3.0},
+        "mean_rev_rsi_period": {"type": "int", "min": 2, "max": 100},
+        # ML
+        "ml_min_confidence": {"type": "float", "min": 0.3, "max": 0.99},
+        "ml_retrain_interval_hours": {"type": "int", "min": 1, "max": 168},
+        # Risk
+        "max_position_size_pct": {"type": "float", "min": 0.001, "max": 1.0},
+        "max_daily_loss_pct": {"type": "float", "min": 0.005, "max": 1.0},
+        "max_portfolio_exposure": {"type": "float", "min": 0.1, "max": 2.0},
+        "max_single_stock_pct": {"type": "float", "min": 0.01, "max": 1.0},
+        "max_leverage": {"type": "float", "min": 0.1, "max": 10.0},
+        "max_open_positions": {"type": "int", "min": 1, "max": 200},
+        "max_orders_per_day": {"type": "int", "min": 1, "max": 1000},
+        "max_correlated_positions": {"type": "int", "min": 1, "max": 20},
+        "default_stop_loss_pct": {"type": "float", "min": 0.005, "max": 0.5},
+        "default_take_profit_pct": {"type": "float", "min": 0.005, "max": 1.0},
+        # Automation
+        "auto_backtest_interval_hours": {"type": "int", "min": 0, "max": 168},
+        "auto_train_interval_hours": {"type": "int", "min": 0, "max": 168},
+        "auto_sweep_interval_hours": {"type": "int", "min": 0, "max": 168},
+        "auto_train_bars": {"type": "int", "min": 100, "max": 10000},
+        # Notifications
+        "notify_on_trade": {"type": "bool"},
+        "notify_on_error": {"type": "bool"},
+        "notify_on_signal": {"type": "bool"},
+        # Backtest
+        "backtest_initial_cash": {"type": "float", "min": 100, "max": 10000000},
+        "backtest_commission_pct": {"type": "float", "min": 0.0, "max": 0.1},
+        "backtest_slippage_pct": {"type": "float", "min": 0.0, "max": 0.1},
+    }
+
+    if param not in SETTABLE_PARAMS:
+        # Check partial matches
+        matches = [p for p in SETTABLE_PARAMS if param in p]
+        if matches:
+            await message.answer(
+                f"Unknown param: <code>{param}</code>\n\nDid you mean:\n" +
+                "\n".join(f"  <code>{m}</code>" for m in matches[:10]),
+                parse_mode=ParseMode.HTML
+            )
+        else:
+            await message.answer(f"Unknown param: <code>{param}</code>\nUse /config to see all params.", parse_mode=ParseMode.HTML)
+        return
+
+    spec = SETTABLE_PARAMS[param]
+    field_name = spec.get("field", param)
+
+    # Parse & validate value
+    try:
+        if spec["type"] == "int":
+            value = int(raw_value)
+            if value < spec["min"] or value > spec["max"]:
+                await message.answer(f"Value must be between {spec['min']} and {spec['max']}.")
+                return
+        elif spec["type"] == "float":
+            value = float(raw_value)
+            if value < spec["min"] or value > spec["max"]:
+                await message.answer(f"Value must be between {spec['min']} and {spec['max']}.")
+                return
+        elif spec["type"] == "bool":
+            value = raw_value.lower() in ("true", "1", "yes", "on")
+        elif spec["type"] == "choice":
+            if raw_value not in spec["choices"]:
+                await message.answer(f"Invalid value. Choose from: {', '.join(spec['choices'])}")
+                return
+            value = raw_value
+        else:
+            value = raw_value
+    except ValueError:
+        await message.answer(f"Invalid value for {param}. Expected type: {spec['type']}")
+        return
+
+    # Get old value
+    old_value = getattr(settings, field_name, "?")
+
+    # Apply to settings object directly (in-memory)
+    try:
+        setattr(settings, field_name, value)
+    except Exception as e:
+        await message.answer(f"Failed to set: {e}")
+        return
+
+    # Also apply to risk manager if it's a risk param
+    risk_params = {
+        "max_position_size_pct", "max_daily_loss_pct", "max_portfolio_exposure",
+        "max_single_stock_pct", "max_leverage", "default_stop_loss_pct",
+        "default_take_profit_pct", "max_open_positions", "max_orders_per_day",
+        "max_correlated_positions",
+    }
+    if field_name in risk_params and _risk_manager:
+        if hasattr(_risk_manager.limits, field_name):
+            setattr(_risk_manager.limits, field_name, value)
+
+    # Signal main loop for params that need strategy rebuild
+    rebuild_params = {
+        "timeframe", "lookback_bars", "momentum_fast_ema", "momentum_slow_ema",
+        "momentum_rsi_period", "momentum_rsi_oversold", "momentum_rsi_overbought",
+        "momentum_atr_period", "momentum_atr_sl_mult", "momentum_atr_tp_mult",
+        "mean_rev_bb_period", "mean_rev_bb_std", "mean_rev_zscore_entry",
+        "mean_rev_zscore_exit", "mean_rev_rsi_period", "ml_min_confidence",
+    }
+    if field_name in rebuild_params:
+        with _runtime_lock:
+            _runtime_changes["config_updates"][field_name] = value
+
+    # Special handling for interval/timeframe/lookback
+    if param == "interval":
+        with _runtime_lock:
+            _runtime_changes["interval"] = value
+    elif param == "timeframe":
+        with _runtime_lock:
+            _runtime_changes["timeframe"] = value
+    elif param == "lookback":
+        with _runtime_lock:
+            _runtime_changes["lookback"] = value
+
+    await message.answer(
+        f"✅ <b>Config updated</b>\n"
+        f"  <code>{param}</code>: {old_value} → <b>{value}</b>\n"
+        f"  {'(takes effect next cycle)' if field_name in rebuild_params else '(immediate)'}",
+        parse_mode=ParseMode.HTML
+    )
+
+
+@router.message(Command("setauto"))
+async def cmd_setauto(message: Message):
+    """Configure automation scheduler.
+    Usage: /setauto backtest|train|sweep HOURS
+    Set to 0 to disable.
+    """
+    if not _is_authorized(message):
+        return
+
+    from config.settings import settings
+
+    parts = message.text.split()
+    if len(parts) < 3:
+        await message.answer(
+            "<b>Usage:</b> /setauto TYPE HOURS\n\n"
+            "<b>Types:</b>\n"
+            f"  backtest - currently every {settings.auto_backtest_interval_hours}h\n"
+            f"  train    - currently every {settings.auto_train_interval_hours}h\n"
+            f"  sweep    - currently every {settings.auto_sweep_interval_hours}h\n\n"
+            "Set HOURS to 0 to disable.\n"
+            "Example: /setauto train 12",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    task_type = parts[1].lower()
+    try:
+        hours = int(parts[2])
+    except ValueError:
+        await message.answer("Hours must be an integer.")
+        return
+
+    if hours < 0 or hours > 168:
+        await message.answer("Hours must be between 0 and 168 (1 week).")
+        return
+
+    field_map = {
+        "backtest": "auto_backtest_interval_hours",
+        "train": "auto_train_interval_hours",
+        "sweep": "auto_sweep_interval_hours",
+    }
+
+    if task_type not in field_map:
+        await message.answer(f"Unknown type: {task_type}. Use: backtest, train, sweep")
+        return
+
+    field = field_map[task_type]
+    old = getattr(settings, field)
+    setattr(settings, field, hours)
+
+    status = f"every {hours}h" if hours > 0 else "DISABLED"
+    await message.answer(
+        f"✅ Auto-{task_type}: {old}h → <b>{status}</b>\n"
+        f"<i>Note: Restart bot for scheduler changes to take full effect.</i>",
+        parse_mode=ParseMode.HTML
+    )
+
+
+@router.message(Command("settf"))
+async def cmd_settf(message: Message):
+    """Change trading timeframe.
+    Usage: /settf 15Min
+    """
+    if not _is_authorized(message):
+        return
+
+    valid_tfs = ["1Min", "5Min", "15Min", "30Min", "1Hour", "4Hour", "1Day"]
+    parts = message.text.split()
+
+    if len(parts) < 2:
+        from config.settings import settings
+        await message.answer(
+            f"<b>Usage:</b> /settf TIMEFRAME\n\n"
+            f"<b>Current:</b> {settings.timeframe}\n"
+            f"<b>Valid:</b> {', '.join(valid_tfs)}",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    new_tf = parts[1]
+    if new_tf not in valid_tfs:
+        await message.answer(f"Invalid timeframe. Choose from: {', '.join(valid_tfs)}")
+        return
+
+    from config.settings import settings
+    old = settings.timeframe
+    settings.timeframe = new_tf
+
+    with _runtime_lock:
+        _runtime_changes["timeframe"] = new_tf
+
+    await message.answer(
+        f"✅ Timeframe: {old} → <b>{new_tf}</b>\nStrategy will rebuild on next cycle.",
+        parse_mode=ParseMode.HTML
+    )
+
+
+@router.message(Command("setlookback"))
+async def cmd_setlookback(message: Message):
+    """Change lookback bars.
+    Usage: /setlookback 500
+    """
+    if not _is_authorized(message):
+        return
+
+    parts = message.text.split()
+    if len(parts) < 2:
+        from config.settings import settings
+        await message.answer(
+            f"<b>Usage:</b> /setlookback BARS\n"
+            f"<b>Current:</b> {settings.lookback_bars}",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    try:
+        bars = int(parts[1])
+    except ValueError:
+        await message.answer("Must be an integer.")
+        return
+
+    if bars < 50 or bars > 5000:
+        await message.answer("Lookback must be between 50 and 5000.")
+        return
+
+    from config.settings import settings
+    old = settings.lookback_bars
+    settings.lookback_bars = bars
+
+    with _runtime_lock:
+        _runtime_changes["lookback"] = bars
+
+    await message.answer(
+        f"✅ Lookback: {old} → <b>{bars}</b> bars\nStrategy will rebuild on next cycle.",
+        parse_mode=ParseMode.HTML
+    )
+
+
+@router.message(Command("setnotify"))
+async def cmd_setnotify(message: Message):
+    """Toggle notification preferences.
+    Usage: /setnotify trade|error|signal on|off
+    """
+    if not _is_authorized(message):
+        return
+
+    from config.settings import settings
+
+    parts = message.text.split()
+    if len(parts) < 3:
+        await message.answer(
+            f"<b>Usage:</b> /setnotify TYPE on|off\n\n"
+            f"<b>Current:</b>\n"
+            f"  trade:  {'ON ✅' if settings.notify_on_trade else 'OFF ❌'}\n"
+            f"  error:  {'ON ✅' if settings.notify_on_error else 'OFF ❌'}\n"
+            f"  signal: {'ON ✅' if settings.notify_on_signal else 'OFF ❌'}",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    notify_type = parts[1].lower()
+    state = parts[2].lower() in ("on", "true", "1", "yes")
+
+    field_map = {
+        "trade": "notify_on_trade",
+        "error": "notify_on_error",
+        "signal": "notify_on_signal",
+    }
+
+    if notify_type not in field_map:
+        await message.answer(f"Unknown type. Use: trade, error, signal")
+        return
+
+    setattr(settings, field_map[notify_type], state)
+    emoji = "✅ ON" if state else "❌ OFF"
+    await message.answer(f"Notifications for <b>{notify_type}</b>: {emoji}", parse_mode=ParseMode.HTML)
 
 
 @router.message(Command("backtest"))

@@ -609,6 +609,27 @@ def cmd_run(
                 interval = changes["interval"]
                 logger.info("runtime.interval_change", interval=interval)
 
+            if changes.get("timeframe"):
+                timeframe = changes["timeframe"]
+                logger.info("runtime.timeframe_change", timeframe=timeframe)
+                strategy = create_strategy(strategy_name, symbols, timeframe, lookback)
+                crypto_only = [s for s in symbols if "/" in s]
+                crypto_strategy = create_strategy(strategy_name, crypto_only, timeframe, lookback) if crypto_only else None
+
+            if changes.get("lookback"):
+                lookback = changes["lookback"]
+                logger.info("runtime.lookback_change", lookback=lookback)
+                strategy = create_strategy(strategy_name, symbols, timeframe, lookback)
+                crypto_only = [s for s in symbols if "/" in s]
+                crypto_strategy = create_strategy(strategy_name, crypto_only, timeframe, lookback) if crypto_only else None
+
+            if changes.get("config_updates"):
+                # Strategy params changed — rebuild strategy with new settings
+                logger.info("runtime.config_update", params=list(changes["config_updates"].keys()))
+                strategy = create_strategy(strategy_name, symbols, timeframe, lookback)
+                crypto_only = [s for s in symbols if "/" in s]
+                crypto_strategy = create_strategy(strategy_name, crypto_only, timeframe, lookback) if crypto_only else None
+
             if changes.get("trigger_train") and strategy_name == "ml":
                 logger.info("runtime.ml_retrain_triggered")
                 try:
