@@ -211,7 +211,8 @@ async def cmd_help(message: Message):
         "/strategy - View active strategy\n"
         "/risk - View risk parameters\n\n"
         "<b>Configuration:</b>\n"
-        "/config [category] - View all settings\n"
+        "/config [category] - View settings\n"
+        "/configfull [section] - Full config (masked)\n"
         "/set PARAM VALUE - Change any setting\n"
         "/setrisk PARAM VALUE - Set risk param\n"
         "/setstrategy NAME - Switch strategy\n"
@@ -221,6 +222,20 @@ async def cmd_help(message: Message):
         "/setlookback BARS - Change lookback\n"
         "/setauto TYPE HOURS - Configure automation\n"
         "/setnotify TYPE on|off - Toggle alerts\n\n"
+        "<b>Broker & Mode:</b>\n"
+        "/setalpaca paper|live KEY SECRET - Set API keys\n"
+        "/setmode paper|live - Switch trading mode\n"
+        "/saveconfig - Persist config to .env\n"
+        "/loadconfig - Reload from .env\n"
+        "/export - Export all config (masked)\n\n"
+        "<b>Strategy Management:</b>\n"
+        "/newstrategy NAME TPL SYMS [TF] [INT] - Create\n"
+        "/liststrats - List all strategies\n"
+        "/editstrat NAME FIELD VALUE - Edit strategy\n"
+        "/deletestrat NAME - Delete strategy\n"
+        "/copystrat SRC NEW - Duplicate strategy\n"
+        "/templates [NAME] - View templates\n"
+        "/applystrats - Apply to orchestrator\n\n"
         "<b>Backtesting & ML:</b>\n"
         "/backtest [SYMBOL] [DAYS] - Backtrader backtest\n"
         "/backtestvbt [SYMBOL] [DAYS] - VectorBT backtest\n"
@@ -1233,14 +1248,21 @@ async def cmd_backtest(message: Message):
             )
             await message.answer(text, parse_mode=ParseMode.HTML)
         except ImportError:
-            # Fallback to simple custom backtest
-            from backtesting.backtest import SimpleBacktest
-            bt = SimpleBacktest(df)
-            results = bt.run()
+            # Fallback to simple custom backtest using the active strategy
+            from backtesting.backtest import Backtester
+
+            if not _strategy:
+                await message.answer("Backtrader not available and no strategy loaded for fallback.")
+                return
+
+            bt = Backtester(_strategy, initial_capital=10000.0)
+            result = bt.run(df, symbol=symbol)
             text = (
                 f"<b>Backtest Results: {symbol}</b>\n"
-                f"Return: {results.get('total_return', 0):.2%}\n"
-                f"Trades: {results.get('total_trades', 0)}\n"
+                f"Return: {result.total_return_pct:.2%}\n"
+                f"Trades: {result.total_trades}\n"
+                f"Win Rate: {result.win_rate:.1%}\n"
+                f"Max DD: {result.max_drawdown:.2%}\n"
             )
             await message.answer(text, parse_mode=ParseMode.HTML)
 

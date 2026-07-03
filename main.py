@@ -562,16 +562,35 @@ def cmd_run(
     _telegram_thread = None
     if enable_telegram and settings.telegram_bot_token:
         from src.notifications.telegram_bot import (
-            TelegramBotManager, set_components, get_runtime_changes
+            TelegramBotManager, set_components, get_runtime_changes,
+            _runtime_lock as _tg_runtime_lock, _runtime_changes as _tg_runtime_changes,
         )
+        from src.notifications.telegram_config_commands import (
+            config_router, set_config_components,
+        )
+        from src.strategy.strategy_store import StrategyStore
 
         # Parse chat ID — skip if placeholder or non-numeric (auto-detect on first message)
         chat_ids = []
         if settings.telegram_chat_id and settings.telegram_chat_id.isdigit():
             chat_ids = [int(settings.telegram_chat_id)]
+
+        # Initialize strategy store for user-defined strategies
+        _strategy_store = StrategyStore()
+
         telegram_bot = TelegramBotManager(
             token=settings.telegram_bot_token,
             authorized_chat_ids=chat_ids,
+        )
+
+        # Register config/strategy management commands router
+        telegram_bot.dp.include_router(config_router)
+        set_config_components(
+            settings=settings,
+            strategy_store=_strategy_store,
+            authorized_users=set(chat_ids),
+            runtime_lock=_tg_runtime_lock,
+            runtime_changes=_tg_runtime_changes,
         )
 
         def _run_telegram_bot(bot):
