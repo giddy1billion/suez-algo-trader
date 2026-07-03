@@ -428,7 +428,7 @@ def cmd_run(
     db = DatabaseManager(settings.database_url)
 
     # Initialize event-driven infrastructure
-    from src.core.events import EventBus
+    from src.core.events import EventBus, OrderFilled, OrderRejected
     from src.core.state_machine import TradeManager
     from src.core.subscribers import setup_default_subscribers
 
@@ -473,6 +473,35 @@ def cmd_run(
         bus=event_bus,
         notification_send_func=_notification_sender if notifier.telegram_token else None,
     )
+
+    # --- Full Telegram Audit Forwarding (ALL events + WARNING+ logs) ---
+    # Nothing held back: every audit event, system alert, and log warning
+    # is sent to Telegram in real-time.
+    telegram_audit_components = {}
+    if notifier.telegram_token:
+        from src.notifications.telegram_audit_forwarder import setup_telegram_full_audit
+
+        def _telegram_html_sender(message: str):
+            """Send HTML-formatted message to Telegram."""
+            import httpx
+            url = f"https://api.telegram.org/bot{notifier.telegram_token}/sendMessage"
+            payload = {
+                "chat_id": notifier.telegram_chat_id,
+                "text": message,
+                "parse_mode": "HTML",
+            }
+            try:
+                with httpx.Client(timeout=10) as client:
+                    client.post(url, json=payload)
+            except Exception:
+                pass
+
+        telegram_audit_components = setup_telegram_full_audit(
+            event_bus=event_bus,
+            send_func=_telegram_html_sender,
+            attach_log_handler=True,
+        )
+        logger.info("telegram_audit.full_forwarding_enabled")
 
     # --- Event Persistence (durable event log for replay & auditing) ---
     from src.core.event_store import EventStore, EventPersistenceSubscriber
@@ -1061,6 +1090,7 @@ def cmd_run(
     logger.info("bot.stopped", cycles=cycle_count)
     if _scheduler:
         _scheduler.shutdown(wait=False)
+    broker.stop_trade_stream()
     notifier.notify_daily_summary(risk.get_daily_summary())
     if telegram_bot:
         import asyncio

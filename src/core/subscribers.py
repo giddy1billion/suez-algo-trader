@@ -14,11 +14,16 @@ from .audit_log import AuditLogger
 from .events import (
     Event,
     EventBus,
+    OrderAccepted,
     OrderFilled,
+    OrderPartialFill,
     OrderRejected,
     OrderSubmitted,
+    RiskEvaluated,
     RiskHalt,
+    SchedulerEvent,
     SignalGenerated,
+    SystemHealth,
     TradeClosed,
     TradeOpened,
 )
@@ -197,7 +202,11 @@ class MetricsSubscriber:
 
 
 class NotificationSubscriber:
-    """Listens for key trade events and sends notifications via Telegram."""
+    """Listens for ALL trade and system events and sends notifications via Telegram.
+    
+    Nothing is held back — every signal, order, fill, risk decision, and system
+    health change is forwarded to the user.
+    """
 
     def __init__(self, send_func: Optional[Any] = None) -> None:
         """
@@ -206,6 +215,52 @@ class NotificationSubscriber:
                        If None, notifications are only logged.
         """
         self._send = send_func
+
+    def handle_signal(self, event: SignalGenerated) -> None:
+        """Notify on strategy signal."""
+        emoji = "📶" if event.signal == "BUY" else "📉" if event.signal == "SELL" else "⏸️"
+        msg = (
+            f"{emoji} Signal: {event.signal} {event.symbol}\n"
+            f"Confidence: {getattr(event, 'confidence', 'N/A')}"
+        )
+        self._notify(msg)
+
+    def handle_risk_evaluated(self, event: RiskEvaluated) -> None:
+        """Notify on risk evaluation (especially rejections)."""
+        approved = getattr(event, "approved", None)
+        if approved is False:
+            reasons = getattr(event, "reasons", [])
+            reason_str = "; ".join(reasons) if reasons else "N/A"
+            msg = (
+                f"🛡️ Risk REJECTED: {getattr(event, 'symbol', '?')}\n"
+                f"Reason: {reason_str}"
+            )
+            self._notify(msg)
+
+    def handle_order_submitted(self, event: OrderSubmitted) -> None:
+        """Notify on order submission."""
+        msg = (
+            f"📤 Order Submitted: {getattr(event, 'side', '?')} "
+            f"{getattr(event, 'symbol', '?')} x{getattr(event, 'qty', '?')}\n"
+            f"ID: {event.order_id}"
+        )
+        self._notify(msg)
+
+    def handle_order_filled(self, event: OrderFilled) -> None:
+        """Notify on order fill."""
+        msg = (
+            f"💰 Order Filled: {event.order_id}\n"
+            f"Price: ${event.fill_price:.2f}"
+        )
+        self._notify(msg)
+
+    def handle_order_partial_fill(self, event: OrderPartialFill) -> None:
+        """Notify on partial fill."""
+        msg = (
+            f"⏳ Partial Fill: {event.order_id}\n"
+            f"Filled: {event.filled_qty} @ ${event.fill_price:.2f}"
+        )
+        self._notify(msg)
 
     def handle_trade_opened(self, event: TradeOpened) -> None:
         """Notify on trade open."""
@@ -236,6 +291,27 @@ class NotificationSubscriber:
         msg = f"⚠️ Order Rejected: {event.order_id}\nReason: {event.reason}"
         self._notify(msg)
 
+    def handle_scheduler(self, event: SchedulerEvent) -> None:
+        """Notify on scheduler events."""
+        status = getattr(event, "status", "unknown")
+        icon = {"started": "⏱️", "completed": "✅", "failed": "❌"}.get(status, "📅")
+        msg = f"{icon} Scheduler: {getattr(event, 'job_name', '?')} — {status}"
+        self._notify(msg)
+
+    def handle_system_health(self, event: SystemHealth) -> None:
+        """Notify on system health changes (especially degradation)."""
+        status = event.status
+        if status in ("degraded", "down"):
+            icon = {"degraded": "🟡", "down": "🔴"}.get(status, "⚪")
+            metrics = getattr(event, "metrics", {})
+            latency = metrics.get("latency_ms", "N/A")
+            msg = (
+                f"{icon} HEALTH ALERT: {event.component}\n"
+                f"Status: {status.upper()}\n"
+                f"Latency: {latency}ms"
+            )
+            self._notify(msg)
+
     def _notify(self, message: str) -> None:
         """Send notification or log if no send function configured."""
         logger.info("Notification: %s", message.replace("\n", " | "))
@@ -246,11 +322,18 @@ class NotificationSubscriber:
                 logger.exception("Failed to send notification")
 
     def register(self, bus: EventBus) -> None:
-        """Register for relevant trade events."""
+        """Register for ALL relevant trade and system events."""
+        bus.subscribe(SignalGenerated, self.handle_signal)
+        bus.subscribe(RiskEvaluated, self.handle_risk_evaluated)
+        bus.subscribe(OrderSubmitted, self.handle_order_submitted)
+        bus.subscribe(OrderFilled, self.handle_order_filled)
+        bus.subscribe(OrderPartialFill, self.handle_order_partial_fill)
         bus.subscribe(TradeOpened, self.handle_trade_opened)
         bus.subscribe(TradeClosed, self.handle_trade_closed)
         bus.subscribe(RiskHalt, self.handle_risk_halt)
         bus.subscribe(OrderRejected, self.handle_order_rejected)
+        bus.subscribe(SchedulerEvent, self.handle_scheduler)
+        bus.subscribe(SystemHealth, self.handle_system_health)
 
 
 # ---------------------------------------------------------------------------
