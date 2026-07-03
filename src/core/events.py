@@ -192,6 +192,111 @@ class SystemHealth(Event):
 
 
 # ---------------------------------------------------------------------------
+# Runtime Switching Events
+# ---------------------------------------------------------------------------
+
+@dataclass
+class EnvironmentSwitched(Event):
+    """Emitted when trading environment switches between paper and live."""
+
+    old_mode: str = ""
+    new_mode: str = ""
+    broker_name: str = ""
+    positions_closed: int = 0
+    reason: str = ""
+
+
+@dataclass
+class BrokerSwitched(Event):
+    """Emitted when the broker instance is hot-swapped."""
+
+    old_broker: str = ""
+    new_broker: str = ""
+    open_positions_migrated: int = 0
+
+
+# ---------------------------------------------------------------------------
+# ML Runtime Events
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ModelSwapped(Event):
+    """Emitted when an ML model is hot-swapped in production."""
+
+    old_version: str = ""
+    new_version: str = ""
+    strategy: str = ""
+    reason: str = ""
+
+
+@dataclass
+class ModelTrainingStarted(Event):
+    """Emitted when model training pipeline begins."""
+
+    pipeline_id: str = ""
+    symbols: list[str] = field(default_factory=list)
+    trigger: str = ""  # "manual" | "scheduled" | "performance_decay"
+
+
+@dataclass
+class ModelTrainingCompleted(Event):
+    """Emitted when model training pipeline finishes."""
+
+    pipeline_id: str = ""
+    version: str = ""
+    metrics: dict[str, Any] = field(default_factory=dict)
+    duration_seconds: float = 0.0
+    auto_deployed: bool = False
+
+
+@dataclass
+class ABTestStarted(Event):
+    """Emitted when an A/B test begins."""
+
+    test_id: str = ""
+    champion_version: str = ""
+    challenger_version: str = ""
+    allocation_pct: float = 0.0
+
+
+@dataclass
+class ABTestCompleted(Event):
+    """Emitted when an A/B test concludes."""
+
+    test_id: str = ""
+    winner: str = ""
+    champion_sharpe: float = 0.0
+    challenger_sharpe: float = 0.0
+    trades_evaluated: int = 0
+
+
+# ---------------------------------------------------------------------------
+# Backtest Events
+# ---------------------------------------------------------------------------
+
+@dataclass
+class BacktestStarted(Event):
+    """Emitted when a backtest run begins."""
+
+    run_id: str = ""
+    strategies: list[str] = field(default_factory=list)
+    symbols: list[str] = field(default_factory=list)
+    engine: str = "native"
+
+
+@dataclass
+class BacktestCompleted(Event):
+    """Emitted when a backtest run finishes."""
+
+    run_id: str = ""
+    strategy: str = ""
+    total_return_pct: float = 0.0
+    sharpe_ratio: float = 0.0
+    total_trades: int = 0
+    duration_seconds: float = 0.0
+
+
+# ---------------------------------------------------------------------------
 # Event Bus
 # ---------------------------------------------------------------------------
 

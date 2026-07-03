@@ -136,14 +136,34 @@ class RecoveryManager:
     def _replay_events(self) -> int:
         """Replay persisted events from event store if available."""
         if self.event_store is None:
+            logger.info("No event store configured, skipping event replay")
             return 0
 
         try:
-            events = self.event_store.get_latest_events(limit=1000)
+            import json
+            from src.core.events import Event
+            from src.core.event_store import _reconstruct_event
+
+            raw_events = self.event_store.get_latest_events(limit=1000)
             count = 0
-            for event in events:
-                self.event_bus.publish(event)
-                count += 1
+            for item in raw_events:
+                try:
+                    if isinstance(item, Event):
+                        # Already a typed Event object (e.g., from replay_session)
+                        self.event_bus.publish(item)
+                    elif isinstance(item, dict) and "payload" in item:
+                        # Raw row from SQLite — reconstruct the Event
+                        payload = json.loads(item["payload"])
+                        payload["_type"] = item["event_type"]
+                        event = _reconstruct_event(item["event_type"], payload)
+                        self.event_bus.publish(event)
+                    else:
+                        logger.warning("Skipping unrecognized event format: %s", type(item).__name__)
+                        continue
+                    count += 1
+                except Exception as e:
+                    logger.warning("Failed to reconstruct event: %s", str(e))
+                    continue
             logger.info("Replayed %d events from event store", count)
             return count
         except Exception as e:

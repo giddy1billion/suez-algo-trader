@@ -42,6 +42,12 @@ class MessageBus(ABC):
         """Get recent event history."""
         ...
 
+    @property
+    @abstractmethod
+    def subscriber_count(self) -> int:
+        """Total number of handler registrations."""
+        ...
+
 
 class InMemoryBus(MessageBus):
     """In-memory message bus (wraps existing EventBus)."""
@@ -60,6 +66,10 @@ class InMemoryBus(MessageBus):
 
     def get_history(self, limit: int = 50) -> list:
         return self._bus.get_history(limit=limit)
+
+    @property
+    def subscriber_count(self) -> int:
+        return self._bus.subscriber_count
 
 
 class PersistentBus(MessageBus):
@@ -92,6 +102,10 @@ class PersistentBus(MessageBus):
 
     def get_history(self, limit: int = 50) -> list:
         return self._bus.get_history(limit=limit)
+
+    @property
+    def subscriber_count(self) -> int:
+        return self._bus.subscriber_count
 
 
 def create_bus(backend: str = "memory", **kwargs) -> MessageBus:

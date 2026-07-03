@@ -41,9 +41,20 @@ class BrokerProtocol(Protocol):
         """Submit a market order. Returns order dict with id, status, fill price."""
         ...
 
+    def market_order_notional(self, symbol: str, notional: float, side: str,
+                              time_in_force: str = "gtc") -> dict:
+        """Submit a market order by dollar amount (notional value)."""
+        ...
+
     def limit_order(self, symbol: str, qty: float, side: str,
                     limit_price: float, time_in_force: str = "day") -> dict:
         """Submit a limit order."""
+        ...
+
+    def stop_limit_order(self, symbol: str, qty: float, side: str,
+                         limit_price: float, stop_price: float,
+                         time_in_force: str = "gtc") -> dict:
+        """Submit a stop-limit order."""
         ...
 
     def bracket_order(self, symbol: str, qty: float, side: str,
@@ -56,8 +67,8 @@ class BrokerProtocol(Protocol):
         """Cancel an order by ID."""
         ...
 
-    def close_position(self, symbol: str) -> Optional[dict]:
-        """Close an entire position for a symbol."""
+    def close_position(self, symbol: str, qty: Optional[float] = None) -> Optional[dict]:
+        """Close a position (entirely, or partially if qty specified)."""
         ...
 
     def get_orders(self, status: str = "open", limit: int = 50) -> list[dict]:

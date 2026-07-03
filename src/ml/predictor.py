@@ -1,0 +1,405 @@
+"""
+Model Predictor — Centralized inference service with transparent hot-swap.
+
+Provides:
+- Single point of prediction for all ML strategies
+- Automatic model reload when registry active version changes
+- Thread-safe model access during hot-swap
+- Version tracking and rollback capability
+- Prediction latency monitoring
+- Shadow mode for testing new models without affecting trading
+"""
+
+import threading
+import time
+from datetime import datetime, timezone
+from typing import Any, Optional
+
+import numpy as np
+
+from src.ml.model_registry import ModelRegistry
+from src.utils.logger import get_logger
+
+logger = get_logger(__name__)
+
+
+class ModelPredictor:
+    """
+    Centralized model inference service with hot-swap.
+
+    All ML strategies route predictions through this service.
+    When the active model version changes in the registry, the
+    predictor transparently reloads without interrupting predictions.
+
+    Features:
+    - Zero-downtime model switching via double-buffered loading
+    - Prediction latency tracking
+    - Fallback to previous model on load failure
+    - Shadow predictions (run new model without using results)
+    """
+
+    def __init__(
+        self,
+        registry: ModelRegistry,
+        event_bus=None,
+        auto_reload: bool = True,
+        check_interval_seconds: float = 30.0,
+    ):
+        self._registry = registry
+        self._event_bus = event_bus
+        self._auto_reload = auto_reload
+        self._check_interval = check_interval_seconds
+
+        # Model state (double-buffered for zero-downtime swap)
+        self._model = None
+        self._features: list[str] = []
+        self._version: Optional[str] = None
+        self._loaded_at: Optional[datetime] = None
+        self._lock = threading.RLock()
+
+        # Shadow model for A/B testing
+        self._shadow_model = None
+        self._shadow_version: Optional[str] = None
+        self._shadow_features: list[str] = []
+
+        # Metrics
+        self._prediction_count: int = 0
+        self._total_latency_ms: float = 0.0
+        self._swap_count: int = 0
+        self._last_check_time: Optional[float] = None
+        self._errors: list[dict] = []
+
+        # Auto-reload watcher
+        self._watcher_thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
+
+        # Load initial model
+        self._load_active_model()
+
+        # Start watcher if auto-reload enabled
+        if auto_reload:
+            self._start_watcher()
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Public Prediction API
+    # ──────────────────────────────────────────────────────────────────────
+
+    def predict(self, features: np.ndarray) -> np.ndarray:
+        """
+        Get prediction from the active model.
+
+        Transparently reloads the model if the active version has changed.
+        Thread-safe — multiple strategies can call this concurrently.
+
+        Args:
+            features: Feature array (samples × features).
+
+        Returns:
+            Prediction array from the model.
+
+        Raises:
+            RuntimeError: If no model is loaded and loading fails.
+        """
+        start_time = time.perf_counter()
+
+        with self._lock:
+            # Check if we need a version refresh
+            self._maybe_check_version()
+
+            if self._model is None:
+                raise RuntimeError("No model loaded. Train or register a model first.")
+
+            try:
+                predictions = self._model.predict(features)
+                self._prediction_count += 1
+                elapsed_ms = (time.perf_counter() - start_time) * 1000
+                self._total_latency_ms += elapsed_ms
+                return predictions
+            except Exception as e:
+                self._errors.append({
+                    "time": datetime.now(timezone.utc).isoformat(),
+                    "error": str(e),
+                    "version": self._version,
+                })
+                raise
+
+    def predict_proba(self, features: np.ndarray) -> np.ndarray:
+        """
+        Get probability predictions from the active model.
+
+        Args:
+            features: Feature array (samples × features).
+
+        Returns:
+            Probability array (samples × classes).
+
+        Raises:
+            RuntimeError: If model doesn't support predict_proba.
+        """
+        start_time = time.perf_counter()
+
+        with self._lock:
+            self._maybe_check_version()
+
+            if self._model is None:
+                raise RuntimeError("No model loaded.")
+
+            if not hasattr(self._model, 'predict_proba'):
+                raise RuntimeError(f"Model {self._version} doesn't support predict_proba")
+
+            try:
+                proba = self._model.predict_proba(features)
+                self._prediction_count += 1
+                elapsed_ms = (time.perf_counter() - start_time) * 1000
+                self._total_latency_ms += elapsed_ms
+                return proba
+            except Exception as e:
+                self._errors.append({
+                    "time": datetime.now(timezone.utc).isoformat(),
+                    "error": str(e),
+                    "version": self._version,
+                })
+                raise
+
+    def predict_with_shadow(self, features: np.ndarray) -> tuple[np.ndarray, Optional[np.ndarray]]:
+        """
+        Get predictions from both active and shadow models.
+
+        Used for A/B testing — shadow predictions are returned but not
+        used for trading decisions.
+
+        Args:
+            features: Feature array.
+
+        Returns:
+            Tuple of (active_predictions, shadow_predictions or None).
+        """
+        active_pred = self.predict(features)
+
+        shadow_pred = None
+        if self._shadow_model is not None:
+            try:
+                with self._lock:
+                    shadow_pred = self._shadow_model.predict(features)
+            except Exception as e:
+                logger.debug("predictor.shadow_failed", error=str(e))
+
+        return active_pred, shadow_pred
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Model Management
+    # ──────────────────────────────────────────────────────────────────────
+
+    def swap_model(self, version: str) -> dict:
+        """
+        Explicitly swap to a specific model version.
+
+        Args:
+            version: Version string to load (e.g., "v003").
+
+        Returns:
+            Dict with swap details.
+
+        Raises:
+            FileNotFoundError: If version doesn't exist.
+        """
+        with self._lock:
+            old_version = self._version
+            self._load_version(version)
+            self._swap_count += 1
+
+            result = {
+                "old_version": old_version,
+                "new_version": version,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+
+            # Publish event
+            if self._event_bus:
+                from src.core.events import ModelSwapped
+                self._event_bus.publish(ModelSwapped(
+                    old_version=old_version or "",
+                    new_version=version,
+                    strategy="global",
+                    reason="explicit_swap",
+                    source="model_predictor",
+                ))
+
+            logger.info("predictor.model_swapped", **result)
+            return result
+
+    def set_shadow_model(self, version: str) -> None:
+        """
+        Set a shadow model for A/B comparison.
+
+        The shadow model's predictions are available via predict_with_shadow()
+        but don't affect trading.
+
+        Args:
+            version: Version string to use as shadow.
+        """
+        with self._lock:
+            try:
+                data = self._registry.get_version(version)
+                self._shadow_model = data["model"]
+                self._shadow_version = version
+                self._shadow_features = data.get("features", [])
+                logger.info("predictor.shadow_set", version=version)
+            except Exception as e:
+                logger.error("predictor.shadow_failed", version=version, error=str(e))
+                raise
+
+    def clear_shadow_model(self) -> None:
+        """Remove the shadow model."""
+        with self._lock:
+            self._shadow_model = None
+            self._shadow_version = None
+            self._shadow_features = []
+
+    def reload(self) -> bool:
+        """Force reload the active model from registry."""
+        with self._lock:
+            try:
+                self._load_active_model()
+                return True
+            except Exception as e:
+                logger.error("predictor.reload_failed", error=str(e))
+                return False
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Status & Metrics
+    # ──────────────────────────────────────────────────────────────────────
+
+    @property
+    def current_version(self) -> Optional[str]:
+        return self._version
+
+    @property
+    def is_loaded(self) -> bool:
+        return self._model is not None
+
+    @property
+    def feature_names(self) -> list[str]:
+        return self._features.copy()
+
+    @property
+    def shadow_version(self) -> Optional[str]:
+        return self._shadow_version
+
+    def get_metrics(self) -> dict:
+        """Get prediction service metrics."""
+        avg_latency = (
+            self._total_latency_ms / self._prediction_count
+            if self._prediction_count > 0 else 0.0
+        )
+        return {
+            "version": self._version,
+            "loaded_at": self._loaded_at.isoformat() if self._loaded_at else None,
+            "prediction_count": self._prediction_count,
+            "avg_latency_ms": round(avg_latency, 2),
+            "swap_count": self._swap_count,
+            "shadow_version": self._shadow_version,
+            "error_count": len(self._errors),
+            "auto_reload": self._auto_reload,
+        }
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Lifecycle
+    # ──────────────────────────────────────────────────────────────────────
+
+    def stop(self):
+        """Stop the auto-reload watcher."""
+        self._stop_event.set()
+        if self._watcher_thread and self._watcher_thread.is_alive():
+            self._watcher_thread.join(timeout=5.0)
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Internal
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _load_active_model(self):
+        """Load the currently active model from registry."""
+        active_version = self._registry.get_active_version()
+        if active_version is None:
+            logger.warning("predictor.no_active_version")
+            return
+
+        if active_version == self._version:
+            return  # Already loaded
+
+        self._load_version(active_version)
+
+    def _load_version(self, version: str):
+        """Load a specific version into the predictor."""
+        old_model = self._model
+        old_version = self._version
+
+        try:
+            data = self._registry.get_version(version)
+            self._model = data["model"]
+            self._features = data.get("features", [])
+            self._version = version
+            self._loaded_at = datetime.now(timezone.utc)
+
+            logger.info(
+                "predictor.model_loaded",
+                version=version,
+                n_features=len(self._features),
+            )
+        except Exception as e:
+            # Rollback on failure
+            logger.error("predictor.load_failed", version=version, error=str(e))
+            self._model = old_model
+            self._version = old_version
+            raise
+
+    def _maybe_check_version(self):
+        """Check if version needs refresh (rate-limited)."""
+        if not self._auto_reload:
+            return
+
+        now = time.monotonic()
+        if self._last_check_time and (now - self._last_check_time) < self._check_interval:
+            return
+
+        self._last_check_time = now
+        active = self._registry.get_active_version()
+        if active and active != self._version:
+            logger.info(
+                "predictor.version_drift_detected",
+                current=self._version,
+                registry_active=active,
+            )
+            old_version = self._version
+            try:
+                self._load_version(active)
+                self._swap_count += 1
+                if self._event_bus:
+                    from src.core.events import ModelSwapped
+                    self._event_bus.publish(ModelSwapped(
+                        old_version=old_version or "",
+                        new_version=active,
+                        strategy="global",
+                        reason="auto_reload",
+                        source="model_predictor",
+                    ))
+            except Exception as e:
+                logger.error("predictor.auto_swap_failed", error=str(e))
+
+    def _start_watcher(self):
+        """Start background thread that watches for model version changes."""
+        def _watch():
+            while not self._stop_event.is_set():
+                try:
+                    with self._lock:
+                        self._maybe_check_version()
+                except Exception as e:
+                    logger.debug("predictor.watcher_error", error=str(e))
+                self._stop_event.wait(timeout=self._check_interval)
+
+        self._watcher_thread = threading.Thread(
+            target=_watch,
+            name="model-predictor-watcher",
+            daemon=True,
+        )
+        self._watcher_thread.start()

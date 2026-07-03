@@ -141,6 +141,42 @@ class PaperBroker:
                         symbol=symbol, qty=qty, side=side, price=price)
             return order
 
+    def market_order_notional(self, symbol: str, notional: float, side: str,
+                              time_in_force: str = "gtc") -> dict:
+        """Submit a market order by dollar amount. Converts to qty internally."""
+        with self._lock:
+            price = self._prices.get(symbol)
+            if price is None:
+                raise ValueError(f"No price set for {symbol}. Use set_price() first.")
+            qty = notional / price
+            order = self._create_order(symbol, qty, side, "market",
+                                       time_in_force=time_in_force)
+            self._fill_order(order, price)
+            order["notional"] = notional
+            logger.info("paper_broker.market_notional_filled",
+                        symbol=symbol, notional=notional, qty=qty, side=side, price=price)
+            return order
+
+    def stop_limit_order(self, symbol: str, qty: float, side: str,
+                         limit_price: float, stop_price: float,
+                         time_in_force: str = "gtc") -> dict:
+        """Submit a stop-limit order. Fills when price hits stop, at limit."""
+        with self._lock:
+            order = self._create_order(symbol, qty, side, "stop_limit",
+                                       limit_price=limit_price,
+                                       stop_price=stop_price,
+                                       time_in_force=time_in_force)
+            # Check immediate fill possibility
+            current_price = self._prices.get(symbol)
+            if current_price is not None:
+                triggered = (side.lower() == "buy" and current_price >= stop_price) or \
+                           (side.lower() == "sell" and current_price <= stop_price)
+                if triggered and self._should_fill_limit(side, limit_price, current_price):
+                    self._fill_order(order, limit_price)
+                    logger.info("paper_broker.stop_limit_filled_immediately",
+                                symbol=symbol, price=limit_price)
+            return order
+
     def cancel_order(self, order_id: str) -> Optional[dict]:
         """Cancel a pending order by ID."""
         with self._lock:
@@ -151,20 +187,31 @@ class PaperBroker:
                     return order
             return None
 
-    def close_position(self, symbol: str) -> Optional[dict]:
-        """Close an entire position for a symbol."""
+    def close_position(self, symbol: str, qty: Optional[float] = None) -> Optional[dict]:
+        """Close a position (entirely or partially by specifying qty)."""
         with self._lock:
-            if symbol not in self._positions:
+            # Normalize crypto symbols (BTC/USD → BTCUSD for lookup)
+            lookup = symbol.replace("/", "")
+            # Try both forms
+            actual_symbol = symbol if symbol in self._positions else lookup
+
+            if actual_symbol not in self._positions:
                 return None
 
-            pos = self._positions[symbol]
-            price = self._prices.get(symbol, pos["avg_entry_price"])
+            pos = self._positions[actual_symbol]
+            original_qty = pos["qty"]
+            price = self._prices.get(actual_symbol, self._prices.get(symbol, pos["avg_entry_price"]))
 
-            # Create a closing order (opposite side)
+            close_qty = qty if qty is not None else original_qty
             close_side = "sell" if pos["side"] == "buy" else "buy"
-            order = self._create_order(symbol, pos["qty"], close_side, "market")
+            order = self._create_order(actual_symbol, close_qty, close_side, "market")
             self._fill_order(order, price)
-            logger.info("paper_broker.position_closed", symbol=symbol, price=price)
+
+            if qty is not None and qty < original_qty:
+                logger.info("paper_broker.position_partial_close",
+                           symbol=actual_symbol, qty=close_qty, price=price)
+            else:
+                logger.info("paper_broker.position_closed", symbol=actual_symbol, price=price)
             return order
 
     def get_orders(self, status: str = "open", limit: int = 50) -> list[dict]:

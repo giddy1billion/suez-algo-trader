@@ -16,12 +16,19 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import (
     MarketOrderRequest,
     LimitOrderRequest,
+    StopLimitOrderRequest,
     StopLossRequest,
     TakeProfitRequest,
     TrailingStopOrderRequest,
     GetOrdersRequest,
+    GetAssetsRequest,
+    ClosePositionRequest,
 )
-from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, OrderStatus, QueryOrderStatus
+from alpaca.trading.enums import (
+    OrderSide, TimeInForce, OrderType, OrderStatus, QueryOrderStatus,
+    AssetClass, AssetStatus,
+)
+from alpaca.trading.stream import TradingStream
 from alpaca.data.historical import StockHistoricalDataClient, CryptoHistoricalDataClient
 from alpaca.data.requests import (
     StockBarsRequest,
@@ -184,7 +191,32 @@ class AlpacaBroker:
         self._stock_stream: Optional[StockDataStream] = None
         self._crypto_stream: Optional[CryptoDataStream] = None
 
+        # Trade update stream (initialized on demand)
+        self._trade_stream: Optional[TradingStream] = None
+        self._trade_stream_thread: Optional[threading.Thread] = None
+
         logger.info("broker.initialized", paper=paper, data_feed=data_feed, timeout=timeout)
+
+    @property
+    def name(self) -> str:
+        return "alpaca"
+
+    @staticmethod
+    def _normalize_symbol_for_position(symbol: str) -> str:
+        """Normalize crypto symbols for position API calls (BTC/USD → BTCUSD)."""
+        return symbol.replace("/", "")
+
+    @staticmethod
+    def _parse_time_in_force(tif: str) -> TimeInForce:
+        """Parse time-in-force string to Alpaca enum."""
+        tif_lower = tif.lower()
+        if tif_lower == "gtc":
+            return TimeInForce.GTC
+        elif tif_lower == "ioc":
+            return TimeInForce.IOC
+        elif tif_lower == "day":
+            return TimeInForce.DAY
+        return TimeInForce.DAY
 
     def _call(self, fn, *args, **kwargs):
         """Execute an API call with rate limiting, retry, and error handling."""
@@ -243,7 +275,8 @@ class AlpacaBroker:
     def get_position(self, symbol: str) -> Optional[dict]:
         """Get position for a specific symbol (None if no position)."""
         try:
-            p = self._call(self.trading_client.get_open_position, symbol)
+            normalized = self._normalize_symbol_for_position(symbol)
+            p = self._call(self.trading_client.get_open_position, normalized)
             return {
                 "symbol": p.symbol,
                 "qty": float(p.qty),
@@ -266,7 +299,7 @@ class AlpacaBroker:
         """Place a market order."""
         try:
             order_side = OrderSide.BUY if side.lower() == "buy" else OrderSide.SELL
-            tif = TimeInForce.DAY if time_in_force.lower() == "day" else TimeInForce.GTC
+            tif = self._parse_time_in_force(time_in_force)
 
             request = MarketOrderRequest(
                 symbol=symbol,
@@ -284,11 +317,33 @@ class AlpacaBroker:
             raise
 
     @_retry()
+    def market_order_notional(self, symbol: str, notional: float, side: str, time_in_force: str = "gtc") -> dict:
+        """Place a market order by dollar amount (notional value)."""
+        try:
+            order_side = OrderSide.BUY if side.lower() == "buy" else OrderSide.SELL
+            tif = self._parse_time_in_force(time_in_force)
+
+            request = MarketOrderRequest(
+                symbol=symbol,
+                notional=notional,
+                side=order_side,
+                time_in_force=tif,
+            )
+            order = self._call(self.trading_client.submit_order, request)
+            logger.info("order.submitted", symbol=symbol, side=side, notional=notional, type="market_notional", order_id=str(order.id))
+            return self._order_to_dict(order)
+        except Exception as exc:
+            logger.error("order.market_notional_failed", symbol=symbol, error=str(exc))
+            if not _is_retryable(exc):
+                return _error_dict(exc)
+            raise
+
+    @_retry()
     def limit_order(self, symbol: str, qty: float, side: str, limit_price: float, time_in_force: str = "day") -> dict:
         """Place a limit order."""
         try:
             order_side = OrderSide.BUY if side.lower() == "buy" else OrderSide.SELL
-            tif = TimeInForce.DAY if time_in_force.lower() == "day" else TimeInForce.GTC
+            tif = self._parse_time_in_force(time_in_force)
 
             request = LimitOrderRequest(
                 symbol=symbol,
@@ -307,6 +362,34 @@ class AlpacaBroker:
             raise
 
     @_retry()
+    def stop_limit_order(
+        self, symbol: str, qty: float, side: str,
+        limit_price: float, stop_price: float, time_in_force: str = "gtc"
+    ) -> dict:
+        """Place a stop-limit order (triggers at stop_price, fills at limit_price)."""
+        try:
+            order_side = OrderSide.BUY if side.lower() == "buy" else OrderSide.SELL
+            tif = self._parse_time_in_force(time_in_force)
+
+            request = StopLimitOrderRequest(
+                symbol=symbol,
+                qty=qty,
+                side=order_side,
+                time_in_force=tif,
+                limit_price=limit_price,
+                stop_price=stop_price,
+            )
+            order = self._call(self.trading_client.submit_order, request)
+            logger.info("order.submitted", symbol=symbol, side=side, qty=qty,
+                       type="stop_limit", limit=limit_price, stop=stop_price)
+            return self._order_to_dict(order)
+        except Exception as exc:
+            logger.error("order.stop_limit_failed", symbol=symbol, error=str(exc))
+            if not _is_retryable(exc):
+                return _error_dict(exc)
+            raise
+
+    @_retry()
     def bracket_order(
         self, symbol: str, qty: float, side: str,
         stop_loss_price: float, take_profit_price: float,
@@ -315,7 +398,7 @@ class AlpacaBroker:
         """Place a bracket order (entry + stop-loss + take-profit)."""
         try:
             order_side = OrderSide.BUY if side.lower() == "buy" else OrderSide.SELL
-            tif = TimeInForce.DAY if time_in_force.lower() == "day" else TimeInForce.GTC
+            tif = self._parse_time_in_force(time_in_force)
 
             request = MarketOrderRequest(
                 symbol=symbol,
@@ -384,11 +467,17 @@ class AlpacaBroker:
             raise
 
     @_retry()
-    def close_position(self, symbol: str) -> Optional[dict]:
-        """Close an entire position."""
+    def close_position(self, symbol: str, qty: Optional[float] = None) -> Optional[dict]:
+        """Close a position (entirely or partially by specifying qty)."""
         try:
-            self._call(self.trading_client.close_position, symbol)
-            logger.info("position.closed", symbol=symbol)
+            normalized = self._normalize_symbol_for_position(symbol)
+            if qty is not None:
+                close_options = ClosePositionRequest(qty=str(qty))
+                self._call(self.trading_client.close_position, normalized, close_options=close_options)
+                logger.info("position.partial_close", symbol=symbol, qty=qty)
+            else:
+                self._call(self.trading_client.close_position, normalized)
+                logger.info("position.closed", symbol=symbol)
             return None
         except Exception as exc:
             logger.error("position.close_failed", symbol=symbol, error=str(exc))
@@ -604,10 +693,149 @@ class AlpacaBroker:
             "side": order.side.value if order.side else None,
             "type": order.type.value if order.type else None,
             "qty": float(order.qty) if order.qty else None,
+            "notional": float(order.notional) if getattr(order, 'notional', None) else None,
             "filled_qty": float(order.filled_qty) if order.filled_qty else 0,
+            "filled_avg_price": float(order.filled_avg_price) if getattr(order, 'filled_avg_price', None) else None,
             "limit_price": float(order.limit_price) if order.limit_price else None,
             "stop_price": float(order.stop_price) if order.stop_price else None,
             "status": order.status.value if order.status else None,
             "created_at": str(order.created_at) if order.created_at else None,
             "filled_at": str(order.filled_at) if order.filled_at else None,
         }
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Trade Update Stream (real-time order fills/cancellations)
+    # ──────────────────────────────────────────────────────────────────────
+
+    def start_trade_stream(self, handler) -> threading.Thread:
+        """
+        Start a background thread that streams real-time trade updates
+        (fills, partial fills, cancellations, rejections) via WebSocket.
+
+        Args:
+            handler: async or sync callable receiving trade update data.
+                     Data includes: event (fill/partial_fill/canceled/rejected),
+                     order dict, timestamp, etc.
+
+        Returns:
+            The daemon thread running the stream (for lifecycle management).
+        """
+        if self._trade_stream_thread and self._trade_stream_thread.is_alive():
+            logger.warning("trade_stream.already_running")
+            return self._trade_stream_thread
+
+        self._trade_stream = TradingStream(
+            self.api_key,
+            self.secret_key,
+            paper=self.paper,
+        )
+
+        async def _handler_wrapper(data):
+            """Normalize trade update data and invoke user handler."""
+            try:
+                update = {
+                    "event": data.event if hasattr(data, 'event') else str(data.get('event', '')),
+                    "order": {
+                        "id": str(data.order.get('id', '')) if hasattr(data, 'order') and isinstance(data.order, dict) else str(getattr(data.order, 'id', '')),
+                        "symbol": data.order.get('symbol', '') if isinstance(getattr(data, 'order', None), dict) else getattr(data.order, 'symbol', ''),
+                        "side": data.order.get('side', '') if isinstance(getattr(data, 'order', None), dict) else getattr(data.order, 'side', ''),
+                        "qty": data.order.get('qty', '') if isinstance(getattr(data, 'order', None), dict) else getattr(data.order, 'qty', ''),
+                        "filled_qty": data.order.get('filled_qty', '0') if isinstance(getattr(data, 'order', None), dict) else getattr(data.order, 'filled_qty', '0'),
+                        "filled_avg_price": data.order.get('filled_avg_price', None) if isinstance(getattr(data, 'order', None), dict) else getattr(data.order, 'filled_avg_price', None),
+                        "status": data.order.get('status', '') if isinstance(getattr(data, 'order', None), dict) else getattr(data.order, 'status', ''),
+                        "type": data.order.get('type', '') if isinstance(getattr(data, 'order', None), dict) else getattr(data.order, 'type', ''),
+                    },
+                    "timestamp": str(data.timestamp) if hasattr(data, 'timestamp') else None,
+                }
+
+                if asyncio.iscoroutinefunction(handler):
+                    await handler(update)
+                else:
+                    handler(update)
+            except Exception as e:
+                logger.error("trade_stream.handler_error", error=str(e))
+
+        self._trade_stream.subscribe_trade_updates(_handler_wrapper)
+
+        def _run_stream():
+            try:
+                self._trade_stream.run()
+            except Exception as e:
+                logger.error("trade_stream.disconnected", error=str(e))
+
+        self._trade_stream_thread = threading.Thread(
+            target=_run_stream,
+            name="trade-stream",
+            daemon=True,
+        )
+        self._trade_stream_thread.start()
+        logger.info("trade_stream.started")
+        return self._trade_stream_thread
+
+    def stop_trade_stream(self):
+        """Stop the trade update stream."""
+        if self._trade_stream:
+            try:
+                self._trade_stream.stop()
+            except Exception as e:
+                logger.debug("trade_stream.stop_error", error=str(e))
+            self._trade_stream = None
+        logger.info("trade_stream.stopped")
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Asset Discovery
+    # ──────────────────────────────────────────────────────────────────────
+
+    @_retry()
+    def get_crypto_assets(self) -> list[dict]:
+        """Discover all tradeable crypto pairs on Alpaca."""
+        try:
+            request = GetAssetsRequest(
+                asset_class=AssetClass.CRYPTO,
+                status=AssetStatus.ACTIVE,
+            )
+            assets = self._call(self.trading_client.get_all_assets, request)
+            return [
+                {
+                    "symbol": a.symbol,
+                    "name": a.name,
+                    "exchange": a.exchange.value if a.exchange else None,
+                    "tradable": a.tradable,
+                    "fractionable": a.fractionable,
+                    "min_order_size": getattr(a, 'min_order_size', None),
+                    "min_trade_increment": getattr(a, 'min_trade_increment', None),
+                }
+                for a in assets
+                if a.tradable
+            ]
+        except Exception as exc:
+            logger.error("assets.crypto_discovery_failed", error=str(exc))
+            raise
+
+    @_retry()
+    def get_stock_assets(self, exchange: str = None) -> list[dict]:
+        """Discover tradeable stock assets, optionally filtered by exchange."""
+        try:
+            request = GetAssetsRequest(
+                asset_class=AssetClass.US_EQUITY,
+                status=AssetStatus.ACTIVE,
+            )
+            assets = self._call(self.trading_client.get_all_assets, request)
+            result = []
+            for a in assets:
+                if not a.tradable:
+                    continue
+                if exchange and a.exchange and a.exchange.value != exchange:
+                    continue
+                result.append({
+                    "symbol": a.symbol,
+                    "name": a.name,
+                    "exchange": a.exchange.value if a.exchange else None,
+                    "tradable": a.tradable,
+                    "fractionable": a.fractionable,
+                    "shortable": a.shortable,
+                })
+            return result
+        except Exception as exc:
+            logger.error("assets.stock_discovery_failed", error=str(exc))
+            raise

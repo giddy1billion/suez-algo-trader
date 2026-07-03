@@ -117,6 +117,20 @@ class ReplayBroker:
             self._fill_order(order, price)
             return order
 
+    def market_order_notional(self, symbol: str, notional: float, side: str,
+                              time_in_force: str = "gtc") -> dict:
+        """Submit a market order by dollar amount."""
+        with self._lock:
+            price = self._get_price(symbol)
+            if price is None:
+                raise ValueError(f"No historical data for {symbol}")
+            qty = notional / price
+            order = self._create_order(symbol, qty, side, "market",
+                                       time_in_force=time_in_force)
+            self._fill_order(order, price)
+            order["notional"] = notional
+            return order
+
     def limit_order(self, symbol: str, qty: float, side: str,
                     limit_price: float, time_in_force: str = "day") -> dict:
         """Submit a limit order. Fills if current price satisfies limit."""
@@ -130,6 +144,23 @@ class ReplayBroker:
                 if self._should_fill_limit(side, limit_price, price):
                     self._fill_order(order, limit_price)
 
+            return order
+
+    def stop_limit_order(self, symbol: str, qty: float, side: str,
+                         limit_price: float, stop_price: float,
+                         time_in_force: str = "gtc") -> dict:
+        """Submit a stop-limit order."""
+        with self._lock:
+            order = self._create_order(symbol, qty, side, "stop_limit",
+                                       limit_price=limit_price,
+                                       stop_price=stop_price,
+                                       time_in_force=time_in_force)
+            price = self._get_price(symbol)
+            if price is not None:
+                triggered = (side.lower() == "buy" and price >= stop_price) or \
+                           (side.lower() == "sell" and price <= stop_price)
+                if triggered and self._should_fill_limit(side, limit_price, price):
+                    self._fill_order(order, limit_price)
             return order
 
     def bracket_order(self, symbol: str, qty: float, side: str,
@@ -157,16 +188,20 @@ class ReplayBroker:
                     return order
             return None
 
-    def close_position(self, symbol: str) -> Optional[dict]:
-        """Close an entire position."""
+    def close_position(self, symbol: str, qty: Optional[float] = None) -> Optional[dict]:
+        """Close a position (entirely or partially)."""
         with self._lock:
-            if symbol not in self._positions:
+            normalized = symbol.replace("/", "")
+            actual_symbol = symbol if symbol in self._positions else normalized
+
+            if actual_symbol not in self._positions:
                 return None
 
-            pos = self._positions[symbol]
-            price = self._get_price(symbol) or pos["avg_entry_price"]
+            pos = self._positions[actual_symbol]
+            price = self._get_price(actual_symbol) or pos["avg_entry_price"]
+            close_qty = qty if qty is not None else pos["qty"]
             close_side = "sell" if pos["side"] == "buy" else "buy"
-            order = self._create_order(symbol, pos["qty"], close_side, "market")
+            order = self._create_order(actual_symbol, close_qty, close_side, "market")
             self._fill_order(order, price)
             return order
 
