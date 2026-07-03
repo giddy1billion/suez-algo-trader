@@ -15,11 +15,17 @@ Requires ONLY numpy and pandas.
 
 import numpy as np
 import pandas as pd
+import warnings
 from typing import Optional
 
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+# Suppress pandas PerformanceWarning about DataFrame fragmentation.
+# This module intentionally adds columns one-by-one for readability, and
+# defragments with df.copy() before returning.
+warnings.filterwarnings("ignore", category=pd.errors.PerformanceWarning)
 
 # Minimum bars needed before features are valid (due to rolling windows)
 MINIMUM_BARS_REQUIRED = 100
