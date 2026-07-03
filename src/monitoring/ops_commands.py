@@ -331,3 +331,48 @@ class OpsCommandHandler:
         elif minutes > 0:
             return f"{minutes}m {secs}s"
         return f"{secs}s"
+
+    # ──────────────────────────────────────────────────────────────────────
+    # /strategies
+    # ──────────────────────────────────────────────────────────────────────
+
+    def format_strategies(self, orchestrator) -> str:
+        """Format /strategies response showing all strategy slots and stats."""
+        if orchestrator is None:
+            return "⚠️ Strategy orchestrator not configured."
+
+        if len(orchestrator) == 0:
+            return "⚠️ No strategies registered."
+
+        all_stats = orchestrator.get_all_stats()
+        strategies = all_stats.get("strategies", {})
+        lines = [
+            "<b>📊 Strategy Orchestrator</b>",
+            f"{'═' * 28}",
+            f"Active: <code>{all_stats['active_strategies']}/{all_stats['total_strategies']}</code>",
+            f"Total Cycles: <code>{all_stats['total_cycles']}</code>",
+            f"Total P&amp;L: <code>${all_stats['total_pnl']:.2f}</code>",
+            "",
+        ]
+
+        for name, s in strategies.items():
+            active = s.get("enabled", False)
+            icon = "🟢" if active else "🔴"
+            cycles = s.get("cycle_count", 0)
+            signals = s.get("total_signals", 0)
+            trades = s.get("total_trades", 0)
+            pnl = s.get("realized_pnl", 0)
+            win_rate = s.get("win_rate", 0)
+            weight = s.get("weight", 1.0)
+            symbols = s.get("symbols", [])
+            timeframe = s.get("timeframe", "?")
+            interval = s.get("interval", 0)
+
+            lines.append(f"{icon} <b>{name}</b> (w={weight:.1f})")
+            lines.append(f"   Symbols: <code>{', '.join(symbols[:5])}</code>")
+            lines.append(f"   TF: <code>{timeframe}</code> | Interval: <code>{interval}s</code>")
+            lines.append(f"   Cycles: <code>{cycles}</code> | Signals: <code>{signals}</code> | Trades: <code>{trades}</code>")
+            lines.append(f"   P&amp;L: <code>${pnl:.2f}</code> | Win: <code>{win_rate}%</code>")
+            lines.append("")
+
+        return "\n".join(lines)

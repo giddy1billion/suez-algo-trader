@@ -300,7 +300,119 @@ def cmd_run(
 ):
     """Main trading loop."""
 
-    strategy = create_strategy(strategy_name, symbols, timeframe, lookback)
+    # --- Multi-Strategy Orchestrator Setup ---
+    from src.strategy.orchestrator import StrategyOrchestrator
+    orchestrator = StrategyOrchestrator()
+
+    # Determine multi-strategy config source:
+    # Priority: CLI --strategies > settings.multi_strategy_config > auto-generate from symbols
+    multi_config = []
+    if hasattr(settings, '_cli_strategies') and settings._cli_strategies:
+        # Parse CLI --strategies format: "name:symbols:tf:interval:weight;..."
+        for entry in settings._cli_strategies.split(";"):
+            entry = entry.strip()
+            if not entry:
+                continue
+            parts = entry.split(":")
+            if len(parts) < 2:
+                continue
+            multi_config.append({
+                "name": parts[0].strip(),
+                "symbols": [s.strip() for s in parts[1].split(",")],
+                "timeframe": parts[2].strip() if len(parts) > 2 else timeframe,
+                "interval": int(parts[3]) if len(parts) > 3 else interval,
+                "weight": float(parts[4]) if len(parts) > 4 else 1.0,
+            })
+    elif settings.multi_strategy_config:
+        multi_config = settings.multi_strategies_parsed
+
+    if strategy_name == "multi":
+        if multi_config:
+            # Use explicit multi-strategy config
+            for cfg in multi_config:
+                try:
+                    strat = create_strategy(cfg["name"], cfg["symbols"], cfg["timeframe"], lookback)
+                    orchestrator.add_strategy(
+                        name=cfg["name"],
+                        strategy=strat,
+                        symbols=cfg["symbols"],
+                        timeframe=cfg["timeframe"],
+                        interval=cfg["interval"],
+                        weight=cfg["weight"],
+                    )
+                except Exception as e:
+                    logger.warning("orchestrator.strategy_config_error", name=cfg["name"], error=str(e))
+        else:
+            # Auto-generate multi-strategy config from symbols
+            stock_symbols = [s for s in symbols if "/" not in s]
+            crypto_symbols = [s for s in symbols if "/" in s]
+
+            if stock_symbols:
+                momentum_strat = create_strategy("momentum", stock_symbols, timeframe, lookback)
+                orchestrator.add_strategy(
+                    name="momentum",
+                    strategy=momentum_strat,
+                    symbols=stock_symbols,
+                    timeframe=timeframe,
+                    interval=interval,
+                    weight=1.0,
+                )
+
+            if stock_symbols:
+                mr_strat = create_strategy("mean_reversion", stock_symbols, "15Min", lookback)
+                orchestrator.add_strategy(
+                    name="mean_reversion",
+                    strategy=mr_strat,
+                    symbols=stock_symbols,
+                    timeframe="15Min",
+                    interval=interval * 2,
+                    weight=0.7,
+                )
+
+            try:
+                ml_strat = create_strategy("ml", symbols, timeframe, max(lookback, 500))
+                orchestrator.add_strategy(
+                    name="ml",
+                    strategy=ml_strat,
+                    symbols=symbols,
+                    timeframe=timeframe,
+                    interval=interval * 3,
+                    weight=1.5,
+                )
+            except Exception as e:
+                logger.warning("orchestrator.ml_strategy_unavailable", error=str(e))
+
+            if crypto_symbols:
+                crypto_strat = create_strategy("momentum", crypto_symbols, "5Min", lookback)
+                orchestrator.add_strategy(
+                    name="crypto_momentum",
+                    strategy=crypto_strat,
+                    symbols=crypto_symbols,
+                    timeframe="5Min",
+                    interval=max(30, interval // 2),
+                    weight=0.8,
+                )
+
+        # Use first strategy as the "primary" for backward compatibility
+        if len(orchestrator) > 0:
+            strategy = orchestrator._slots[next(iter(orchestrator._slots))].strategy
+        else:
+            strategy = create_strategy("momentum", symbols, timeframe, lookback)
+            orchestrator.add_strategy(name="momentum", strategy=strategy, symbols=symbols,
+                                     timeframe=timeframe, interval=interval, weight=1.0)
+        logger.info("orchestrator.multi_mode", strategies=len(orchestrator), weights=orchestrator.get_weights())
+    else:
+        # Single-strategy mode (backward compatible)
+        strategy = create_strategy(strategy_name, symbols, timeframe, lookback)
+        orchestrator.add_strategy(
+            name=strategy_name,
+            strategy=strategy,
+            symbols=symbols,
+            timeframe=timeframe,
+            interval=interval,
+            weight=1.0,
+        )
+
     risk = RiskManager(RiskLimits(
         max_position_size_pct=settings.max_position_size_pct,
         max_daily_loss_pct=settings.max_daily_loss_pct,
@@ -475,6 +587,54 @@ def cmd_run(
         _stream_thread = threading.Thread(target=_run_stream, daemon=True)
         _stream_thread.start()
         logger.info("stream.started", symbols=len(symbols))
+
+    # Start trade update stream (real-time order fills/cancellations)
+    if not dry_run:
+        def _trade_update_handler(update: dict):
+            """Handle real-time trade updates from Alpaca WebSocket."""
+            event_type = update.get("event", "")
+            order_info = update.get("order", {})
+            symbol = order_info.get("symbol", "?")
+            order_id = order_info.get("id", "")
+
+            if event_type in ("fill", "partial_fill"):
+                filled_qty = order_info.get("filled_qty", "0")
+                filled_price = order_info.get("filled_avg_price")
+                logger.info("trade_update.fill", event=event_type, symbol=symbol,
+                           filled_qty=filled_qty, avg_price=filled_price, order_id=order_id)
+
+                # Publish OrderFilled event if event bus is available
+                if event_bus:
+                    try:
+                        event_bus.publish(OrderFilled(
+                            order_id=order_id,
+                            fill_price=float(filled_price) if filled_price else 0.0,
+                            fill_qty=float(filled_qty) if filled_qty else 0.0,
+                            fees=0.0,
+                            source="trade_stream",
+                        ))
+                    except Exception:
+                        pass
+
+            elif event_type in ("canceled", "rejected", "expired"):
+                reason = order_info.get("status", event_type)
+                logger.warning("trade_update.rejected", event=event_type, symbol=symbol,
+                              reason=reason, order_id=order_id)
+
+                if event_bus:
+                    try:
+                        event_bus.publish(OrderRejected(
+                            order_id=order_id,
+                            reason=f"{event_type}: {reason}",
+                            source="trade_stream",
+                        ))
+                    except Exception:
+                        pass
+            else:
+                logger.debug("trade_update.event", event=event_type, symbol=symbol)
+
+        broker.start_trade_stream(_trade_update_handler)
+        logger.info("trade_stream.active")
 
     print(f"\n{'='*60}")
     print(f"  ALGO TRADER RUNNING - {mode}")
@@ -846,14 +1006,24 @@ def cmd_run(
             if stock_symbols and not broker.is_market_open():
                 next_open = broker.next_market_open()
                 logger.info("market.closed", next_open=str(next_open))
-                if crypto_strategy:
+                # Only run crypto strategies when stock market closed
+                if strategy_name == "multi":
+                    for slot_name in orchestrator.strategy_names:
+                        slot = orchestrator._slots[slot_name]
+                        has_crypto = any("/" in s for s in slot.symbols)
+                        if not has_crypto:
+                            continue  # skip stock-only strategies
+                    with _broker_lock:
+                        results = orchestrator.run_due_strategies(engine)
+                elif crypto_strategy:
                     with _broker_lock:
                         results = engine.run_cycle(crypto_strategy)
                 else:
                     results = []
             else:
+                # Full execution — use orchestrator for all strategies
                 with _broker_lock:
-                    results = engine.run_cycle(strategy)
+                    results = orchestrator.run_due_strategies(engine)
 
             consecutive_errors = 0
 
@@ -927,8 +1097,8 @@ Examples:
 
     parser.add_argument("--live", action="store_true", help="[!] Enable LIVE trading (real money)")
     parser.add_argument("--strategy", "-s", default=settings.active_strategy,
-                       choices=["momentum", "mean_reversion", "ml"],
-                       help="Trading strategy to use")
+                       choices=["momentum", "mean_reversion", "ml", "multi"],
+                       help="Trading strategy (use 'multi' for concurrent strategies)")
     parser.add_argument("--symbols", default=settings.trading_symbols,
                        help="Comma-separated symbols (e.g., AAPL,TSLA,BTC/USD)")
     parser.add_argument("--timeframe", "-tf", default=settings.timeframe,
@@ -946,6 +1116,8 @@ Examples:
     parser.add_argument("--train", action="store_true", help="Train/retrain ML model")
     parser.add_argument("--status", action="store_true", help="Show account status and exit")
     parser.add_argument("--no-telegram", action="store_true", help="Disable Telegram bot")
+    parser.add_argument("--strategies", default="",
+                       help="Multi-strategy config (semicolon-separated): name:symbols:timeframe:interval:weight")
 
     args = parser.parse_args()
 
@@ -1008,6 +1180,11 @@ Examples:
     elif args.train:
         cmd_train(broker, symbols, args.timeframe)
     else:
+        # Pass CLI strategies config to settings for orchestrator to pick up
+        if args.strategies:
+            settings._cli_strategies = args.strategies
+        else:
+            settings._cli_strategies = ""
         cmd_run(broker, args.strategy, symbols, args.timeframe,
                 args.lookback, args.interval, args.dry_run, notifier,
                 enable_telegram=not args.no_telegram,

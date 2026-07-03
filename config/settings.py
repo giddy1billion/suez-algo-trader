@@ -58,6 +58,12 @@ class Settings(BaseSettings):
     timeframe: str = "1Hour"
     lookback_bars: int = 200
 
+    # --- Multi-Strategy Orchestrator ---
+    # JSON-style config for multi-strategy mode (used when active_strategy="multi")
+    # Format: name:symbols:timeframe:interval:weight (semicolon-separated strategies)
+    # Example: "momentum:AAPL,MSFT:1Hour:60:1.0;ml:NVDA,TSLA:15Min:120:1.5"
+    multi_strategy_config: str = ""
+
     # --- Strategy Parameters (Momentum) ---
     momentum_fast_ema: int = 12
     momentum_slow_ema: int = 26
@@ -177,6 +183,37 @@ class Settings(BaseSettings):
     @property
     def symbols_list(self) -> list[str]:
         return [s.strip() for s in self.trading_symbols.split(",") if s.strip()]
+
+    @property
+    def multi_strategies_parsed(self) -> list[dict]:
+        """Parse multi_strategy_config into list of strategy dicts.
+        
+        Format: "name:symbols:timeframe:interval:weight;..." 
+        Returns: [{"name": ..., "symbols": [...], "timeframe": ..., "interval": int, "weight": float}]
+        """
+        if not self.multi_strategy_config:
+            return []
+        strategies = []
+        for entry in self.multi_strategy_config.split(";"):
+            entry = entry.strip()
+            if not entry:
+                continue
+            parts = entry.split(":")
+            if len(parts) < 3:
+                continue
+            name = parts[0].strip()
+            symbols = [s.strip() for s in parts[1].split(",") if s.strip()]
+            timeframe = parts[2].strip()
+            interval = int(parts[3]) if len(parts) > 3 else 60
+            weight = float(parts[4]) if len(parts) > 4 else 1.0
+            strategies.append({
+                "name": name,
+                "symbols": symbols,
+                "timeframe": timeframe,
+                "interval": interval,
+                "weight": weight,
+            })
+        return strategies
 
     @property
     def is_paper(self) -> bool:
