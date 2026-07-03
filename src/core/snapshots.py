@@ -11,6 +11,7 @@ Use snapshots:
 import json
 import sqlite3
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -137,11 +138,14 @@ class SnapshotManager:
     """
 
     def __init__(self, snapshot_store: SnapshotStore, event_store=None,
-                 snapshot_interval_events: int = 500):
+                 snapshot_interval_events: int = 500,
+                 snapshot_interval_seconds: float = 300.0):
         self.store = snapshot_store
         self.event_store = event_store
         self.snapshot_interval = snapshot_interval_events
+        self._snapshot_interval_seconds = snapshot_interval_seconds
         self._events_since_snapshot = 0
+        self._last_snapshot_time = time.time()
         self._lock = threading.Lock()
 
     def on_event(self, event) -> None:
@@ -150,16 +154,24 @@ class SnapshotManager:
             self._events_since_snapshot += 1
 
     def should_snapshot(self) -> bool:
-        """Check if it's time for a new snapshot."""
+        """Check if it's time for a new snapshot (adaptive: events OR time)."""
         with self._lock:
-            return self._events_since_snapshot >= self.snapshot_interval
+            events_trigger = self._events_since_snapshot >= self.snapshot_interval
+            time_trigger = (time.time() - self._last_snapshot_time) >= self._snapshot_interval_seconds
+            return events_trigger or time_trigger
 
     def take_snapshot(self, session_id: str, last_event_id: int, state: dict) -> int:
-        """Take a snapshot and reset counter."""
+        """Take snapshot and reset both counters."""
         snapshot_id = self.store.save_snapshot(session_id, last_event_id, state)
         with self._lock:
             self._events_since_snapshot = 0
+            self._last_snapshot_time = time.time()
         return snapshot_id
+
+    def force_snapshot(self, session_id: str, last_event_id: int, state: dict, reason: str = "") -> int:
+        """Force a snapshot regardless of interval (e.g., graceful shutdown, pre-deployment)."""
+        logger.info("snapshot.forced", reason=reason)
+        return self.take_snapshot(session_id, last_event_id, state)
 
     def recover_from_snapshot(self, session_id: Optional[str] = None) -> Optional[dict]:
         """

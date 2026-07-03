@@ -440,18 +440,29 @@ class ModelGovernance:
         return hashlib.sha256(schema_str.encode()).hexdigest()[:8]
 
     def _save_lineage(self, lineage: ModelLineage) -> None:
-        """Append a lineage record."""
+        """Append a lineage record (immutable once deployed)."""
         with self._lock:
             all_lineage = self._load_all_lineage()
-            # Replace if version exists, else append
             existing = self._find_lineage(all_lineage, lineage.version)
             if existing is not None:
+                # If already deployed, refuse to overwrite
+                if existing.get("deployed_at"):
+                    logger.warning(
+                        "governance.immutable_reject",
+                        version=lineage.version,
+                        reason="deployed record cannot be overwritten",
+                    )
+                    return
                 all_lineage = [
                     lineage.to_dict() if e.get("version") == lineage.version else e
                     for e in all_lineage
                 ]
             else:
                 all_lineage.append(lineage.to_dict())
+            # Compute and store integrity hash for each new/updated record
+            for entry in all_lineage:
+                if entry.get("version") == lineage.version:
+                    entry["integrity_hash"] = self._compute_integrity_hash(entry)
             self._save_all_lineage(all_lineage)
 
     def _load_all_lineage(self) -> list[dict]:
@@ -480,3 +491,46 @@ class ModelGovernance:
             if entry.get("version") == version:
                 return entry
         return None
+
+    def _compute_integrity_hash(self, record: dict) -> str:
+        """Compute hash of record content excluding deployment fields."""
+        # Exclude mutable deployment fields and the integrity_hash itself
+        excluded = {"deployed_at", "retired_at", "is_deployed", "deployment_reason",
+                    "retirement_reason", "integrity_hash"}
+        content = {k: v for k, v in record.items() if k not in excluded}
+        json_str = json.dumps(content, sort_keys=True, default=str)
+        return hashlib.sha256(json_str.encode()).hexdigest()[:16]
+
+    def verify_integrity(self) -> tuple:
+        """
+        Verify integrity of all governance records.
+        
+        Checks:
+        - All records have required fields (version, training_timestamp)
+        - No deployed record has been tampered with (integrity hash matches)
+        
+        Returns (is_valid, list_of_issues).
+        """
+        issues = []
+        all_lineage = self._load_all_lineage()
+
+        for entry in all_lineage:
+            version = entry.get("version", "<unknown>")
+
+            # Check required fields
+            if not entry.get("version"):
+                issues.append("Record missing 'version' field")
+                continue
+            if not entry.get("training_timestamp"):
+                issues.append(f"Record {version} missing 'training_timestamp'")
+
+            # Check integrity hash for deployed records
+            if entry.get("deployed_at") and entry.get("integrity_hash"):
+                expected_hash = self._compute_integrity_hash(entry)
+                if entry["integrity_hash"] != expected_hash:
+                    issues.append(
+                        f"Record {version} integrity hash mismatch: "
+                        f"expected {expected_hash}, got {entry['integrity_hash']}"
+                    )
+
+        return len(issues) == 0, issues

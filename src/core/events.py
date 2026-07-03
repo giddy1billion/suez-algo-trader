@@ -16,6 +16,9 @@ from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
+# Event schema version — increment when event structure changes
+SCHEMA_VERSION = "1.0.0"
+
 
 # ---------------------------------------------------------------------------
 # Base Event
@@ -33,6 +36,7 @@ class Event:
         """Serialize event to a dictionary."""
         data = asdict(self)
         data["_type"] = type(self).__name__
+        data["_schema_version"] = SCHEMA_VERSION
         # Convert datetime to ISO string
         if isinstance(data.get("timestamp"), datetime):
             data["timestamp"] = data["timestamp"].isoformat()
@@ -43,6 +47,7 @@ class Event:
         """Deserialize event from a dictionary (base implementation)."""
         data = data.copy()
         data.pop("_type", None)
+        data.pop("_schema_version", None)  # Remove version before constructing
         ts = data.get("timestamp")
         if isinstance(ts, str):
             data["timestamp"] = datetime.fromisoformat(ts)
