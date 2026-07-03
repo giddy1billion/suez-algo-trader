@@ -283,7 +283,13 @@ class EnvironmentManager:
                 raise RuntimeError(f"Switch already in progress (state={self._state})")
 
             if self._current_mode == target_mode and not force:
-                raise ValueError(f"Already in {target_mode.value} mode")
+                return {
+                    "success": True,
+                    "old_mode": target_mode.value,
+                    "new_mode": target_mode.value,
+                    "reason": "already_in_target_mode",
+                    "no_op": True,
+                }
 
             old_mode = self._current_mode
             result = {
