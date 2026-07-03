@@ -1,4 +1,4 @@
-﻿"""
+"""
 Backtesting Engine â€” Run strategies against historical data to evaluate performance.
 """
 

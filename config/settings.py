@@ -99,11 +99,18 @@ class Settings(BaseSettings):
     def is_paper(self) -> bool:
         return self.trading_mode == TradingMode.PAPER
 
-    @field_validator("max_position_size_pct", "max_daily_loss_pct", "max_portfolio_exposure")
+    @field_validator("max_position_size_pct", "max_daily_loss_pct", "max_portfolio_exposure", "max_single_stock_pct", "default_stop_loss_pct", "default_take_profit_pct")
     @classmethod
     def validate_percentage(cls, v: float) -> float:
         if not 0 < v <= 1.0:
             raise ValueError(f"Percentage must be between 0 and 1.0, got {v}")
+        return v
+
+    @field_validator("max_leverage")
+    @classmethod
+    def validate_leverage(cls, v: float) -> float:
+        if v <= 0 or v > 10:
+            raise ValueError(f"Leverage must be between 0 and 10, got {v}")
         return v
 
 

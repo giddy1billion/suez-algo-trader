@@ -125,15 +125,27 @@ class DatabaseManager:
                     setattr(trade, k, v)
                 session.commit()
 
-    def get_trades(self, symbol: str = None, strategy: str = None, limit: int = 100) -> list[Trade]:
-        """Query trades with optional filters."""
+    def get_trades(self, symbol: str = None, strategy: str = None, limit: int = 100) -> list[dict]:
+        """Query trades with optional filters. Returns dicts to avoid detached session issues."""
         with self.get_session() as session:
             q = session.query(Trade)
             if symbol:
                 q = q.filter_by(symbol=symbol)
             if strategy:
                 q = q.filter_by(strategy=strategy)
-            return q.order_by(Trade.created_at.desc()).limit(limit).all()
+            trades = q.order_by(Trade.created_at.desc()).limit(limit).all()
+            return [
+                {
+                    "id": t.id, "symbol": t.symbol, "side": t.side,
+                    "qty": t.qty, "price": t.price, "order_type": t.order_type,
+                    "status": t.status, "order_id": t.order_id, "strategy": t.strategy,
+                    "signal_confidence": t.signal_confidence, "stop_loss": t.stop_loss,
+                    "take_profit": t.take_profit, "pnl": t.pnl, "pnl_pct": t.pnl_pct,
+                    "fees": t.fees, "created_at": str(t.created_at),
+                    "filled_at": str(t.filled_at) if t.filled_at else None,
+                }
+                for t in trades
+            ]
 
     # --- Signals ---
 
@@ -155,14 +167,23 @@ class DatabaseManager:
             session.commit()
             return snap
 
-    def get_portfolio_history(self, days: int = 30) -> list[PortfolioSnapshot]:
-        """Get recent portfolio snapshots."""
+    def get_portfolio_history(self, days: int = 30) -> list[dict]:
+        """Get recent portfolio snapshots as dicts."""
         from datetime import timedelta
         cutoff = datetime.utcnow() - timedelta(days=days)
         with self.get_session() as session:
-            return session.query(PortfolioSnapshot).filter(
+            snapshots = session.query(PortfolioSnapshot).filter(
                 PortfolioSnapshot.created_at >= cutoff
             ).order_by(PortfolioSnapshot.created_at).all()
+            return [
+                {
+                    "total_equity": s.total_equity, "cash": s.cash,
+                    "positions_value": s.positions_value, "unrealized_pnl": s.unrealized_pnl,
+                    "daily_pnl": s.daily_pnl, "open_positions": s.open_positions,
+                    "created_at": str(s.created_at),
+                }
+                for s in snapshots
+            ]
 
     # --- Performance Metrics ---
 

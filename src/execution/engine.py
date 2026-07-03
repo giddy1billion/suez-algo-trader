@@ -52,6 +52,7 @@ class ExecutionEngine:
         5. Log everything
         """
         self._last_cycle_time = datetime.now()
+        self._current_strategy_name = strategy.name
         results = []
 
         # 1. Check if trading is allowed
@@ -132,24 +133,14 @@ class ExecutionEngine:
                 portfolio_value=portfolio_value,
             )
         else:
-            # Fallback: use max position size
-            max_value = portfolio_value * self.risk.limits.max_position_size_pct
+            # Fallback: use max single stock allocation
+            max_value = portfolio_value * self.risk.limits.max_single_stock_pct
             qty = max_value / signal.price
 
         if qty <= 0:
             return None
 
         # Risk evaluation
-        approved, reason, params = self.risk.evaluate_trade(
-            symbol=signal.symbol,
-            side=side,
-            qty=params.get('adjusted_qty', qty) if (approved := True) else qty,
-            price=signal.price,
-            portfolio_value=portfolio_value,
-            current_positions=positions,
-        )
-
-        # Re-evaluate properly
         approved, reason, params = self.risk.evaluate_trade(
             symbol=signal.symbol,
             side=side,
@@ -250,7 +241,7 @@ class ExecutionEngine:
         try:
             self.db.log_signal({
                 "symbol": signal.symbol,
-                "strategy": "momentum",
+                "strategy": getattr(self, '_current_strategy_name', 'unknown'),
                 "signal": signal.signal.name,
                 "confidence": signal.confidence,
                 "price_at_signal": signal.price,

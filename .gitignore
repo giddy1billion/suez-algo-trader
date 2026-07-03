@@ -30,3 +30,6 @@ desktop.ini
 
 # Jupyter
 .ipynb_checkpoints/
+
+# Generated configs
+liu_tradeplan.toml

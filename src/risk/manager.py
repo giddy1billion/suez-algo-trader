@@ -86,8 +86,8 @@ class RiskManager:
         if self.daily_stats.is_halted:
             return False, f"Trading halted: {self.daily_stats.halt_reason}"
 
-        # Daily loss limit
-        if abs(self.daily_stats.daily_return_pct) >= self.limits.max_daily_loss_pct:
+        # Daily loss limit (only halts on losses, not profits)
+        if self.daily_stats.daily_return_pct <= -self.limits.max_daily_loss_pct:
             self.daily_stats.is_halted = True
             self.daily_stats.halt_reason = f"Daily loss limit hit: {self.daily_stats.daily_return_pct:.2%}"
             logger.warning("risk.halted", reason=self.daily_stats.halt_reason)

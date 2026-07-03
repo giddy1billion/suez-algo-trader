@@ -121,11 +121,11 @@ class MomentumStrategy(BaseStrategy):
         confidence_factors = []
 
         # 1. EMA Crossover (strong signal)
-        if latest['ema_cross'] == 1 and prev.get('ema_cross_prev', 0) == -1:
+        if latest['ema_cross'] == 1 and latest['ema_cross_prev'] == -1:
             score += 2
             reasons.append("EMA bullish crossover")
             confidence_factors.append(0.8)
-        elif latest['ema_cross'] == -1 and prev.get('ema_cross_prev', 0) == 1:
+        elif latest['ema_cross'] == -1 and latest['ema_cross_prev'] == 1:
             score -= 2
             reasons.append("EMA bearish crossover")
             confidence_factors.append(0.8)

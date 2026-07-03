@@ -32,7 +32,12 @@ def vectorbt_momentum_backtest(
     Returns:
         Dict with performance metrics
     """
-    import vectorbt as vbt
+    try:
+        import vectorbt as vbt
+    except ImportError:
+        raise ImportError(
+            "vectorbt is not installed. Install with: pip install vectorbt"
+        )
 
     close = df['close']
 
@@ -87,7 +92,12 @@ def vectorbt_parameter_sweep(
     Returns:
         DataFrame with metrics for each parameter combination
     """
-    import vectorbt as vbt
+    try:
+        import vectorbt as vbt
+    except ImportError:
+        raise ImportError(
+            "vectorbt is not installed. Install with: pip install vectorbt"
+        )
 
     close = df['close']
 

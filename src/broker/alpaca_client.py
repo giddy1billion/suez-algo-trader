@@ -240,7 +240,15 @@ class AlpacaBroker:
         tf = TIMEFRAME_MAP.get(timeframe, TimeFrame(1, TimeFrameUnit.Hour))
 
         if not start:
-            start = datetime.now() - timedelta(days=max(limit * 2, 30))
+            # Estimate how many calendar days to fetch based on timeframe
+            bars_per_day = {
+                "1Min": 390, "5Min": 78, "15Min": 26,
+                "30Min": 13, "1Hour": 7, "4Hour": 2,
+                "1Day": 1, "1Week": 0.2,
+            }
+            bpd = bars_per_day.get(timeframe, 7)
+            days_needed = int((limit / max(bpd, 0.1)) * 1.5) + 5
+            start = datetime.now() - timedelta(days=max(days_needed, 7))
 
         is_crypto = "/" in symbol  # BTC/USD, ETH/USD
 
@@ -262,7 +270,13 @@ class AlpacaBroker:
             )
             bars = self.stock_data.get_stock_bars(request)
 
-        return bars[symbol] if symbol in bars else bars.df
+        # Always return list of Bar objects for consistency
+        if symbol in bars:
+            return bars[symbol]
+        # Fallback: try accessing via .data dict
+        if hasattr(bars, 'data') and symbol in bars.data:
+            return bars.data[symbol]
+        return []
 
     def get_latest_price(self, symbol: str) -> float:
         """Get the latest price for a symbol."""
@@ -283,8 +297,8 @@ class AlpacaBroker:
 
         bars = self.get_bars(symbol, timeframe, limit)
 
-        if hasattr(bars, 'df'):
-            return bars.df
+        if not bars:
+            return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
 
         records = []
         for bar in bars:
@@ -296,7 +310,9 @@ class AlpacaBroker:
                 "close": float(bar.close),
                 "volume": float(bar.volume),
             })
-        return pd.DataFrame(records).set_index("timestamp")
+        df = pd.DataFrame(records).set_index("timestamp")
+        df.index = pd.to_datetime(df.index, utc=True)
+        return df
 
     # ──────────────────────────────────────────────────────────────────────
     # Real-time WebSocket Streaming

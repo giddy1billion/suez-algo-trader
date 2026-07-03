@@ -96,9 +96,14 @@ def engineer_features(df: pd.DataFrame, include_target: bool = False, forward_ba
     return df
 
 
-def get_feature_names() -> list[str]:
-    """Return the list of feature column names (excluding target)."""
-    return [
+def get_feature_names(include_time_features: bool = True) -> list[str]:
+    """Return the list of feature column names (excluding target).
+    
+    Args:
+        include_time_features: Whether to include hour/dow cyclical features.
+            Only set True when the data has a DatetimeIndex.
+    """
+    features = [
         'ret_1', 'ret_2', 'ret_3', 'ret_5', 'ret_10', 'ret_20', 'ret_50',
         'vol_5', 'vol_10', 'vol_20', 'vol_ratio',
         'dist_sma_5', 'dist_sma_10', 'dist_sma_20', 'dist_sma_50', 'dist_sma_100', 'dist_sma_200',
@@ -108,5 +113,7 @@ def get_feature_names() -> list[str]:
         'vol_spike', 'vol_trend',
         'body_pct', 'upper_wick', 'lower_wick',
         'atr_pct',
-        'hour_sin', 'hour_cos', 'dow_sin', 'dow_cos',
     ]
+    if include_time_features:
+        features.extend(['hour_sin', 'hour_cos', 'dow_sin', 'dow_cos'])
+    return features

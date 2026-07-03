@@ -18,6 +18,7 @@ import argparse
 import sys
 import time
 import signal
+import threading
 from datetime import datetime
 
 from dotenv import load_dotenv
@@ -40,19 +41,20 @@ from src.notifications.alerts import NotificationManager
 # Globals
 # ──────────────────────────────────────────────────────────────────────────
 
-_shutdown_requested = False
+_shutdown_event = threading.Event()
 logger = None
 
 
 def signal_handler(sig, frame):
     """Handle Ctrl+C gracefully."""
-    global _shutdown_requested
-    _shutdown_requested = True
+    _shutdown_event.set()
     if logger:
         logger.info("shutdown.requested")
 
 
 signal.signal(signal.SIGINT, signal_handler)
+if hasattr(signal, 'SIGBREAK'):
+    signal.signal(signal.SIGBREAK, signal_handler)
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -207,7 +209,6 @@ def cmd_run(
     notifier: NotificationManager, enable_telegram: bool = False
 ):
     """Main trading loop."""
-    global _shutdown_requested
 
     strategy = create_strategy(strategy_name, symbols, timeframe, lookback)
     risk = RiskManager(RiskLimits(
@@ -226,19 +227,28 @@ def cmd_run(
     account = broker.get_account()
     risk.reset_daily(account['equity'])
 
-    # Start Telegram bot if enabled
+    # Start Telegram bot if enabled (runs in background thread)
     telegram_bot = None
+    _telegram_thread = None
     if enable_telegram and settings.telegram_bot_token:
-        from src.notifications.telegram_bot import TelegramBotManager, set_components
+        import threading
+        from src.notifications.telegram_bot import TelegramBotManager, set_components, _bot_paused
+
         chat_ids = [int(settings.telegram_chat_id)] if settings.telegram_chat_id else []
         set_components(broker, engine, risk, strategy, chat_ids)
         telegram_bot = TelegramBotManager(
             token=settings.telegram_bot_token,
             authorized_chat_ids=chat_ids,
         )
-        import asyncio
-        loop = asyncio.new_event_loop()
-        loop.run_until_complete(telegram_bot.start())
+
+        def _run_telegram_bot(bot):
+            import asyncio
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(bot.dp.start_polling(bot.bot))
+
+        _telegram_thread = threading.Thread(target=_run_telegram_bot, args=(telegram_bot,), daemon=True)
+        _telegram_thread.start()
         logger.info("telegram.bot_started")
 
     mode = "DRY RUN" if dry_run else ("PAPER" if broker.paper else "[LIVE]")
@@ -249,14 +259,26 @@ def cmd_run(
     print(f"  ALGO TRADER RUNNING - {mode}")
     print(f"  Strategy: {strategy_name} | Symbols: {len(symbols)} | Interval: {interval}s")
     print(f"  Ctrl+C to stop gracefully")
+    if telegram_bot:
+        print(f"  Telegram bot active for remote control")
     print(f"{'='*60}\n")
 
     cycle_count = 0
     consecutive_errors = 0
 
-    while not _shutdown_requested:
+    # Cache crypto-only strategy to avoid re-creating each cycle (#16)
+    crypto_only = [s for s in symbols if "/" in s]
+    crypto_strategy = create_strategy(strategy_name, crypto_only, timeframe, lookback) if crypto_only else None
+
+    while not _shutdown_event.is_set():
         cycle_count += 1
         cycle_start = time.time()
+
+        # Check if paused via Telegram (#3 fix)
+        if telegram_bot and telegram_bot.is_paused():
+            logger.debug("cycle.paused_via_telegram")
+            time.sleep(5)
+            continue
 
         try:
             # For stocks: check market hours
@@ -265,10 +287,8 @@ def cmd_run(
                 next_open = broker.next_market_open()
                 logger.info("market.closed", next_open=str(next_open))
                 # Still process crypto if any
-                crypto_only = [s for s in symbols if "/" in s]
-                if crypto_only:
-                    strategy_copy = create_strategy(strategy_name, crypto_only, timeframe, lookback)
-                    results = engine.run_cycle(strategy_copy)
+                if crypto_strategy:
+                    results = engine.run_cycle(crypto_strategy)
                 else:
                     results = []
             else:
@@ -302,15 +322,19 @@ def cmd_run(
         sleep_time = max(1, interval - elapsed)
         logger.debug("cycle.sleeping", seconds=int(sleep_time))
 
-        # Interruptible sleep
-        for _ in range(int(sleep_time)):
-            if _shutdown_requested:
-                break
-            time.sleep(1)
+        # Interruptible sleep using Event.wait()
+        _shutdown_event.wait(timeout=sleep_time)
 
     # Shutdown
     logger.info("bot.stopped", cycles=cycle_count)
     notifier.notify_daily_summary(risk.get_daily_summary())
+    if telegram_bot:
+        import asyncio
+        try:
+            loop = asyncio.new_event_loop()
+            loop.run_until_complete(telegram_bot.stop())
+        except Exception:
+            pass
     print(f"\n[OK] Bot stopped after {cycle_count} cycles. All state saved.")
 
 

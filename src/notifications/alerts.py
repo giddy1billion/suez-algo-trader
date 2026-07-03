@@ -121,13 +121,14 @@ class NotificationManager:
         logger.info("notification", message=message[:100])
 
     def _send_telegram(self, message: str):
-        """Send via Telegram Bot API."""
+        """Send via Telegram Bot API using Markdown formatting."""
         url = f"https://api.telegram.org/bot{self.telegram_token}/sendMessage"
-        # Convert markdown bold to Telegram HTML
-        text = message.replace("**", "<b>").replace("**", "</b>")
+        # Telegram Markdown uses *bold* not **bold**
+        import re
+        text = re.sub(r'\*\*(.*?)\*\*', r'*\1*', message)
         payload = {
             "chat_id": self.telegram_chat_id,
-            "text": message,
+            "text": text,
             "parse_mode": "Markdown",
         }
         try:

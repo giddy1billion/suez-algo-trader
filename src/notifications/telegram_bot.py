@@ -47,6 +47,10 @@ _strategy = None
 _bot_paused = False
 _authorized_users: set[int] = set()
 
+# Thread-safe lock for broker operations (broker is called from Telegram's async thread)
+import threading
+_broker_lock = threading.Lock()
+
 
 def set_components(broker, engine, risk_manager, strategy, authorized_chat_ids: list[int] = None):
     """Inject trading components into the bot module."""
@@ -288,7 +292,7 @@ async def cmd_buy(message: Message):
     # Confirmation keyboard
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="Confirm BUY", callback_data=f"confirm_buy_{symbol}_{qty}"),
+            InlineKeyboardButton(text="Confirm BUY", callback_data=f"buy|{symbol}|{qty}"),
             InlineKeyboardButton(text="Cancel", callback_data="cancel_order"),
         ]
     ])
@@ -317,7 +321,7 @@ async def cmd_sell(message: Message):
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="Confirm SELL", callback_data=f"confirm_sell_{symbol}_{qty}"),
+            InlineKeyboardButton(text="Confirm SELL", callback_data=f"sell|{symbol}|{qty}"),
             InlineKeyboardButton(text="Cancel", callback_data="cancel_order"),
         ]
     ])
@@ -340,7 +344,7 @@ async def cmd_close(message: Message):
     symbol = parts[1].upper()
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text=f"Close {symbol}", callback_data=f"confirm_close_{symbol}"),
+            InlineKeyboardButton(text=f"Close {symbol}", callback_data=f"close|{symbol}"),
             InlineKeyboardButton(text="Cancel", callback_data="cancel_order"),
         ]
     ])
@@ -357,7 +361,7 @@ async def cmd_closeall(message: Message):
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="YES - CLOSE ALL", callback_data="confirm_closeall"),
+            InlineKeyboardButton(text="YES - CLOSE ALL", callback_data="closeall"),
             InlineKeyboardButton(text="Cancel", callback_data="cancel_order"),
         ]
     ])
@@ -445,14 +449,15 @@ async def cmd_risk(message: Message):
 # Callback Handlers (inline button confirmations)
 # ──────────────────────────────────────────────────────────────────────────
 
-@router.callback_query(F.data.startswith("confirm_buy_"))
+@router.callback_query(F.data.startswith("buy|"))
 async def callback_confirm_buy(callback: CallbackQuery):
-    parts = callback.data.split("_")
-    symbol = parts[2]
-    qty = float(parts[3])
+    parts = callback.data.split("|")
+    symbol = parts[1]
+    qty = float(parts[2])
 
     try:
-        order = _broker.market_order(symbol, qty, "buy")
+        with _broker_lock:
+            order = _broker.market_order(symbol, qty, "buy")
         await callback.message.edit_text(
             f"BUY order placed: {symbol} x {qty}\nOrder ID: {order['id'][:8]}..."
         )
@@ -461,14 +466,15 @@ async def callback_confirm_buy(callback: CallbackQuery):
     await callback.answer()
 
 
-@router.callback_query(F.data.startswith("confirm_sell_"))
+@router.callback_query(F.data.startswith("sell|"))
 async def callback_confirm_sell(callback: CallbackQuery):
-    parts = callback.data.split("_")
-    symbol = parts[2]
-    qty = float(parts[3])
+    parts = callback.data.split("|")
+    symbol = parts[1]
+    qty = float(parts[2])
 
     try:
-        order = _broker.market_order(symbol, qty, "sell")
+        with _broker_lock:
+            order = _broker.market_order(symbol, qty, "sell")
         await callback.message.edit_text(
             f"SELL order placed: {symbol} x {qty}\nOrder ID: {order['id'][:8]}..."
         )
@@ -477,22 +483,24 @@ async def callback_confirm_sell(callback: CallbackQuery):
     await callback.answer()
 
 
-@router.callback_query(F.data.startswith("confirm_close_"))
+@router.callback_query(F.data.startswith("close|"))
 async def callback_confirm_close(callback: CallbackQuery):
-    symbol = callback.data.replace("confirm_close_", "")
+    symbol = callback.data.split("|")[1]
     try:
-        _broker.close_position(symbol)
+        with _broker_lock:
+            _broker.close_position(symbol)
         await callback.message.edit_text(f"Position in {symbol} closed.")
     except Exception as e:
         await callback.message.edit_text(f"Close failed: {e}")
     await callback.answer()
 
 
-@router.callback_query(F.data == "confirm_closeall")
+@router.callback_query(F.data == "closeall")
 async def callback_confirm_closeall(callback: CallbackQuery):
     try:
-        _broker.cancel_all_orders()
-        _broker.close_all_positions()
+        with _broker_lock:
+            _broker.cancel_all_orders()
+            _broker.close_all_positions()
         await callback.message.edit_text("ALL positions closed. ALL orders cancelled.")
     except Exception as e:
         await callback.message.edit_text(f"Emergency liquidation error: {e}")
