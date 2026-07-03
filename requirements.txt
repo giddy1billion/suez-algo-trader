@@ -1,57 +1,76 @@
-# Alpaca Trading API
+# ═══════════════════════════════════════════════════════════════════════════════
+# Algo Trader — Full Platform Requirements
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ─── Core: Alpaca Trading API ─────────────────────────────────────────────────
 alpaca-py>=0.43.0
 
-# Data & Analysis
+# ─── Data & Technical Analysis ────────────────────────────────────────────────
 pandas>=2.0.0
 numpy>=1.24.0
 ta>=0.11.0
+scipy>=1.11.0
 
-# ML/AI
+# ─── ML / AI ─────────────────────────────────────────────────────────────────
 scikit-learn>=1.3.0
 xgboost>=2.0.0
 joblib>=1.3.0
 
-# Reinforcement Learning (FinRL)
+# ─── Reinforcement Learning (optional — heavy, install separately if needed) ─
+# pip install finrl stable-baselines3 gymnasium
 # finrl>=0.3.6
 # stable-baselines3>=2.0.0
 # gymnasium>=0.29.0
 
-# WebSocket streaming
+# ─── Backtesting Engines ─────────────────────────────────────────────────────
+backtrader>=1.9.78
+vectorbt>=0.26.0
+numba>=0.59.0
+
+# ─── Telegram Bot (aiogram 3.x) ──────────────────────────────────────────────
+aiogram>=3.10.0
+aiohttp>=3.9.0
+aiofiles>=23.0.0
+
+# ─── WebSocket / Streaming ───────────────────────────────────────────────────
 websockets>=12.0
 
-# Async
-aiohttp>=3.9.0
-aiogram>=3.10.0
-
-# Database
+# ─── Database ────────────────────────────────────────────────────────────────
 sqlalchemy>=2.0.0
 aiosqlite>=0.19.0
 
-# Environment & Config
+# ─── Environment & Config ────────────────────────────────────────────────────
 python-dotenv>=1.0.0
 pydantic>=2.5.0
 pydantic-settings>=2.1.0
 
-# Scheduling
+# ─── Scheduling ──────────────────────────────────────────────────────────────
 apscheduler>=3.10.0
 
-# Notifications & Bot Management
+# ─── HTTP / Notifications ────────────────────────────────────────────────────
 httpx>=0.25.0
+requests>=2.31.0
 
-# Backtesting
-backtrader>=1.9.78
-vectorbt>=0.26.0
-
-# Framework Integration
-# liualgotrader>=0.0.87
-
-# Visualization
+# ─── Visualization ───────────────────────────────────────────────────────────
 matplotlib>=3.7.0
+plotly>=5.18.0
 
-# Logging
+# ─── Logging ─────────────────────────────────────────────────────────────────
 structlog>=23.1.0
 
-# Testing
+# ─── Utilities ───────────────────────────────────────────────────────────────
+tqdm>=4.65.0
+psutil>=5.9.0
+dateparser>=1.1.0
+schedule>=1.2.0
+dill>=0.3.7
+
+# ─── Framework Integration (optional — install separately) ───────────────────
+# pip install liualgotrader  (requires PostgreSQL)
+# liualgotrader>=0.0.87
+
+# ─── Testing & Dev ───────────────────────────────────────────────────────────
 pytest>=7.4.0
 pytest-asyncio>=0.21.0
+ipython>=8.0.0
 
