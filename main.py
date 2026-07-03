@@ -295,8 +295,8 @@ def _train_ml_model(broker: AlpacaBroker, symbols: list[str], timeframe: str):
 def cmd_run(
     broker: AlpacaBroker, strategy_name: str, symbols: list[str],
     timeframe: str, lookback: int, interval: int, dry_run: bool,
-    notifier: NotificationManager, enable_telegram: bool = False,
-    enable_streaming: bool = False
+    notifier: NotificationManager, enable_telegram: bool = True,
+    enable_streaming: bool = True
 ):
     """Main trading loop."""
 
@@ -942,10 +942,10 @@ Examples:
     parser.add_argument("--backtest", action="store_true", help="Run custom backtest engine")
     parser.add_argument("--backtest-bt", action="store_true", help="Run Backtrader backtest")
     parser.add_argument("--backtest-vbt", action="store_true", help="Run VectorBT vectorized backtest")
-    parser.add_argument("--stream", action="store_true", help="Use WebSocket streaming for real-time data")
+    parser.add_argument("--no-stream", action="store_true", help="Disable WebSocket streaming for real-time data")
     parser.add_argument("--train", action="store_true", help="Train/retrain ML model")
     parser.add_argument("--status", action="store_true", help="Show account status and exit")
-    parser.add_argument("--telegram", action="store_true", help="Enable Telegram bot for interactive control")
+    parser.add_argument("--no-telegram", action="store_true", help="Disable Telegram bot")
 
     args = parser.parse_args()
 
@@ -1010,8 +1010,8 @@ Examples:
     else:
         cmd_run(broker, args.strategy, symbols, args.timeframe,
                 args.lookback, args.interval, args.dry_run, notifier,
-                enable_telegram=args.telegram,
-                enable_streaming=getattr(args, 'stream', False))
+                enable_telegram=not args.no_telegram,
+                enable_streaming=not getattr(args, 'no_stream', False))
 
 
 if __name__ == "__main__":
