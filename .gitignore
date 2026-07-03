@@ -1,0 +1,32 @@
+# Dependencies
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Environment
+.env
+
+# Data & Models
+data_cache/*.db
+data_cache/*.csv
+models/*.joblib
+models/*.pkl
+logs/*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Jupyter
+.ipynb_checkpoints/
