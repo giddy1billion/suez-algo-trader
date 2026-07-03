@@ -33,8 +33,13 @@ def _numpy_ema_crossover_backtest(
     slow_ema: int = 26,
     initial_cash: float = 10000.0,
     fees: float = 0.001,
+    risk_per_trade: float = 1.0,
 ) -> dict:
-    """Vectorized EMA crossover backtest using pure numpy/pandas."""
+    """Vectorized EMA crossover backtest using pure numpy/pandas.
+    
+    Args:
+        risk_per_trade: Fraction of equity to risk per trade (1.0 = all-in, 0.02 = 2%)
+    """
     close = df['close'].values.astype(float)
     n = len(close)
 
@@ -57,11 +62,12 @@ def _numpy_ema_crossover_backtest(
 
     for i in range(n):
         if entries[i] and position == 0:
-            # Buy
-            qty = (cash * (1 - fees)) / close[i]
+            # Buy — use risk_per_trade fraction of available cash
+            invest_amount = cash * min(risk_per_trade, 1.0)
+            qty = (invest_amount * (1 - fees)) / close[i]
             position = qty
             entry_price = close[i]
-            cash = 0.0
+            cash -= invest_amount
         elif exits[i] and position > 0:
             # Sell
             proceeds = position * close[i] * (1 - fees)
@@ -72,11 +78,11 @@ def _numpy_ema_crossover_backtest(
                 'pnl': pnl,
                 'return': (close[i] - entry_price) / entry_price,
             })
-            cash = proceeds
+            cash += proceeds
             position = 0.0
 
     # Final value
-    final_value = cash + position * close[-1] if position > 0 else cash
+    final_value = cash + position * close[-1] * (1 - fees) if position > 0 else cash
     total_return = (final_value - initial_cash) / initial_cash
 
     # Metrics
@@ -92,16 +98,17 @@ def _numpy_ema_crossover_backtest(
         sharpe = 0.0
 
     # Max drawdown from equity curve
-    equity = np.full(n, initial_cash)
+    equity = np.full(n, initial_cash, dtype=float)
     pos = 0.0
     c = initial_cash
     for i in range(n):
         if entries[i] and pos == 0:
-            qty = (c * (1 - fees)) / close[i]
+            invest_amount = c * min(risk_per_trade, 1.0)
+            qty = (invest_amount * (1 - fees)) / close[i]
             pos = qty
-            c = 0.0
+            c -= invest_amount
         elif exits[i] and pos > 0:
-            c = pos * close[i] * (1 - fees)
+            c += pos * close[i] * (1 - fees)
             pos = 0.0
         equity[i] = c + pos * close[i]
 
@@ -123,12 +130,14 @@ def _numpy_ema_crossover_backtest(
 
 def _numpy_parameter_sweep(
     df: pd.DataFrame,
-    fast_range: range = range(5, 30, 5),
-    slow_range: range = range(20, 100, 10),
+    fast_range: range = range(8, 30, 2),
+    slow_range: range = range(20, 56, 2),
     initial_cash: float = 10000.0,
     fees: float = 0.001,
 ) -> pd.DataFrame:
-    """Brute-force parameter sweep using numpy fallback."""
+    """Brute-force parameter sweep using numpy fallback.
+    Default ranges include (12, 26) for direct comparison with single backtest.
+    """
     results = []
     for fast_w in fast_range:
         for slow_w in slow_range:
@@ -161,6 +170,7 @@ def vectorbt_momentum_backtest(
     slow_ema: int = 26,
     initial_cash: float = 10000.0,
     fees: float = 0.001,
+    risk_per_trade: float = 1.0,
 ) -> dict:
     """
     Vectorized EMA crossover backtest.
@@ -172,13 +182,14 @@ def vectorbt_momentum_backtest(
         slow_ema: Slow EMA period
         initial_cash: Starting capital
         fees: Trading fees (0.001 = 0.1%)
+        risk_per_trade: Fraction of equity to invest per trade (1.0 = all-in)
 
     Returns:
         Dict with performance metrics
     """
     if not _VBT_AVAILABLE:
         logger.debug("vbt.using_numpy_fallback")
-        return _numpy_ema_crossover_backtest(df, fast_ema, slow_ema, initial_cash, fees)
+        return _numpy_ema_crossover_backtest(df, fast_ema, slow_ema, initial_cash, fees, risk_per_trade)
 
     close = df['close']
 
@@ -216,14 +227,16 @@ def vectorbt_momentum_backtest(
 
 def vectorbt_parameter_sweep(
     df: pd.DataFrame,
-    fast_range: range = range(5, 30, 5),
-    slow_range: range = range(20, 100, 10),
+    fast_range: range = range(8, 30, 2),
+    slow_range: range = range(20, 56, 2),
     initial_cash: float = 10000.0,
     fees: float = 0.001,
 ) -> pd.DataFrame:
     """
     Parameter optimization — tests ALL EMA combinations.
     Uses vectorbt's batch engine if available, otherwise numpy loop.
+
+    Default ranges include (12, 26) for direct comparison with single backtest.
 
     Returns:
         DataFrame with columns: fast_window, slow_window, total_return,

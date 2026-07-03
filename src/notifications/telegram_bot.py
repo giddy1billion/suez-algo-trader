@@ -27,6 +27,8 @@ Commands:
     /backtestvbt - VectorBT backtest (e.g., /backtestvbt AAPL 30)
     /sweep       - Parameter sweep (e.g., /sweep TSLA 60)
     /train       - Train ML model (e.g., /train AAPL,TSLA 1000)
+    /modelinfo   - ML model metadata (type, date, features, accuracy)
+    /predict     - ML prediction (e.g., /predict BTC/USD)
     /help        - Show all commands
 """
 
@@ -173,6 +175,8 @@ async def cmd_help(message: Message):
         "/backtestvbt [SYMBOL] [DAYS] - VectorBT backtest\n"
         "/sweep [SYMBOL] [DAYS] - Parameter sweep\n"
         "/train [SYMBOLS] [BARS] - Train ML model\n"
+        "/modelinfo - ML model metadata\n"
+        "/predict [SYMBOL] - ML prediction + confidence\n"
     )
     await message.answer(text, parse_mode=ParseMode.HTML)
 
@@ -830,6 +834,10 @@ async def cmd_backtest_vbt(message: Message):
             text = (
                 f"<b>VectorBT Results: {symbol}</b>\n"
                 f"{'=' * 30}\n"
+                f"EMA:          12/26 (default)\n"
+                f"Fees:         0.1%\n"
+                f"Bars:         {len(df)}\n"
+                f"{'─' * 30}\n"
                 f"Return:       {metrics['total_return']:.2%}\n"
                 f"Trades:       {metrics['total_trades']}\n"
                 f"Win Rate:     {metrics['win_rate']:.1%}\n"
@@ -902,6 +910,203 @@ async def cmd_sweep(message: Message):
         await message.answer("VectorBT not installed. Install with: pip install vectorbt")
     except Exception as e:
         await message.answer(f"Sweep error: {e}")
+
+
+@router.message(Command("modelinfo"))
+async def cmd_modelinfo(message: Message):
+    """Show ML model metadata.
+    Displays: model type, training date, accuracy, features, symbols.
+    """
+    if not _is_authorized(message):
+        return
+
+    try:
+        import os
+        import joblib
+        from config.settings import settings
+
+        model_path = settings.ml_model_path
+        if not os.path.exists(model_path):
+            await message.answer("No trained model found.\nUse /train to train one.")
+            return
+
+        data = joblib.load(model_path)
+        model = data.get('model')
+        features = data.get('features', [])
+        trained_at = data.get('trained_at')
+
+        # Get model info
+        model_type = type(model).__name__ if model else "Unknown"
+        n_features = len(features)
+        trained_str = trained_at.strftime('%Y-%m-%d %H:%M') if trained_at else "Unknown"
+
+        # Try to get more details from the model
+        n_estimators = getattr(model, 'n_estimators', '?')
+        max_depth = getattr(model, 'max_depth', '?')
+
+        # File size
+        file_size = os.path.getsize(model_path)
+        size_str = f"{file_size / 1024:.1f} KB" if file_size < 1024 * 1024 else f"{file_size / (1024*1024):.1f} MB"
+
+        # Current strategy status
+        strategy_status = "Active" if (_strategy and _strategy.name == "ml_xgboost" and _strategy.model is not None) else "Not loaded"
+
+        text = (
+            f"<b>🧠 ML Model Info</b>\n"
+            f"{'=' * 30}\n"
+            f"Type:         {model_type}\n"
+            f"Trained:      {trained_str}\n"
+            f"Features:     {n_features}\n"
+            f"Estimators:   {n_estimators}\n"
+            f"Max Depth:    {max_depth}\n"
+            f"File Size:    {size_str}\n"
+            f"Status:       {strategy_status}\n"
+            f"\n<b>Top Features:</b>\n"
+        )
+
+        # Show top features (first 10)
+        for f in features[:10]:
+            text += f"  • {f}\n"
+        if len(features) > 10:
+            text += f"  ... +{len(features) - 10} more"
+
+        await message.answer(text, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        await message.answer(f"Error loading model info: {e}")
+
+
+@router.message(Command("predict"))
+async def cmd_predict(message: Message):
+    """Get ML prediction for a symbol.
+    Usage: /predict [SYMBOL]
+    Shows prediction direction, confidence, and key feature values.
+    """
+    if not _is_authorized(message) or not _broker:
+        return
+
+    parts = message.text.split()
+    symbol = parts[1].upper() if len(parts) > 1 else (_strategy.symbols[0] if _strategy else "BTC/USD")
+
+    # Check if ML strategy is available
+    if not _strategy or _strategy.name != "ml_xgboost" or _strategy.model is None:
+        # Try loading model directly
+        try:
+            import os
+            from config.settings import settings
+            from src.strategy.ml_strategy import MLStrategy
+
+            if not os.path.exists(settings.ml_model_path):
+                await message.answer(
+                    "No ML model available.\n"
+                    "Switch to ML strategy: /setstrategy ml\n"
+                    "Or train a model: /train"
+                )
+                return
+
+            ml_strat = MLStrategy(
+                symbols=[symbol],
+                timeframe=_strategy.timeframe if _strategy else "1Hour",
+                lookback=200,
+                model_path=settings.ml_model_path,
+            )
+        except Exception as e:
+            await message.answer(f"Failed to load ML model: {e}")
+            return
+    else:
+        ml_strat = _strategy
+
+    try:
+        with _broker_lock:
+            df = _broker.get_bars_df(symbol, ml_strat.timeframe, limit=200)
+
+        if df is None or len(df) < 100:
+            await message.answer(f"Insufficient data for {symbol}.")
+            return
+
+        # Calculate features
+        df_feat = ml_strat.calculate_indicators(df)
+        latest = df_feat.iloc[-1:]
+
+        feature_cols = ml_strat._feature_columns or ml_strat.get_feature_columns()
+        available_cols = [c for c in feature_cols if c in df_feat.columns]
+        features = latest[available_cols]
+
+        if features.isna().any(axis=1).iloc[0]:
+            await message.answer(f"Feature calculation incomplete for {symbol}. Need more data.")
+            return
+
+        # Predict
+        import numpy as np
+        proba = ml_strat.model.predict_proba(features)[0]
+        pred_class = np.argmax(proba)
+        confidence = proba[pred_class]
+
+        direction_map = {0: "SELL 📉", 1: "HOLD ➡️", 2: "BUY 📈"}
+        direction = direction_map[pred_class]
+
+        price = float(latest['close'].iloc[0])
+
+        # Key indicators for display
+        key_features = {}
+        for col in ['rsi_14', 'ret_1', 'vol_5', 'dist_sma_20', 'bb_pct', 'atr_pct']:
+            if col in df_feat.columns and not np.isnan(latest[col].iloc[0]):
+                key_features[col] = float(latest[col].iloc[0])
+
+        # Determine signal strength
+        if confidence >= 0.80:
+            strength = "STRONG"
+        elif confidence >= 0.65:
+            strength = "MODERATE"
+        else:
+            strength = "WEAK"
+
+        # ATR for SL/TP
+        atr = float(latest['atr'].iloc[0]) if 'atr' in df_feat.columns and not np.isnan(latest['atr'].iloc[0]) else price * 0.02
+
+        text = (
+            f"<b>🔮 ML Prediction: {symbol}</b>\n"
+            f"{'=' * 30}\n"
+            f"Direction:  <b>{direction}</b>\n"
+            f"Confidence: {confidence:.0%} ({strength})\n"
+            f"Price:      ${price:,.2f}\n"
+            f"\n<b>Probabilities:</b>\n"
+            f"  📉 Sell:  {proba[0]:.0%}\n"
+            f"  ➡️ Hold:  {proba[1]:.0%}\n"
+            f"  📈 Buy:   {proba[2]:.0%}\n"
+        )
+
+        if key_features:
+            text += f"\n<b>Key Indicators:</b>\n"
+            labels = {
+                'rsi_14': 'RSI(14)',
+                'ret_1': 'Return(1bar)',
+                'vol_5': 'Volatility(5)',
+                'dist_sma_20': 'Dist SMA20',
+                'bb_pct': 'BB %B',
+                'atr_pct': 'ATR %',
+            }
+            for col, val in key_features.items():
+                label = labels.get(col, col)
+                if 'pct' in col or 'ret' in col or 'dist' in col or 'vol' in col:
+                    text += f"  {label}: {val:.4f}\n"
+                else:
+                    text += f"  {label}: {val:.2f}\n"
+
+        if pred_class != 1:  # Not HOLD
+            sl_dir = -1 if pred_class == 2 else 1
+            sl = price + sl_dir * atr * 2
+            tp = price - sl_dir * atr * 3
+            text += (
+                f"\n<b>Suggested Levels:</b>\n"
+                f"  Stop Loss:    ${sl:,.2f}\n"
+                f"  Take Profit:  ${tp:,.2f}\n"
+            )
+        else:
+            text += "\n<i>No trade suggested at current confidence.</i>"
+
+        await message.answer(text, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        await message.answer(f"Prediction error: {e}")
 
 
 # ──────────────────────────────────────────────────────────────────────────
