@@ -1,6 +1,9 @@
 """
 VectorBT Integration — Ultra-fast vectorized backtesting.
 Leverages NumPy for batch signal evaluation across symbols and timeframes.
+
+Falls back to a pure numpy/pandas vectorized engine if vectorbt/numba
+can't be imported (common on Python 3.13 where numba DLLs may fail).
 """
 
 import numpy as np
@@ -11,6 +14,146 @@ from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+# Check if vectorbt is usable
+_VBT_AVAILABLE = False
+try:
+    import vectorbt as vbt
+    _VBT_AVAILABLE = True
+except (ImportError, OSError):
+    logger.debug("vbt.unavailable", msg="Using pure numpy fallback")
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Pure numpy/pandas fallback (no vectorbt/numba required)
+# ──────────────────────────────────────────────────────────────────────────
+
+def _numpy_ema_crossover_backtest(
+    df: pd.DataFrame,
+    fast_ema: int = 12,
+    slow_ema: int = 26,
+    initial_cash: float = 10000.0,
+    fees: float = 0.001,
+) -> dict:
+    """Vectorized EMA crossover backtest using pure numpy/pandas."""
+    close = df['close'].values.astype(float)
+    n = len(close)
+
+    # Calculate EMAs
+    fast = pd.Series(close).ewm(span=fast_ema, adjust=False).mean().values
+    slow = pd.Series(close).ewm(span=slow_ema, adjust=False).mean().values
+
+    # Signals: +1 when fast crosses above slow, -1 when below
+    fast_above = fast > slow
+    entries = np.zeros(n, dtype=bool)
+    exits = np.zeros(n, dtype=bool)
+    entries[1:] = fast_above[1:] & ~fast_above[:-1]  # cross above
+    exits[1:] = ~fast_above[1:] & fast_above[:-1]    # cross below
+
+    # Simulate trades
+    cash = initial_cash
+    position = 0.0
+    trades = []
+    entry_price = 0.0
+
+    for i in range(n):
+        if entries[i] and position == 0:
+            # Buy
+            qty = (cash * (1 - fees)) / close[i]
+            position = qty
+            entry_price = close[i]
+            cash = 0.0
+        elif exits[i] and position > 0:
+            # Sell
+            proceeds = position * close[i] * (1 - fees)
+            pnl = proceeds - (position * entry_price)
+            trades.append({
+                'entry_price': entry_price,
+                'exit_price': close[i],
+                'pnl': pnl,
+                'return': (close[i] - entry_price) / entry_price,
+            })
+            cash = proceeds
+            position = 0.0
+
+    # Final value
+    final_value = cash + position * close[-1] if position > 0 else cash
+    total_return = (final_value - initial_cash) / initial_cash
+
+    # Metrics
+    wins = [t for t in trades if t['pnl'] > 0]
+    losses = [t for t in trades if t['pnl'] <= 0]
+    win_rate = len(wins) / len(trades) if trades else 0.0
+
+    # Sharpe ratio (annualized from trade returns)
+    if trades:
+        returns = np.array([t['return'] for t in trades])
+        sharpe = (returns.mean() / returns.std() * np.sqrt(252)) if returns.std() > 0 else 0.0
+    else:
+        sharpe = 0.0
+
+    # Max drawdown from equity curve
+    equity = np.full(n, initial_cash)
+    pos = 0.0
+    c = initial_cash
+    for i in range(n):
+        if entries[i] and pos == 0:
+            qty = (c * (1 - fees)) / close[i]
+            pos = qty
+            c = 0.0
+        elif exits[i] and pos > 0:
+            c = pos * close[i] * (1 - fees)
+            pos = 0.0
+        equity[i] = c + pos * close[i]
+
+    running_max = np.maximum.accumulate(equity)
+    drawdown = (equity - running_max) / running_max
+    max_drawdown = drawdown.min()
+
+    return {
+        'total_return': total_return,
+        'sharpe_ratio': sharpe,
+        'max_drawdown': abs(max_drawdown),
+        'win_rate': win_rate,
+        'total_trades': len(trades),
+        'profit_factor': (sum(t['pnl'] for t in wins) / abs(sum(t['pnl'] for t in losses)))
+                         if losses and sum(t['pnl'] for t in losses) != 0 else float('inf') if wins else 0,
+        'final_value': final_value,
+    }
+
+
+def _numpy_parameter_sweep(
+    df: pd.DataFrame,
+    fast_range: range = range(5, 30, 5),
+    slow_range: range = range(20, 100, 10),
+    initial_cash: float = 10000.0,
+    fees: float = 0.001,
+) -> pd.DataFrame:
+    """Brute-force parameter sweep using numpy fallback."""
+    results = []
+    for fast_w in fast_range:
+        for slow_w in slow_range:
+            if fast_w >= slow_w:
+                continue
+            try:
+                metrics = _numpy_ema_crossover_backtest(df, fast_w, slow_w, initial_cash, fees)
+                results.append({
+                    'fast_window': fast_w,
+                    'slow_window': slow_w,
+                    'total_return': metrics['total_return'],
+                    'sharpe_ratio': metrics['sharpe_ratio'],
+                    'max_drawdown': metrics['max_drawdown'],
+                    'win_rate': metrics['win_rate'],
+                    'total_trades': metrics['total_trades'],
+                })
+            except Exception:
+                continue
+
+    return pd.DataFrame(results) if results else pd.DataFrame()
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Public API (delegates to vectorbt if available, numpy otherwise)
+# ──────────────────────────────────────────────────────────────────────────
 
 def vectorbt_momentum_backtest(
     df: pd.DataFrame,
@@ -20,7 +163,8 @@ def vectorbt_momentum_backtest(
     fees: float = 0.001,
 ) -> dict:
     """
-    Vectorized EMA crossover backtest using vectorbt.
+    Vectorized EMA crossover backtest.
+    Uses vectorbt if available, falls back to pure numpy.
 
     Args:
         df: OHLCV DataFrame with DatetimeIndex and 'close' column
@@ -32,12 +176,9 @@ def vectorbt_momentum_backtest(
     Returns:
         Dict with performance metrics
     """
-    try:
-        import vectorbt as vbt
-    except ImportError:
-        raise ImportError(
-            "vectorbt is not installed. Install with: pip install vectorbt"
-        )
+    if not _VBT_AVAILABLE:
+        logger.debug("vbt.using_numpy_fallback")
+        return _numpy_ema_crossover_backtest(df, fast_ema, slow_ema, initial_cash, fees)
 
     close = df['close']
 
@@ -81,23 +222,16 @@ def vectorbt_parameter_sweep(
     fees: float = 0.001,
 ) -> pd.DataFrame:
     """
-    Vectorized parameter optimization — tests ALL combinations simultaneously.
-    This is where vectorbt shines: testing 100+ parameter combos in seconds.
-
-    Args:
-        df: OHLCV DataFrame
-        fast_range: Range of fast EMA periods to test
-        slow_range: Range of slow EMA periods to test
+    Parameter optimization — tests ALL EMA combinations.
+    Uses vectorbt's batch engine if available, otherwise numpy loop.
 
     Returns:
-        DataFrame with metrics for each parameter combination
+        DataFrame with columns: fast_window, slow_window, total_return,
+        sharpe_ratio, max_drawdown, win_rate, total_trades
     """
-    try:
-        import vectorbt as vbt
-    except ImportError:
-        raise ImportError(
-            "vectorbt is not installed. Install with: pip install vectorbt"
-        )
+    if not _VBT_AVAILABLE:
+        logger.debug("vbt.sweep_numpy_fallback")
+        return _numpy_parameter_sweep(df, fast_range, slow_range, initial_cash, fees)
 
     close = df['close']
 
@@ -106,7 +240,8 @@ def vectorbt_parameter_sweep(
     slow_emas = vbt.MA.run(close, list(slow_range), short_name='slow', ewm=True)
 
     # All crossover combinations
-    entries, exits = fast_emas.ma_crossed_above(slow_emas), fast_emas.ma_crossed_below(slow_emas)
+    entries = fast_emas.ma_crossed_above(slow_emas)
+    exits = fast_emas.ma_crossed_below(slow_emas)
 
     # Run all portfolios at once
     portfolio = vbt.Portfolio.from_signals(
@@ -118,22 +253,37 @@ def vectorbt_parameter_sweep(
         freq='1h',
     )
 
-    # Get metrics for each combo
+    # Collect metrics into DataFrame
     total_returns = portfolio.total_return()
     sharpe_ratios = portfolio.sharpe_ratio()
     max_drawdowns = portfolio.max_drawdown()
 
-    # Find best parameters
-    best_idx = total_returns.idxmax() if hasattr(total_returns, 'idxmax') else None
+    results = []
+    if hasattr(total_returns, 'index') and hasattr(total_returns.index, 'to_frame'):
+        idx_df = total_returns.index.to_frame(index=False)
+        for i in range(len(idx_df)):
+            results.append({
+                'fast_window': idx_df.iloc[i, 0],
+                'slow_window': idx_df.iloc[i, 1],
+                'total_return': total_returns.iloc[i],
+                'sharpe_ratio': sharpe_ratios.iloc[i],
+                'max_drawdown': max_drawdowns.iloc[i],
+                'win_rate': 0,
+                'total_trades': 0,
+            })
+    else:
+        # Scalar result
+        results.append({
+            'fast_window': list(fast_range)[0],
+            'slow_window': list(slow_range)[0],
+            'total_return': float(total_returns) if np.isscalar(total_returns) else 0,
+            'sharpe_ratio': float(sharpe_ratios) if np.isscalar(sharpe_ratios) else 0,
+            'max_drawdown': float(max_drawdowns) if np.isscalar(max_drawdowns) else 0,
+            'win_rate': 0,
+            'total_trades': 0,
+        })
 
-    return {
-        'total_returns': total_returns,
-        'sharpe_ratios': sharpe_ratios,
-        'max_drawdowns': max_drawdowns,
-        'best_params': best_idx,
-        'best_return': total_returns.max() if hasattr(total_returns, 'max') else None,
-        'portfolio': portfolio,
-    }
+    return pd.DataFrame(results)
 
 
 def vectorbt_multi_symbol_backtest(
@@ -154,11 +304,13 @@ def vectorbt_multi_symbol_backtest(
         Combined performance metrics
     """
     results = {}
+    per_symbol_cash = initial_cash / len(data) if data else initial_cash
+
     for symbol, df in data.items():
         try:
             result = vectorbt_momentum_backtest(
                 df, fast_ema=fast_ema, slow_ema=slow_ema,
-                initial_cash=initial_cash / len(data)
+                initial_cash=per_symbol_cash
             )
             results[symbol] = {
                 'return': result['total_return'],
@@ -172,7 +324,6 @@ def vectorbt_multi_symbol_backtest(
     if not results:
         return {}
 
-    # Aggregate
     returns = [r['return'] for r in results.values()]
     return {
         'per_symbol': results,

@@ -3,24 +3,31 @@ Telegram Bot — Full management interface via aiogram 3.x.
 Provides interactive controls, real-time alerts, and portfolio management.
 
 Commands:
-    /start     - Welcome + status overview
-    /status    - Account balance, equity, positions
-    /positions - Detailed position list
-    /orders    - Open orders
-    /pnl       - Today's P&L summary
-    /trades    - Recent trade history
-    /signals   - Current active signals
-    /buy       - Manual buy order (e.g., /buy AAPL 10)
-    /sell      - Manual sell order (e.g., /sell AAPL 10)
-    /close     - Close position (e.g., /close AAPL)
-    /closeall  - Emergency: close all positions
-    /cancelall - Cancel all pending orders
-    /pause     - Pause bot trading
-    /resume    - Resume bot trading
-    /strategy  - Show/switch active strategy
-    /risk      - Show risk parameters
-    /backtest  - Quick backtest summary
-    /help      - Show all commands
+    /start       - Welcome + status overview
+    /status      - Account balance, equity, positions
+    /positions   - Detailed position list
+    /orders      - Open orders
+    /pnl         - Today's P&L summary
+    /trades      - Recent trade history
+    /signals     - Current active signals
+    /buy         - Manual buy order (e.g., /buy AAPL 10)
+    /sell        - Manual sell order (e.g., /sell AAPL 10)
+    /close       - Close position (e.g., /close AAPL)
+    /closeall    - Emergency: close all positions
+    /cancelall   - Cancel all pending orders
+    /pause       - Pause bot trading
+    /resume      - Resume bot trading
+    /strategy    - Show/switch active strategy
+    /risk        - Show risk parameters
+    /setrisk     - Set risk param (e.g., /setrisk max_daily_loss_pct 0.05)
+    /setstrategy - Switch strategy (momentum|mean_reversion|ml)
+    /setsymbols  - Change symbols (e.g., /setsymbols AAPL,TSLA,BTC/USD)
+    /setinterval - Change cycle interval (e.g., /setinterval 120)
+    /backtest    - Backtrader backtest (e.g., /backtest AAPL 30)
+    /backtestvbt - VectorBT backtest (e.g., /backtestvbt AAPL 30)
+    /sweep       - Parameter sweep (e.g., /sweep TSLA 60)
+    /train       - Train ML model (e.g., /train AAPL,TSLA 1000)
+    /help        - Show all commands
 """
 
 import asyncio
@@ -161,9 +168,11 @@ async def cmd_help(message: Message):
         "/setstrategy NAME - Switch strategy\n"
         "/setsymbols SYM1,SYM2 - Change symbols\n"
         "/setinterval SECS - Change cycle interval\n\n"
-        "<b>Tools:</b>\n"
-        "/backtest [SYMBOL] [DAYS] - Run backtest\n"
-        "/train - Retrain ML model\n"
+        "<b>Backtesting & ML:</b>\n"
+        "/backtest [SYMBOL] [DAYS] - Backtrader backtest\n"
+        "/backtestvbt [SYMBOL] [DAYS] - VectorBT backtest\n"
+        "/sweep [SYMBOL] [DAYS] - Parameter sweep\n"
+        "/train [SYMBOLS] [BARS] - Train ML model\n"
     )
     await message.answer(text, parse_mode=ParseMode.HTML)
 
@@ -723,18 +732,176 @@ async def cmd_backtest(message: Message):
 
 @router.message(Command("train"))
 async def cmd_train(message: Message):
-    """Trigger ML model retraining."""
-    if not _is_authorized(message):
+    """Trigger ML model retraining.
+    Usage: /train [SYMBOL1,SYMBOL2] [BARS]
+    Without arguments, trains on all configured symbols.
+    """
+    if not _is_authorized(message) or not _broker:
         return
 
-    with _runtime_lock:
-        _runtime_changes["trigger_train"] = True
+    parts = message.text.split()
+    symbols = None
+    bars = 1000
+
+    if len(parts) > 1:
+        symbols = [s.strip().upper() for s in parts[1].split(",") if s.strip()]
+    if len(parts) > 2:
+        try:
+            bars = int(parts[2])
+        except ValueError:
+            pass
+
+    if not symbols:
+        symbols = _strategy.symbols[:10] if _strategy else ["AAPL", "MSFT", "TSLA"]
 
     await message.answer(
-        "ML model retraining requested.\n"
-        "Training will start on the next cycle. This may take a few minutes.\n"
-        "Use /strategy to check model status."
+        f"ML model training started...\n"
+        f"Symbols: {', '.join(symbols)}\n"
+        f"Bars: {bars}\n"
+        f"This may take 1-3 minutes."
     )
+
+    try:
+        from src.strategy.ml_strategy import MLStrategy
+        from config.settings import settings
+
+        strategy = MLStrategy(
+            symbols=symbols,
+            timeframe=_strategy.timeframe if _strategy else "1Hour",
+            lookback=500,
+            model_path=settings.ml_model_path,
+            min_confidence=settings.ml_min_confidence,
+        )
+
+        training_data = {}
+        for symbol in symbols:
+            with _broker_lock:
+                df = _broker.get_bars_df(symbol, _strategy.timeframe if _strategy else "1Hour", limit=bars)
+            if df is not None and len(df) >= 200:
+                training_data[symbol] = df
+
+        if not training_data:
+            await message.answer("Insufficient data for training. Need 200+ bars per symbol.")
+            return
+
+        strategy.train(training_data)
+
+        # Trigger strategy reload in main loop
+        with _runtime_lock:
+            _runtime_changes["trigger_train"] = True
+
+        await message.answer(
+            f"<b>ML Model Trained Successfully</b>\n"
+            f"Symbols used: {len(training_data)}\n"
+            f"Model saved. Strategy will reload on next cycle.",
+            parse_mode=ParseMode.HTML
+        )
+    except Exception as e:
+        await message.answer(f"Training failed: {e}")
+
+
+@router.message(Command("backtestvbt"))
+async def cmd_backtest_vbt(message: Message):
+    """Run VectorBT vectorized backtest from Telegram.
+    Usage: /backtestvbt [SYMBOL] [DAYS]
+    """
+    if not _is_authorized(message) or not _broker:
+        return
+
+    parts = message.text.split()
+    symbol = parts[1].upper() if len(parts) > 1 else (_strategy.symbols[0] if _strategy else "AAPL")
+    days = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 30
+
+    await message.answer(f"Running VectorBT backtest for {symbol} ({days} days)...")
+
+    try:
+        with _broker_lock:
+            df = _broker.get_bars_df(symbol, _strategy.timeframe if _strategy else "1Hour", limit=days * 7)
+
+        if df is None or len(df) < 50:
+            await message.answer(f"Insufficient data for {symbol}. Need at least 50 bars.")
+            return
+
+        try:
+            from backtesting.vbt_adapter import vectorbt_momentum_backtest, vectorbt_parameter_sweep
+            from config.settings import settings
+
+            metrics = vectorbt_momentum_backtest(df, initial_cash=settings.backtest_initial_cash)
+            text = (
+                f"<b>VectorBT Results: {symbol}</b>\n"
+                f"{'=' * 30}\n"
+                f"Return:       {metrics['total_return']:.2%}\n"
+                f"Trades:       {metrics['total_trades']}\n"
+                f"Win Rate:     {metrics['win_rate']:.1%}\n"
+                f"Sharpe:       {metrics['sharpe_ratio']:.2f}\n"
+                f"Max DD:       {metrics['max_drawdown']:.2%}\n"
+            )
+
+            # Quick parameter sweep (top 3)
+            try:
+                sweep_df = vectorbt_parameter_sweep(df)
+                if sweep_df is not None and len(sweep_df) > 0:
+                    top = sweep_df.sort_values('total_return', ascending=False).head(3)
+                    text += f"\n<b>Top 3 Param Combos:</b>\n"
+                    for _, row in top.iterrows():
+                        text += f"  Fast={int(row['fast_window'])}, Slow={int(row['slow_window'])}: {row['total_return']:.2%}\n"
+            except Exception:
+                pass
+
+            await message.answer(text, parse_mode=ParseMode.HTML)
+        except ImportError:
+            await message.answer(
+                "VectorBT not installed.\n"
+                "Install with: pip install vectorbt"
+            )
+    except Exception as e:
+        await message.answer(f"VectorBT backtest error: {e}")
+
+
+@router.message(Command("sweep"))
+async def cmd_sweep(message: Message):
+    """Run full parameter sweep via VectorBT.
+    Usage: /sweep [SYMBOL] [DAYS]
+    """
+    if not _is_authorized(message) or not _broker:
+        return
+
+    parts = message.text.split()
+    symbol = parts[1].upper() if len(parts) > 1 else (_strategy.symbols[0] if _strategy else "AAPL")
+    days = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 60
+
+    await message.answer(f"Running parameter sweep for {symbol} ({days} days)...\nThis may take a minute.")
+
+    try:
+        with _broker_lock:
+            df = _broker.get_bars_df(symbol, _strategy.timeframe if _strategy else "1Hour", limit=days * 7)
+
+        if df is None or len(df) < 100:
+            await message.answer(f"Insufficient data for {symbol}.")
+            return
+
+        from backtesting.vbt_adapter import vectorbt_parameter_sweep
+        sweep_df = vectorbt_parameter_sweep(df)
+
+        if sweep_df is None or len(sweep_df) == 0:
+            await message.answer("Sweep produced no results.")
+            return
+
+        top = sweep_df.sort_values('total_return', ascending=False).head(10)
+        lines = [f"<b>Parameter Sweep: {symbol}</b>\n", f"{'=' * 35}\n"]
+        lines.append(f"{'Fast':<6}{'Slow':<6}{'Return':<10}{'Trades':<8}{'WinRate':<8}\n")
+        for _, row in top.iterrows():
+            lines.append(
+                f"{int(row['fast_window']):<6}{int(row['slow_window']):<6}"
+                f"{row['total_return']:.1%}{'':4}{int(row.get('total_trades', 0)):<8}"
+                f"{row.get('win_rate', 0):.0%}\n"
+            )
+
+        await message.answer("".join(lines), parse_mode=ParseMode.HTML)
+    except ImportError:
+        await message.answer("VectorBT not installed. Install with: pip install vectorbt")
+    except Exception as e:
+        await message.answer(f"Sweep error: {e}")
 
 
 # ──────────────────────────────────────────────────────────────────────────
