@@ -100,6 +100,13 @@ class Settings(BaseSettings):
     backtest_slippage_pct: float = 0.0005
     backtest_initial_cash: float = 10000.0
 
+    # --- Automation Scheduler ---
+    auto_backtest_interval_hours: int = 6       # Run backtests every N hours (0=disabled)
+    auto_train_interval_hours: int = 24         # Retrain ML every N hours (0=disabled)
+    auto_sweep_interval_hours: int = 12         # Parameter sweep every N hours (0=disabled)
+    auto_backtest_symbols: str = ""             # Override symbols for backtest (empty=use trading_symbols)
+    auto_train_bars: int = 1000                 # Bars to use for training
+
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 
     # --- Computed Properties ---

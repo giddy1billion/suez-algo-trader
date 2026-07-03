@@ -365,38 +365,209 @@ def cmd_run(
     print(f"  Ctrl+C to stop gracefully")
     if telegram_bot:
         print(f"  Telegram bot active for remote control")
+    print(f"  Auto-backtest: every {settings.auto_backtest_interval_hours}h" if settings.auto_backtest_interval_hours > 0 else "  Auto-backtest: disabled")
+    print(f"  Auto-train: every {settings.auto_train_interval_hours}h" if settings.auto_train_interval_hours > 0 else "  Auto-train: disabled")
+    print(f"  Auto-sweep: every {settings.auto_sweep_interval_hours}h" if settings.auto_sweep_interval_hours > 0 else "  Auto-sweep: disabled")
     print(f"{'='*60}\n")
+
+    # Thread-safe broker access for scheduled background jobs
+    _broker_lock = threading.Lock()
+
+    # Runtime state for scheduled jobs to signal the main loop
+    _runtime_lock = threading.Lock()
+    _runtime_changes = {"trigger_train": False}
 
     cycle_count = 0
     consecutive_errors = 0
 
-    # Daily summary scheduler (fires at 16:05 ET / market close)
+    # ──────────────────────────────────────────────────────────────────────
+    # Automated Scheduler — periodic backtests, training, sweeps, summary
+    # ──────────────────────────────────────────────────────────────────────
     _scheduler = None
     try:
         from apscheduler.schedulers.background import BackgroundScheduler
         from apscheduler.triggers.cron import CronTrigger
+        from apscheduler.triggers.interval import IntervalTrigger
+        from concurrent.futures import ThreadPoolExecutor
+
+        _auto_executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="auto")
+
+        def _send_telegram(text: str):
+            """Helper: send message via Telegram bot (thread-safe)."""
+            if telegram_bot:
+                import asyncio
+                try:
+                    loop = asyncio.new_event_loop()
+                    loop.run_until_complete(telegram_bot.send_alert(text))
+                    loop.close()
+                except Exception:
+                    pass
 
         def _send_daily_summary():
             try:
                 summary = risk.get_daily_summary()
                 notifier.notify_daily_summary(summary)
-                if telegram_bot:
-                    import asyncio
-                    loop = asyncio.new_event_loop()
-                    loop.run_until_complete(telegram_bot.notify_daily_summary(summary))
-                    loop.close()
+                text = (
+                    f"<b>📊 Daily Summary</b>\n"
+                    f"{'=' * 25}\n"
+                    f"Trades: {summary.get('trades', 0)}\n"
+                    f"Win Rate: {summary.get('win_rate', '0%')}\n"
+                    f"PnL: ${summary.get('daily_pnl', 0):.2f}\n"
+                    f"Return: {summary.get('daily_return', '0%')}\n"
+                )
+                _send_telegram(text)
                 logger.info("scheduler.daily_summary_sent")
             except Exception as e:
                 logger.error("scheduler.summary_error", error=str(e))
 
-        _scheduler = BackgroundScheduler()
+        def _auto_backtest():
+            """Run automated backtests on all symbols and report to Telegram."""
+            try:
+                bt_symbols = settings.auto_backtest_symbols.split(",") if settings.auto_backtest_symbols else symbols
+                bt_symbols = [s.strip() for s in bt_symbols if s.strip()]
+
+                from backtesting.vbt_adapter import vectorbt_momentum_backtest
+
+                results_text = [f"<b>🔄 Auto-Backtest Results</b>\n{'=' * 30}\n"]
+                for sym in bt_symbols:
+                    try:
+                        with _broker_lock:
+                            df = broker.get_bars_df(sym, timeframe, limit=500)
+                        if df is None or len(df) < 50:
+                            continue
+                        metrics = vectorbt_momentum_backtest(df, initial_cash=settings.backtest_initial_cash)
+                        emoji = "✅" if metrics['total_return'] > 0 else "❌"
+                        results_text.append(
+                            f"{emoji} <b>{sym}</b>: {metrics['total_return']:.2%} "
+                            f"| Sharpe: {metrics['sharpe_ratio']:.2f} "
+                            f"| DD: {metrics['max_drawdown']:.1%} "
+                            f"| Trades: {metrics['total_trades']}"
+                        )
+                    except Exception as e:
+                        results_text.append(f"⚠️ {sym}: error - {str(e)[:50]}")
+
+                if len(results_text) > 1:
+                    _send_telegram("\n".join(results_text))
+                logger.info("scheduler.auto_backtest_complete", symbols=len(bt_symbols))
+            except Exception as e:
+                logger.error("scheduler.auto_backtest_error", error=str(e))
+                _send_telegram(f"<b>⚠️ Auto-Backtest Failed</b>\n{str(e)[:200]}")
+
+        def _auto_train():
+            """Run automated ML training and report to Telegram."""
+            try:
+                _send_telegram("🧠 <b>Auto ML Training Started...</b>")
+                train_symbols = symbols[:10]
+                bars = settings.auto_train_bars
+
+                ml_strategy = MLStrategy(
+                    symbols=train_symbols,
+                    timeframe=timeframe,
+                    lookback=500,
+                    model_path=settings.ml_model_path,
+                    min_confidence=settings.ml_min_confidence,
+                )
+
+                training_data = {}
+                for sym in train_symbols:
+                    try:
+                        with _broker_lock:
+                            df = broker.get_bars_df(sym, timeframe, limit=bars)
+                        if df is not None and len(df) >= 200:
+                            training_data[sym] = df
+                    except Exception:
+                        continue
+
+                if not training_data:
+                    _send_telegram("⚠️ <b>Auto Training:</b> No sufficient data")
+                    return
+
+                ml_strategy.train(training_data)
+
+                # If current strategy is ML, trigger reload
+                with _runtime_lock:
+                    _runtime_changes["trigger_train"] = True
+
+                _send_telegram(
+                    f"✅ <b>ML Model Retrained</b>\n"
+                    f"Symbols: {len(training_data)}/{len(train_symbols)}\n"
+                    f"Bars/symbol: {bars}\n"
+                    f"Model saved. Active strategy will reload."
+                )
+                logger.info("scheduler.auto_train_complete", symbols=len(training_data))
+            except Exception as e:
+                logger.error("scheduler.auto_train_error", error=str(e))
+                _send_telegram(f"<b>⚠️ Auto Training Failed</b>\n{str(e)[:200]}")
+
+        def _auto_sweep():
+            """Run parameter sweep and report optimal params to Telegram."""
+            try:
+                from backtesting.vbt_adapter import vectorbt_parameter_sweep
+
+                sweep_symbols = symbols[:3]  # Top 3 symbols for sweep
+                results_text = [f"<b>🔬 Auto Parameter Sweep</b>\n{'=' * 30}\n"]
+
+                for sym in sweep_symbols:
+                    try:
+                        with _broker_lock:
+                            df = broker.get_bars_df(sym, timeframe, limit=700)
+                        if df is None or len(df) < 100:
+                            continue
+
+                        sweep_df = vectorbt_parameter_sweep(df)
+                        if sweep_df is not None and len(sweep_df) > 0:
+                            best = sweep_df.sort_values('total_return', ascending=False).iloc[0]
+                            results_text.append(
+                                f"<b>{sym}</b>: Best EMA({int(best['fast_window'])}/{int(best['slow_window'])}) "
+                                f"→ {best['total_return']:.2%} return"
+                            )
+                    except Exception as e:
+                        results_text.append(f"⚠️ {sym}: {str(e)[:40]}")
+
+                if len(results_text) > 1:
+                    _send_telegram("\n".join(results_text))
+                logger.info("scheduler.auto_sweep_complete", symbols=len(sweep_symbols))
+            except Exception as e:
+                logger.error("scheduler.auto_sweep_error", error=str(e))
+
+        _scheduler = BackgroundScheduler(executors={'default': _auto_executor})
+
+        # Daily summary at market close
         _scheduler.add_job(
             _send_daily_summary,
             CronTrigger(hour=16, minute=5, timezone="US/Eastern"),
             id="daily_summary",
         )
+
+        # Automated backtest
+        if settings.auto_backtest_interval_hours > 0:
+            _scheduler.add_job(
+                _auto_backtest,
+                IntervalTrigger(hours=settings.auto_backtest_interval_hours),
+                id="auto_backtest",
+                next_run_time=datetime.now(),  # Run immediately on start
+            )
+
+        # Automated ML training
+        if settings.auto_train_interval_hours > 0:
+            _scheduler.add_job(
+                _auto_train,
+                IntervalTrigger(hours=settings.auto_train_interval_hours),
+                id="auto_train",
+            )
+
+        # Automated parameter sweep
+        if settings.auto_sweep_interval_hours > 0:
+            _scheduler.add_job(
+                _auto_sweep,
+                IntervalTrigger(hours=settings.auto_sweep_interval_hours),
+                id="auto_sweep",
+            )
+
         _scheduler.start()
-        logger.info("scheduler.started", job="daily_summary@16:05ET")
+
+        active_jobs = [j.id for j in _scheduler.get_jobs()]
+        logger.info("scheduler.started", jobs=active_jobs)
     except ImportError:
         logger.debug("scheduler.apscheduler_not_available")
 
@@ -445,6 +616,16 @@ def cmd_run(
                     strategy = create_strategy("ml", symbols, timeframe, lookback)
                 except Exception as e:
                     logger.error("runtime.train_error", error=str(e))
+
+        # Process runtime changes from scheduler (auto_train signals reload)
+        with _runtime_lock:
+            if _runtime_changes.get("trigger_train") and strategy_name == "ml":
+                _runtime_changes["trigger_train"] = False
+                logger.info("runtime.ml_reload_from_scheduler")
+                try:
+                    strategy = create_strategy("ml", symbols, timeframe, lookback)
+                except Exception as e:
+                    logger.error("runtime.ml_reload_error", error=str(e))
 
         # Auto-retrain ML model if needed (check every 10 cycles)
         if strategy_name == "ml" and cycle_count % 10 == 0:
