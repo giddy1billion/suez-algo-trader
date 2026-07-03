@@ -44,6 +44,7 @@ _broker = None
 _engine = None
 _risk_manager = None
 _strategy = None
+_db = None
 _bot_paused = False
 _authorized_users: set[int] = set()
 
@@ -51,14 +52,43 @@ _authorized_users: set[int] = set()
 import threading
 _broker_lock = threading.Lock()
 
+# Shared runtime state — Telegram commands write, main loop reads
+_runtime_changes = {
+    "strategy_name": None,      # str: new strategy name to switch to
+    "symbols": None,            # list: new symbols to watch
+    "interval": None,           # int: new interval in seconds
+    "risk_updates": {},         # dict: risk param updates (e.g., {"max_daily_loss_pct": 0.03})
+    "trigger_backtest": False,  # bool: run backtest next cycle
+    "trigger_train": False,     # bool: trigger ML retraining
+}
+_runtime_lock = threading.Lock()
 
-def set_components(broker, engine, risk_manager, strategy, authorized_chat_ids: list[int] = None):
+
+def get_runtime_changes() -> dict:
+    """Read and clear pending runtime changes (called by main loop)."""
+    with _runtime_lock:
+        changes = {}
+        for key, val in _runtime_changes.items():
+            if val and val != {} and val != False:
+                changes[key] = val
+        # Reset after reading
+        _runtime_changes["strategy_name"] = None
+        _runtime_changes["symbols"] = None
+        _runtime_changes["interval"] = None
+        _runtime_changes["risk_updates"] = {}
+        _runtime_changes["trigger_backtest"] = False
+        _runtime_changes["trigger_train"] = False
+        return changes
+
+
+def set_components(broker, engine, risk_manager, strategy, db=None, authorized_chat_ids: list[int] = None):
     """Inject trading components into the bot module."""
-    global _broker, _engine, _risk_manager, _strategy, _authorized_users
+    global _broker, _engine, _risk_manager, _strategy, _db, _authorized_users
     _broker = broker
     _engine = engine
     _risk_manager = risk_manager
     _strategy = strategy
+    _db = db
     if authorized_chat_ids:
         _authorized_users = set(authorized_chat_ids)
 
@@ -117,9 +147,16 @@ async def cmd_help(message: Message):
         "<b>Control:</b>\n"
         "/pause - Pause auto-trading\n"
         "/resume - Resume auto-trading\n"
-        "/strategy - View/switch strategy\n"
-        "/risk - Risk parameters\n"
-        "/backtest - Recent backtest results\n"
+        "/strategy - View active strategy\n"
+        "/risk - View risk parameters\n\n"
+        "<b>Configuration:</b>\n"
+        "/setrisk PARAM VALUE - Set risk param\n"
+        "/setstrategy NAME - Switch strategy\n"
+        "/setsymbols SYM1,SYM2 - Change symbols\n"
+        "/setinterval SECS - Change cycle interval\n\n"
+        "<b>Tools:</b>\n"
+        "/backtest [SYMBOL] [DAYS] - Run backtest\n"
+        "/train - Retrain ML model\n"
     )
     await message.answer(text, parse_mode=ParseMode.HTML)
 
@@ -225,10 +262,29 @@ async def cmd_pnl(message: Message):
 
 @router.message(Command("trades"))
 async def cmd_trades(message: Message):
-    if not _is_authorized(message):
+    if not _is_authorized(message) or not _db:
         return
-    # Would query database for recent trades
-    await message.answer("Trade history: use /pnl for today's summary.")
+
+    try:
+        trades = _db.get_trades(limit=10)
+        if not trades:
+            await message.answer("No trades recorded yet.")
+            return
+
+        lines = ["<b>Recent Trades (last 10):</b>\n"]
+        for t in trades:
+            side = t.get('side', '?').upper()
+            symbol = t.get('symbol', '?')
+            qty = t.get('qty', 0)
+            price = t.get('price', 0)
+            pnl = t.get('pnl')
+            ts = t.get('timestamp', '')[:16]
+            pnl_str = f" PnL: ${pnl:.2f}" if pnl else ""
+            lines.append(f"  {side} {symbol} x{qty:.2f} @ ${price:.2f}{pnl_str} [{ts}]")
+
+        await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
+    except Exception as e:
+        await message.answer(f"Error fetching trades: {e}")
 
 
 @router.message(Command("signals"))
@@ -446,6 +502,235 @@ async def cmd_risk(message: Message):
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# Runtime Configuration Commands
+# ──────────────────────────────────────────────────────────────────────────
+
+@router.message(Command("setrisk"))
+async def cmd_setrisk(message: Message):
+    """Set risk parameters at runtime.
+    Usage: /setrisk max_daily_loss_pct 0.03
+    """
+    if not _is_authorized(message) or not _risk_manager:
+        return
+
+    parts = message.text.split()
+    if len(parts) < 3:
+        valid_params = [
+            "max_position_size_pct", "max_daily_loss_pct", "max_portfolio_exposure",
+            "max_single_stock_pct", "max_leverage", "default_stop_loss_pct",
+            "default_take_profit_pct", "max_open_positions", "max_orders_per_day",
+        ]
+        await message.answer(
+            "<b>Usage:</b> /setrisk PARAM VALUE\n\n"
+            "<b>Parameters:</b>\n" + "\n".join(f"  {p}" for p in valid_params),
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    param_name = parts[1].lower()
+    try:
+        value = float(parts[2])
+    except ValueError:
+        await message.answer("Invalid value. Must be a number.")
+        return
+
+    # Validate and apply to risk manager
+    limits = _risk_manager.limits
+    if not hasattr(limits, param_name):
+        await message.answer(f"Unknown parameter: {param_name}")
+        return
+
+    # Safety check for percentages
+    pct_params = {"max_position_size_pct", "max_daily_loss_pct", "max_portfolio_exposure",
+                  "max_single_stock_pct", "default_stop_loss_pct", "default_take_profit_pct"}
+    if param_name in pct_params and not (0 < value <= 1.0):
+        await message.answer(f"Percentage values must be between 0 and 1.0 (got {value})")
+        return
+
+    old_value = getattr(limits, param_name)
+    setattr(limits, param_name, type(old_value)(value))
+
+    with _runtime_lock:
+        _runtime_changes["risk_updates"][param_name] = value
+
+    await message.answer(
+        f"Risk parameter updated:\n"
+        f"  {param_name}: {old_value} -> {value}",
+        parse_mode=ParseMode.HTML
+    )
+
+
+@router.message(Command("setstrategy"))
+async def cmd_setstrategy(message: Message):
+    """Switch active strategy at runtime.
+    Usage: /setstrategy momentum|mean_reversion|ml
+    """
+    if not _is_authorized(message):
+        return
+
+    parts = message.text.split()
+    if len(parts) < 2:
+        await message.answer(
+            "<b>Usage:</b> /setstrategy NAME\n\n"
+            "<b>Available:</b> momentum, mean_reversion, ml",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    new_strategy = parts[1].lower()
+    valid = {"momentum", "mean_reversion", "ml"}
+    if new_strategy not in valid:
+        await message.answer(f"Unknown strategy: {new_strategy}\nValid: {', '.join(valid)}")
+        return
+
+    with _runtime_lock:
+        _runtime_changes["strategy_name"] = new_strategy
+
+    await message.answer(
+        f"Strategy switch requested: {new_strategy}\n"
+        f"Will take effect on next cycle.",
+        parse_mode=ParseMode.HTML
+    )
+
+
+@router.message(Command("setsymbols"))
+async def cmd_setsymbols(message: Message):
+    """Change watched symbols at runtime.
+    Usage: /setsymbols AAPL,TSLA,BTC/USD
+    """
+    if not _is_authorized(message):
+        return
+
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        current = ", ".join(_strategy.symbols[:10]) if _strategy else "none"
+        await message.answer(
+            f"<b>Usage:</b> /setsymbols SYM1,SYM2,...\n\n"
+            f"<b>Current:</b> {current}",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    symbols = [s.strip().upper() for s in parts[1].split(",") if s.strip()]
+    if not symbols:
+        await message.answer("No valid symbols provided.")
+        return
+
+    with _runtime_lock:
+        _runtime_changes["symbols"] = symbols
+
+    await message.answer(
+        f"Symbol change requested: {', '.join(symbols)}\n"
+        f"Will take effect on next cycle.",
+        parse_mode=ParseMode.HTML
+    )
+
+
+@router.message(Command("setinterval"))
+async def cmd_setinterval(message: Message):
+    """Change trading cycle interval.
+    Usage: /setinterval 120
+    """
+    if not _is_authorized(message):
+        return
+
+    parts = message.text.split()
+    if len(parts) < 2:
+        await message.answer("<b>Usage:</b> /setinterval SECONDS\nExample: /setinterval 120", parse_mode=ParseMode.HTML)
+        return
+
+    try:
+        new_interval = int(parts[1])
+    except ValueError:
+        await message.answer("Invalid interval. Must be an integer (seconds).")
+        return
+
+    if new_interval < 10 or new_interval > 3600:
+        await message.answer("Interval must be between 10 and 3600 seconds.")
+        return
+
+    with _runtime_lock:
+        _runtime_changes["interval"] = new_interval
+
+    await message.answer(f"Interval change requested: {new_interval}s\nWill take effect on next cycle.")
+
+
+@router.message(Command("backtest"))
+async def cmd_backtest(message: Message):
+    """Trigger a backtest from Telegram.
+    Usage: /backtest [symbol] [days]
+    """
+    if not _is_authorized(message) or not _broker:
+        return
+
+    parts = message.text.split()
+    symbol = parts[1].upper() if len(parts) > 1 else (_strategy.symbols[0] if _strategy else "AAPL")
+    days = int(parts[2]) if len(parts) > 2 else 30
+
+    await message.answer(f"Running backtest for {symbol} ({days} days)...")
+
+    try:
+        import pandas as pd
+        from datetime import datetime, timedelta
+
+        with _broker_lock:
+            df = _broker.get_bars_df(symbol, "1Hour", limit=days * 7)
+
+        if df is None or len(df) < 50:
+            await message.answer(f"Insufficient data for {symbol}. Need at least 50 bars.")
+            return
+
+        try:
+            from backtesting.bt_adapter import run_backtrader_backtest, _BT_AVAILABLE
+            if not _BT_AVAILABLE:
+                raise ImportError("backtrader not installed")
+
+            metrics = run_backtrader_backtest(df, initial_cash=10000.0)
+            text = (
+                f"<b>Backtest Results: {symbol}</b>\n"
+                f"{'=' * 30}\n"
+                f"Strategy:     {metrics['strategy']}\n"
+                f"Return:       {metrics['total_return']:.2%}\n"
+                f"Trades:       {metrics['total_trades']}\n"
+                f"Win Rate:     {metrics['win_rate']:.1%}\n"
+                f"Sharpe:       {metrics['sharpe_ratio']:.2f}\n"
+                f"Max DD:       {metrics['max_drawdown']:.2%}\n"
+                f"Final Value:  ${metrics['final_value']:.2f}\n"
+            )
+            await message.answer(text, parse_mode=ParseMode.HTML)
+        except ImportError:
+            # Fallback to simple custom backtest
+            from backtesting.backtest import SimpleBacktest
+            bt = SimpleBacktest(df)
+            results = bt.run()
+            text = (
+                f"<b>Backtest Results: {symbol}</b>\n"
+                f"Return: {results.get('total_return', 0):.2%}\n"
+                f"Trades: {results.get('total_trades', 0)}\n"
+            )
+            await message.answer(text, parse_mode=ParseMode.HTML)
+
+    except Exception as e:
+        await message.answer(f"Backtest error: {e}")
+
+
+@router.message(Command("train"))
+async def cmd_train(message: Message):
+    """Trigger ML model retraining."""
+    if not _is_authorized(message):
+        return
+
+    with _runtime_lock:
+        _runtime_changes["trigger_train"] = True
+
+    await message.answer(
+        "ML model retraining requested.\n"
+        "Training will start on the next cycle. This may take a few minutes.\n"
+        "Use /strategy to check model status."
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # Callback Handlers (inline button confirmations)
 # ──────────────────────────────────────────────────────────────────────────
 
@@ -573,6 +858,78 @@ class TelegramBotManager:
         """Send error notification."""
         text = f"<b>ERROR</b>\n{error}\nContext: {context}"
         await self.send_alert(text)
+
+    async def notify_exit(self, trade: dict):
+        """Send position exit notification."""
+        symbol = trade.get('symbol', '?')
+        pnl = trade.get('pnl', 0)
+        reason = trade.get('reason', 'manual')
+        pnl_emoji = "+" if pnl >= 0 else ""
+        text = (
+            f"<b>EXIT {symbol}</b>\n"
+            f"PnL: {pnl_emoji}${pnl:.2f}\n"
+            f"Reason: {reason}\n"
+            f"Time: {datetime.now().strftime('%H:%M:%S')}"
+        )
+        await self.send_alert(text)
+
+    async def notify_risk_halt(self, reason: str):
+        """Send risk halt notification."""
+        text = (
+            f"<b>RISK HALT</b>\n"
+            f"Trading paused automatically.\n"
+            f"Reason: {reason}\n"
+            f"Use /resume to restart."
+        )
+        await self.send_alert(text)
+
+    async def notify_signal(self, signal_info: dict):
+        """Send signal notification (when configured)."""
+        symbol = signal_info.get('symbol', '?')
+        direction = signal_info.get('direction', '?')
+        confidence = signal_info.get('confidence', 0)
+        text = (
+            f"<b>SIGNAL: {direction} {symbol}</b>\n"
+            f"Confidence: {confidence:.0%}\n"
+            f"Reason: {signal_info.get('reason', '-')}"
+        )
+        await self.send_alert(text)
+
+    async def notify_daily_summary(self, summary: dict):
+        """Send daily summary notification."""
+        text = (
+            f"<b>Daily Summary</b>\n"
+            f"{'=' * 25}\n"
+            f"Trades: {summary.get('trades', 0)}\n"
+            f"Win Rate: {summary.get('win_rate', '0%')}\n"
+            f"PnL: ${summary.get('daily_pnl', 0):.2f}\n"
+            f"Return: {summary.get('daily_return', '0%')}\n"
+        )
+        await self.send_alert(text)
+
+    async def notify_train_complete(self, metrics: dict):
+        """Send ML training completion notification."""
+        text = (
+            f"<b>ML Model Retrained</b>\n"
+            f"Accuracy: {metrics.get('accuracy', 0):.2%}\n"
+            f"Features: {metrics.get('n_features', 0)}\n"
+            f"Samples: {metrics.get('n_samples', 0)}"
+        )
+        await self.send_alert(text)
+
+    def send_sync(self, text: str):
+        """Thread-safe synchronous alert (called from main thread)."""
+        import asyncio
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                asyncio.ensure_future(self.send_alert(text))
+            else:
+                loop.run_until_complete(self.send_alert(text))
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            loop.run_until_complete(self.send_alert(text))
+            loop.close()
 
     def is_paused(self) -> bool:
         """Check if bot is paused via Telegram command."""

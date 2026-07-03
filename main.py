@@ -62,13 +62,21 @@ if hasattr(signal, 'SIGBREAK'):
 # ──────────────────────────────────────────────────────────────────────────
 
 def create_strategy(name: str, symbols: list[str], timeframe: str, lookback: int):
-    """Factory to create strategy instances by name."""
+    """Factory to create strategy instances by name, using settings for params."""
     strategies = {
         "momentum": lambda: MomentumStrategy(
-            symbols=symbols, timeframe=timeframe, lookback=lookback
+            symbols=symbols, timeframe=timeframe, lookback=lookback,
+            fast_ema=settings.momentum_fast_ema,
+            slow_ema=settings.momentum_slow_ema,
+            rsi_period=settings.momentum_rsi_period,
+            rsi_oversold=settings.momentum_rsi_oversold,
+            rsi_overbought=settings.momentum_rsi_overbought,
+            atr_period=settings.momentum_atr_period,
+            atr_sl_multiplier=settings.momentum_atr_sl_mult,
+            atr_tp_multiplier=settings.momentum_atr_tp_mult,
         ),
         "mean_reversion": lambda: MeanReversionStrategy(
-            symbols=symbols, timeframe=timeframe, lookback=lookback
+            symbols=symbols, timeframe=timeframe, lookback=lookback,
         ),
         "ml": lambda: MLStrategy(
             symbols=symbols, timeframe=timeframe, lookback=max(lookback, 500),
@@ -163,7 +171,7 @@ def cmd_backtest_bt(broker: AlpacaBroker, strategy_name: str, symbols: list[str]
             print(f"  [!] Insufficient data for {symbol}")
             continue
 
-        metrics = run_backtrader_backtest(df, strategy_class=strat_class, initial_cash=10000.0)
+        metrics = run_backtrader_backtest(df, strategy_class=strat_class, initial_cash=settings.backtest_initial_cash)
 
         print(f"\n  {'='*50}")
         print(f"  BACKTRADER RESULTS: {strategy_name} on {symbol}")
@@ -176,6 +184,48 @@ def cmd_backtest_bt(broker: AlpacaBroker, strategy_name: str, symbols: list[str]
         print(f"  SQN:           {metrics['sqn']:.2f}")
         print(f"  Final Value:   ${metrics['final_value']:,.2f}")
         print(f"  {'='*50}\n")
+
+
+def cmd_backtest_vbt(broker: AlpacaBroker, symbols: list[str], timeframe: str, lookback: int):
+    """Run VectorBT vectorized backtest with parameter sweep."""
+    from backtesting.vbt_adapter import vectorbt_momentum_backtest, vectorbt_parameter_sweep
+
+    print(f"\n[*] Running VectorBT vectorized backtest")
+    print(f"   Symbols: {', '.join(symbols)}")
+    print(f"   Timeframe: {timeframe}\n")
+
+    for symbol in symbols:
+        print(f"  Fetching data for {symbol}...")
+        df = broker.get_bars_df(symbol, timeframe, limit=min(lookback * 3, 1000))
+
+        if df is None or len(df) < 100:
+            print(f"  [!] Insufficient data for {symbol}")
+            continue
+
+        metrics = vectorbt_momentum_backtest(df, initial_cash=settings.backtest_initial_cash)
+
+        print(f"\n  {'='*50}")
+        print(f"  VECTORBT RESULTS: {symbol}")
+        print(f"  {'='*50}")
+        print(f"  Total Return:  {metrics['total_return']:.2%}")
+        print(f"  Sharpe Ratio:  {metrics['sharpe_ratio']:.3f}")
+        print(f"  Max Drawdown:  {metrics['max_drawdown']:.2%}")
+        print(f"  Total Trades:  {metrics['total_trades']}")
+        print(f"  Win Rate:      {metrics['win_rate']:.1%}")
+        print(f"  {'='*50}\n")
+
+    # Parameter sweep on first symbol with enough data
+    for symbol in symbols:
+        df = broker.get_bars_df(symbol, timeframe, limit=min(lookback * 3, 1000))
+        if df is not None and len(df) >= 100:
+            print(f"\n  Running parameter sweep on {symbol}...")
+            try:
+                sweep_df = vectorbt_parameter_sweep(df)
+                print(f"\n  Top 5 parameter combinations:")
+                print(sweep_df.sort_values('total_return', ascending=False).head(5).to_string())
+            except Exception as e:
+                print(f"  Parameter sweep failed: {e}")
+            break
 
 
 def cmd_train(broker: AlpacaBroker, symbols: list[str], timeframe: str):
@@ -203,10 +253,26 @@ def cmd_train(broker: AlpacaBroker, symbols: list[str], timeframe: str):
         print("\n[!] No sufficient data for training")
 
 
+def _train_ml_model(broker: AlpacaBroker, symbols: list[str], timeframe: str):
+    """Silent ML training (called from main loop / Telegram trigger)."""
+    strategy = MLStrategy(symbols=symbols, timeframe=timeframe, lookback=500)
+    training_data = {}
+    for symbol in symbols:
+        df = broker.get_bars_df(symbol, timeframe, limit=1000)
+        if df is not None and len(df) >= 200:
+            training_data[symbol] = df
+    if training_data:
+        strategy.train(training_data)
+        logger.info("ml.training_complete", symbols=len(training_data))
+    else:
+        logger.warning("ml.training_no_data")
+
+
 def cmd_run(
     broker: AlpacaBroker, strategy_name: str, symbols: list[str],
     timeframe: str, lookback: int, interval: int, dry_run: bool,
-    notifier: NotificationManager, enable_telegram: bool = False
+    notifier: NotificationManager, enable_telegram: bool = False,
+    enable_streaming: bool = False
 ):
     """Main trading loop."""
 
@@ -217,6 +283,9 @@ def cmd_run(
         max_portfolio_exposure=settings.max_portfolio_exposure,
         max_single_stock_pct=settings.max_single_stock_pct,
         max_leverage=settings.max_leverage,
+        max_open_positions=settings.max_open_positions,
+        max_orders_per_day=settings.max_orders_per_day,
+        max_correlated_positions=settings.max_correlated_positions,
         default_stop_loss_pct=settings.default_stop_loss_pct,
         default_take_profit_pct=settings.default_take_profit_pct,
     ))
@@ -231,11 +300,12 @@ def cmd_run(
     telegram_bot = None
     _telegram_thread = None
     if enable_telegram and settings.telegram_bot_token:
-        import threading
-        from src.notifications.telegram_bot import TelegramBotManager, set_components, _bot_paused
+        from src.notifications.telegram_bot import (
+            TelegramBotManager, set_components, get_runtime_changes
+        )
 
         chat_ids = [int(settings.telegram_chat_id)] if settings.telegram_chat_id else []
-        set_components(broker, engine, risk, strategy, chat_ids)
+        set_components(broker, engine, risk, strategy, db=db, authorized_chat_ids=chat_ids)
         telegram_bot = TelegramBotManager(
             token=settings.telegram_bot_token,
             authorized_chat_ids=chat_ids,
@@ -255,9 +325,40 @@ def cmd_run(
     logger.info("bot.started", mode=mode, strategy=strategy_name, symbols=len(symbols))
     notifier.notify_startup(mode, strategy_name, symbols)
 
+    # Start WebSocket streaming if enabled
+    _stream_data = {}  # Shared dict: symbol -> latest bar data
+    if enable_streaming:
+        import asyncio as _asyncio
+
+        def _bar_handler(bar):
+            """Store incoming bar data from WebSocket."""
+            symbol = bar.symbol
+            _stream_data[symbol] = {
+                "timestamp": bar.timestamp,
+                "open": float(bar.open),
+                "high": float(bar.high),
+                "low": float(bar.low),
+                "close": float(bar.close),
+                "volume": float(bar.volume),
+            }
+
+        def _run_stream():
+            loop = _asyncio.new_event_loop()
+            _asyncio.set_event_loop(loop)
+            try:
+                loop.run_until_complete(broker.stream_bars(symbols, _bar_handler))
+            except Exception as e:
+                logger.error("stream.error", error=str(e))
+
+        _stream_thread = threading.Thread(target=_run_stream, daemon=True)
+        _stream_thread.start()
+        logger.info("stream.started", symbols=len(symbols))
+
     print(f"\n{'='*60}")
     print(f"  ALGO TRADER RUNNING - {mode}")
     print(f"  Strategy: {strategy_name} | Symbols: {len(symbols)} | Interval: {interval}s")
+    if enable_streaming:
+        print(f"  WebSocket streaming: ACTIVE")
     print(f"  Ctrl+C to stop gracefully")
     if telegram_bot:
         print(f"  Telegram bot active for remote control")
@@ -266,7 +367,37 @@ def cmd_run(
     cycle_count = 0
     consecutive_errors = 0
 
-    # Cache crypto-only strategy to avoid re-creating each cycle (#16)
+    # Daily summary scheduler (fires at 16:05 ET / market close)
+    _scheduler = None
+    try:
+        from apscheduler.schedulers.background import BackgroundScheduler
+        from apscheduler.triggers.cron import CronTrigger
+
+        def _send_daily_summary():
+            try:
+                summary = risk.get_daily_summary()
+                notifier.notify_daily_summary(summary)
+                if telegram_bot:
+                    import asyncio
+                    loop = asyncio.new_event_loop()
+                    loop.run_until_complete(telegram_bot.notify_daily_summary(summary))
+                    loop.close()
+                logger.info("scheduler.daily_summary_sent")
+            except Exception as e:
+                logger.error("scheduler.summary_error", error=str(e))
+
+        _scheduler = BackgroundScheduler()
+        _scheduler.add_job(
+            _send_daily_summary,
+            CronTrigger(hour=16, minute=5, timezone="US/Eastern"),
+            id="daily_summary",
+        )
+        _scheduler.start()
+        logger.info("scheduler.started", job="daily_summary@16:05ET")
+    except ImportError:
+        logger.debug("scheduler.apscheduler_not_available")
+
+    # Cache crypto-only strategy to avoid re-creating each cycle
     crypto_only = [s for s in symbols if "/" in s]
     crypto_strategy = create_strategy(strategy_name, crypto_only, timeframe, lookback) if crypto_only else None
 
@@ -274,19 +405,76 @@ def cmd_run(
         cycle_count += 1
         cycle_start = time.time()
 
-        # Check if paused via Telegram (#3 fix)
+        # Check if paused via Telegram
         if telegram_bot and telegram_bot.is_paused():
             logger.debug("cycle.paused_via_telegram")
             time.sleep(5)
             continue
 
+        # Process runtime changes from Telegram
+        if telegram_bot:
+            changes = get_runtime_changes()
+            if changes.get("strategy_name"):
+                new_name = changes["strategy_name"]
+                logger.info("runtime.strategy_change", new=new_name)
+                strategy = create_strategy(new_name, strategy.symbols, strategy.timeframe, strategy.lookback)
+                strategy_name = new_name
+                # Rebuild crypto strategy too
+                crypto_only = [s for s in strategy.symbols if "/" in s]
+                crypto_strategy = create_strategy(new_name, crypto_only, timeframe, lookback) if crypto_only else None
+
+            if changes.get("symbols"):
+                new_symbols = changes["symbols"]
+                logger.info("runtime.symbols_change", symbols=new_symbols)
+                symbols = new_symbols
+                strategy = create_strategy(strategy_name, symbols, timeframe, lookback)
+                crypto_only = [s for s in symbols if "/" in s]
+                crypto_strategy = create_strategy(strategy_name, crypto_only, timeframe, lookback) if crypto_only else None
+
+            if changes.get("interval"):
+                interval = changes["interval"]
+                logger.info("runtime.interval_change", interval=interval)
+
+            if changes.get("trigger_train") and strategy_name == "ml":
+                logger.info("runtime.ml_retrain_triggered")
+                try:
+                    _train_ml_model(broker, symbols, timeframe)
+                    strategy = create_strategy("ml", symbols, timeframe, lookback)
+                except Exception as e:
+                    logger.error("runtime.train_error", error=str(e))
+
+        # Auto-retrain ML model if needed (check every 10 cycles)
+        if strategy_name == "ml" and cycle_count % 10 == 0:
+            if hasattr(strategy, 'needs_retraining') and strategy.needs_retraining():
+                logger.info("ml.auto_retrain_start")
+                try:
+                    _train_ml_model(broker, symbols, timeframe)
+                    strategy = create_strategy("ml", symbols, timeframe, lookback)
+                    logger.info("ml.auto_retrain_complete")
+                except Exception as e:
+                    logger.error("ml.auto_retrain_error", error=str(e))
+
         try:
+            # Check risk halt and notify
+            can_trade, halt_reason = risk.can_trade()
+            if not can_trade:
+                if telegram_bot and halt_reason:
+                    import asyncio
+                    try:
+                        loop = asyncio.new_event_loop()
+                        loop.run_until_complete(telegram_bot.notify_risk_halt(halt_reason))
+                        loop.close()
+                    except Exception:
+                        pass
+                logger.warning("engine.halted", reason=halt_reason)
+                _shutdown_event.wait(timeout=60)
+                continue
+
             # For stocks: check market hours
             stock_symbols = [s for s in symbols if "/" not in s]
             if stock_symbols and not broker.is_market_open():
                 next_open = broker.next_market_open()
                 logger.info("market.closed", next_open=str(next_open))
-                # Still process crypto if any
                 if crypto_strategy:
                     results = engine.run_cycle(crypto_strategy)
                 else:
@@ -301,8 +489,17 @@ def cmd_run(
                 for r in results:
                     if not r.get('dry_run'):
                         notifier.notify_trade(r)
+                        # Also notify via Telegram bot
+                        if telegram_bot:
+                            import asyncio
+                            try:
+                                loop = asyncio.new_event_loop()
+                                loop.run_until_complete(telegram_bot.notify_trade(r))
+                                loop.close()
+                            except Exception:
+                                pass
             else:
-                logger.info("cycle.no_signals", cycle=cycle_count)
+                logger.debug("cycle.no_signals", cycle=cycle_count)
 
         except KeyboardInterrupt:
             break
@@ -311,9 +508,9 @@ def cmd_run(
             logger.error("cycle.error", error=str(e), consecutive=consecutive_errors)
             notifier.notify_error(str(e), f"Cycle {cycle_count}")
 
-            if consecutive_errors >= 5:
-                logger.warning("bot.too_many_errors", msg="Pausing for 5 minutes")
-                time.sleep(300)
+            if consecutive_errors >= settings.max_consecutive_errors:
+                logger.warning("bot.too_many_errors", msg=f"Pausing for {settings.error_cooldown_seconds}s")
+                _shutdown_event.wait(timeout=settings.error_cooldown_seconds)
                 consecutive_errors = 0
                 continue
 
@@ -321,12 +518,12 @@ def cmd_run(
         elapsed = time.time() - cycle_start
         sleep_time = max(1, interval - elapsed)
         logger.debug("cycle.sleeping", seconds=int(sleep_time))
-
-        # Interruptible sleep using Event.wait()
         _shutdown_event.wait(timeout=sleep_time)
 
     # Shutdown
     logger.info("bot.stopped", cycles=cycle_count)
+    if _scheduler:
+        _scheduler.shutdown(wait=False)
     notifier.notify_daily_summary(risk.get_daily_summary())
     if telegram_bot:
         import asyncio
@@ -372,11 +569,13 @@ Examples:
                        help="Candle timeframe")
     parser.add_argument("--lookback", type=int, default=settings.lookback_bars,
                        help="Number of historical bars to analyze")
-    parser.add_argument("--interval", "-i", type=int, default=60,
+    parser.add_argument("--interval", "-i", type=int, default=settings.trading_interval,
                        help="Seconds between trading cycles")
     parser.add_argument("--dry-run", action="store_true", help="Generate signals without placing orders")
     parser.add_argument("--backtest", action="store_true", help="Run custom backtest engine")
     parser.add_argument("--backtest-bt", action="store_true", help="Run Backtrader backtest")
+    parser.add_argument("--backtest-vbt", action="store_true", help="Run VectorBT vectorized backtest")
+    parser.add_argument("--stream", action="store_true", help="Use WebSocket streaming for real-time data")
     parser.add_argument("--train", action="store_true", help="Train/retrain ML model")
     parser.add_argument("--status", action="store_true", help="Show account status and exit")
     parser.add_argument("--telegram", action="store_true", help="Enable Telegram bot for interactive control")
@@ -437,12 +636,15 @@ Examples:
         cmd_backtest(broker, args.strategy, symbols, args.timeframe, args.lookback)
     elif getattr(args, 'backtest_bt', False):
         cmd_backtest_bt(broker, args.strategy, symbols, args.timeframe, args.lookback)
+    elif getattr(args, 'backtest_vbt', False):
+        cmd_backtest_vbt(broker, symbols, args.timeframe, args.lookback)
     elif args.train:
         cmd_train(broker, symbols, args.timeframe)
     else:
         cmd_run(broker, args.strategy, symbols, args.timeframe,
                 args.lookback, args.interval, args.dry_run, notifier,
-                enable_telegram=args.telegram)
+                enable_telegram=args.telegram,
+                enable_streaming=getattr(args, 'stream', False))
 
 
 if __name__ == "__main__":

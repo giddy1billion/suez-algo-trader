@@ -17,7 +17,7 @@ class TradingMode(str, Enum):
 
 
 class Settings(BaseSettings):
-    """Application configuration — loaded from .env + environment variables."""
+    """Application configuration -- loaded from .env + environment variables."""
 
     # --- Trading Mode ---
     trading_mode: TradingMode = TradingMode.PAPER
@@ -35,12 +35,20 @@ class Settings(BaseSettings):
     # --- Data Feed ---
     alpaca_data_feed: str = "iex"
 
+    # --- Trading Loop ---
+    trading_interval: int = 60
+    max_consecutive_errors: int = 5
+    error_cooldown_seconds: int = 300
+
     # --- Risk Management ---
     max_position_size_pct: float = 0.02
     max_daily_loss_pct: float = 0.05
     max_portfolio_exposure: float = 0.80
     max_single_stock_pct: float = 0.15
     max_leverage: float = 1.0
+    max_open_positions: int = 20
+    max_orders_per_day: int = 100
+    max_correlated_positions: int = 3
     default_stop_loss_pct: float = 0.03
     default_take_profit_pct: float = 0.06
 
@@ -49,6 +57,23 @@ class Settings(BaseSettings):
     trading_symbols: str = "AAPL,MSFT,GOOGL,AMZN,NVDA"
     timeframe: str = "1Hour"
     lookback_bars: int = 200
+
+    # --- Strategy Parameters (Momentum) ---
+    momentum_fast_ema: int = 12
+    momentum_slow_ema: int = 26
+    momentum_rsi_period: int = 14
+    momentum_rsi_oversold: int = 30
+    momentum_rsi_overbought: int = 70
+    momentum_atr_period: int = 14
+    momentum_atr_sl_mult: float = 2.0
+    momentum_atr_tp_mult: float = 3.0
+
+    # --- Strategy Parameters (Mean Reversion) ---
+    mean_rev_bb_period: int = 20
+    mean_rev_bb_std: float = 2.0
+    mean_rev_zscore_entry: float = 2.0
+    mean_rev_zscore_exit: float = 0.5
+    mean_rev_rsi_period: int = 14
 
     # --- ML ---
     ml_model_path: str = "models/latest_model.joblib"
@@ -61,6 +86,7 @@ class Settings(BaseSettings):
     discord_webhook_url: str = ""
     notify_on_trade: bool = True
     notify_on_error: bool = True
+    notify_on_signal: bool = False
 
     # --- Database ---
     database_url: str = "sqlite:///data_cache/trading.db"
@@ -68,6 +94,11 @@ class Settings(BaseSettings):
     # --- Logging ---
     log_level: str = "INFO"
     log_file: str = "logs/trader.log"
+
+    # --- Backtesting ---
+    backtest_commission_pct: float = 0.001
+    backtest_slippage_pct: float = 0.0005
+    backtest_initial_cash: float = 10000.0
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 

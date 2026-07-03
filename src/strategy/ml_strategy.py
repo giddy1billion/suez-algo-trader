@@ -81,81 +81,21 @@ class MLStrategy(BaseStrategy):
         return hours_since >= self.retrain_interval_hours
 
     # ──────────────────────────────────────────────────────────────────────
-    # Feature Engineering
+    # Feature Engineering (delegates to shared pipeline)
     # ──────────────────────────────────────────────────────────────────────
 
     def calculate_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Calculate all features used by the ML model."""
-        df = df.copy()
-
-        # Price-based features
-        df['returns_1'] = df['close'].pct_change(1)
-        df['returns_5'] = df['close'].pct_change(5)
-        df['returns_10'] = df['close'].pct_change(10)
-        df['returns_20'] = df['close'].pct_change(20)
-
-        # Volatility
-        df['volatility_10'] = df['returns_1'].rolling(10).std()
-        df['volatility_20'] = df['returns_1'].rolling(20).std()
-
-        # Moving averages
-        for period in [5, 10, 20, 50, 100]:
-            df[f'sma_{period}'] = df['close'].rolling(period).mean()
-            df[f'close_to_sma_{period}'] = (df['close'] - df[f'sma_{period}']) / df[f'sma_{period}']
-
-        # EMA
-        df['ema_12'] = df['close'].ewm(span=12, adjust=False).mean()
-        df['ema_26'] = df['close'].ewm(span=26, adjust=False).mean()
-        df['macd'] = df['ema_12'] - df['ema_26']
-        df['macd_signal'] = df['macd'].ewm(span=9, adjust=False).mean()
-
-        # RSI
-        delta = df['close'].diff()
-        gain = delta.where(delta > 0, 0).rolling(14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-        rs = gain / loss.replace(0, np.nan)
-        df['rsi'] = 100 - (100 / (1 + rs))
-
-        # Bollinger Bands
-        df['bb_mid'] = df['close'].rolling(20).mean()
-        df['bb_std'] = df['close'].rolling(20).std()
-        df['bb_upper'] = df['bb_mid'] + 2 * df['bb_std']
-        df['bb_lower'] = df['bb_mid'] - 2 * df['bb_std']
-        df['bb_pct'] = (df['close'] - df['bb_lower']) / (df['bb_upper'] - df['bb_lower']).replace(0, np.nan)
-
-        # Volume features
-        df['volume_ma_20'] = df['volume'].rolling(20).mean()
-        df['volume_ratio'] = df['volume'] / df['volume_ma_20'].replace(0, np.nan)
-
-        # Candle patterns
-        df['body_size'] = abs(df['close'] - df['open']) / df['open']
-        df['upper_shadow'] = (df['high'] - df[['close', 'open']].max(axis=1)) / df['open']
-        df['lower_shadow'] = (df[['close', 'open']].min(axis=1) - df['low']) / df['open']
-
-        # Momentum
-        df['momentum_5'] = df['close'] / df['close'].shift(5) - 1
-        df['momentum_10'] = df['close'] / df['close'].shift(10) - 1
-
-        # ATR
-        high_low = df['high'] - df['low']
-        high_close = (df['high'] - df['close'].shift()).abs()
-        low_close = (df['low'] - df['close'].shift()).abs()
-        true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-        df['atr'] = true_range.rolling(14).mean()
-        df['atr_pct'] = df['atr'] / df['close']
-
-        return df
+        """Calculate all features using the shared feature pipeline."""
+        from src.ml.features import engineer_features
+        has_datetime_index = isinstance(df.index, pd.DatetimeIndex)
+        return engineer_features(df, include_target=False)
 
     def get_feature_columns(self) -> list[str]:
         """Get the list of feature columns for the model."""
-        return [
-            'returns_1', 'returns_5', 'returns_10', 'returns_20',
-            'volatility_10', 'volatility_20',
-            'close_to_sma_5', 'close_to_sma_10', 'close_to_sma_20', 'close_to_sma_50', 'close_to_sma_100',
-            'macd', 'macd_signal', 'rsi', 'bb_pct',
-            'volume_ratio', 'body_size', 'upper_shadow', 'lower_shadow',
-            'momentum_5', 'momentum_10', 'atr_pct',
-        ]
+        from src.ml.features import get_feature_names
+        if self._feature_columns:
+            return self._feature_columns
+        return get_feature_names(include_time_features=True)
 
     # ──────────────────────────────────────────────────────────────────────
     # Training
@@ -189,12 +129,13 @@ class MLStrategy(BaseStrategy):
                 np.where(df['future_return'] < -threshold, -1, 0)  # DOWN / FLAT
             )
 
-            # Drop NaN rows
-            valid = df.dropna(subset=feature_cols + ['target'])
+            # Use only features that actually exist in the data
+            available_cols = [c for c in feature_cols if c in df.columns]
+            valid = df.dropna(subset=available_cols + ['target'])
             if len(valid) < 100:
                 continue
 
-            all_X.append(valid[feature_cols])
+            all_X.append(valid[available_cols])
             all_y.append(valid['target'])
 
         if not all_X:
@@ -235,7 +176,7 @@ class MLStrategy(BaseStrategy):
         # Final fit on all data
         model.fit(X, y_mapped, verbose=False)
         self.model = model
-        self._feature_columns = feature_cols
+        self._feature_columns = list(X.columns)  # Save actual columns used
         self._last_train_time = datetime.now()
         self.save_model()
 
