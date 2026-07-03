@@ -106,6 +106,13 @@ def _is_authorized(message: Message) -> bool:
 
 @router.message(CommandStart())
 async def cmd_start(message: Message):
+    # Auto-register first user if no chat IDs are configured
+    global _authorized_users
+    if not _authorized_users:
+        _authorized_users.add(message.from_user.id)
+        logger.info("telegram.auto_registered", user_id=message.from_user.id,
+                    username=message.from_user.username)
+
     if not _is_authorized(message):
         await message.answer("Unauthorized.")
         return
@@ -827,7 +834,7 @@ class TelegramBotManager:
 
     async def send_alert(self, text: str, chat_id: int = None):
         """Send an alert message to specified or all authorized chats."""
-        targets = [chat_id] if chat_id else self.authorized_chat_ids
+        targets = [chat_id] if chat_id else (self.authorized_chat_ids or list(_authorized_users))
         for cid in targets:
             try:
                 await self.bot.send_message(cid, text, parse_mode=ParseMode.HTML)

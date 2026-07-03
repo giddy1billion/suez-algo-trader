@@ -304,7 +304,10 @@ def cmd_run(
             TelegramBotManager, set_components, get_runtime_changes
         )
 
-        chat_ids = [int(settings.telegram_chat_id)] if settings.telegram_chat_id else []
+        # Parse chat ID — skip if placeholder or non-numeric (auto-detect on first message)
+        chat_ids = []
+        if settings.telegram_chat_id and settings.telegram_chat_id.isdigit():
+            chat_ids = [int(settings.telegram_chat_id)]
         set_components(broker, engine, risk, strategy, db=db, authorized_chat_ids=chat_ids)
         telegram_bot = TelegramBotManager(
             token=settings.telegram_bot_token,
