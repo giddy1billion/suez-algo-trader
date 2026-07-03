@@ -551,7 +551,7 @@ class FixedRiskSizing(SizingModel):
         self.risk_pct = risk_pct
 
     def size(self, signal: Signal, price: float, portfolio_value: float, atr: float) -> float:
-        if price <= 0 or atr <= 0:
+        if price <= 0 or atr <= 0 or portfolio_value <= 0:
             return 0.0
 
         risk_amount = portfolio_value * self.risk_pct
@@ -579,7 +579,7 @@ class KellySizing(SizingModel):
         # where p=win_rate, q=1-p, b=avg_win/avg_loss
         b = self.avg_win / self.avg_loss
         q = 1 - self.win_rate
-        kelly = (self.win_rate * b - q) / b
+        kelly = max((self.win_rate * b - q) / b, 0.0)
 
         # Apply fraction (half-kelly by default)
         sized = kelly * self.fraction

@@ -16,9 +16,8 @@ All models are deterministic when seeded, thread-safe, and require only numpy.
 from __future__ import annotations
 
 import threading
-import time
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -92,6 +91,8 @@ class VolumeImpactSlippage(SlippageModel):
     def apply(self, price: float, qty: float, side: str, volume: float) -> float:
         participation = qty / max(volume * self.daily_volume_pct, 1.0)
         impact_pct = self.impact_factor * np.sqrt(participation) / 100
+        # Cap at 5% to prevent negative prices
+        impact_pct = min(impact_pct, 0.05)
         if side == "buy":
             return price * (1 + impact_pct)
         else:
@@ -202,9 +203,11 @@ class PartialFill(FillModel):
         while remaining > 0:
             # Each fill takes up to max_per_fill shares with slight randomness
             fill_qty = min(remaining, max_per_fill * (0.5 + 0.5 * rng.random()))
-            fill_qty = max(fill_qty, 1.0)  # At least 1 share
+            fill_qty = max(fill_qty, min(1.0, remaining))  # At least 1 share or remaining
             if fill_qty > remaining:
                 fill_qty = remaining
+            if fill_qty <= 0:
+                break
 
             fills.append(
                 {
@@ -217,7 +220,7 @@ class PartialFill(FillModel):
 
             # Subsequent fills have slight price drift (adverse)
             drift = rng.normal(0.0001, 0.00005)
-            fill_price *= 1 + abs(drift)
+            fill_price *= 1 + drift
 
         return fills
 
@@ -295,7 +298,7 @@ class LatencyModel:
 
         Uses truncated normal: always >= 0, capped at max_ms.
         """
-        if self.mean_ms <= 0 and self.std_ms <= 0:
+        if self.mean_ms <= 0:
             return 0.0
         latency = rng.normal(self.mean_ms, self.std_ms)
         return float(np.clip(latency, 0.0, self.max_ms))

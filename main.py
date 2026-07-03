@@ -35,6 +35,8 @@ from src.strategy.ml_strategy import MLStrategy
 from src.execution.engine import ExecutionEngine
 from src.data.store import DatabaseManager
 from src.notifications.alerts import NotificationManager
+from src.monitoring.health import HealthMonitor
+from src.monitoring.metrics import LiveMetrics
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -77,6 +79,8 @@ if hasattr(signal, 'SIGBREAK'):
 
 def create_strategy(name: str, symbols: list[str], timeframe: str, lookback: int):
     """Factory to create strategy instances by name, using settings for params."""
+    from src.strategy.composable import momentum_preset, mean_reversion_preset
+
     strategies = {
         "momentum": lambda: MomentumStrategy(
             symbols=symbols, timeframe=timeframe, lookback=lookback,
@@ -96,6 +100,12 @@ def create_strategy(name: str, symbols: list[str], timeframe: str, lookback: int
             symbols=symbols, timeframe=timeframe, lookback=max(lookback, 500),
             model_path=settings.ml_model_path,
             min_confidence=settings.ml_min_confidence,
+        ),
+        "composable": lambda: momentum_preset(
+            symbols=symbols, timeframe=timeframe, lookback=lookback,
+        ),
+        "composable_mr": lambda: mean_reversion_preset(
+            symbols=symbols, timeframe=timeframe, lookback=lookback,
         ),
     }
 
@@ -306,6 +316,10 @@ def cmd_run(
     db = DatabaseManager(settings.database_url)
     engine = ExecutionEngine(broker=broker, risk_manager=risk, db=db, dry_run=dry_run)
 
+    # Initialize monitoring components
+    health_monitor = HealthMonitor()
+    live_metrics = LiveMetrics()
+
     # Initialize risk manager
     account = broker.get_account()
     risk.reset_daily(account['equity'])
@@ -322,7 +336,10 @@ def cmd_run(
         chat_ids = []
         if settings.telegram_chat_id and settings.telegram_chat_id.isdigit():
             chat_ids = [int(settings.telegram_chat_id)]
-        set_components(broker, engine, risk, strategy, db=db, authorized_chat_ids=chat_ids)
+        set_components(broker, engine, risk, strategy, db=db,
+                      authorized_chat_ids=chat_ids,
+                      health_monitor=health_monitor,
+                      live_metrics=live_metrics)
         telegram_bot = TelegramBotManager(
             token=settings.telegram_bot_token,
             authorized_chat_ids=chat_ids,
@@ -582,6 +599,15 @@ def cmd_run(
 
         active_jobs = [j.id for j in _scheduler.get_jobs()]
         logger.info("scheduler.started", jobs=active_jobs)
+
+        # Pass scheduler to Telegram bot for /health command
+        if telegram_bot:
+            from src.notifications.telegram_bot import set_components as _set_components_update
+            _set_components_update(broker, engine, risk, strategy, db=db,
+                                  authorized_chat_ids=chat_ids,
+                                  health_monitor=health_monitor,
+                                  live_metrics=live_metrics,
+                                  scheduler=_scheduler)
     except ImportError:
         logger.debug("scheduler.apscheduler_not_available")
 
@@ -674,6 +700,9 @@ def cmd_run(
                     logger.error("ml.auto_retrain_error", error=str(e))
 
         try:
+            # Record heartbeat for health monitoring
+            health_monitor.heartbeat("engine")
+
             # Check risk halt and notify
             can_trade, halt_reason = risk.can_trade()
             if not can_trade:
