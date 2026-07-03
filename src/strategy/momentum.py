@@ -96,6 +96,11 @@ class MomentumStrategy(BaseStrategy):
         signals = []
 
         for symbol, df in data.items():
+            required = {'close', 'high', 'low', 'volume'}
+            if not required.issubset(df.columns):
+                logger.warning("momentum.missing_columns", symbol=symbol, missing=list(required - set(df.columns)))
+                continue
+
             if len(df) < self.slow_ema + 10:
                 continue
 
@@ -108,6 +113,8 @@ class MomentumStrategy(BaseStrategy):
 
     def _evaluate_symbol(self, symbol: str, df: pd.DataFrame) -> Optional[TradeSignal]:
         """Evaluate a single symbol and return a signal."""
+        if len(df) < 2:
+            return None
         latest = df.iloc[-1]
         prev = df.iloc[-2]
         price = latest['close']

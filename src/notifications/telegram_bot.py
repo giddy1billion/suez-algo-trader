@@ -2224,9 +2224,9 @@ async def cmd_events(message: Message):
         await message.answer(f"Events error: {e}")
 
 
-@router.message(Command("trades"))
+@router.message(Command("activetrades"))
 async def cmd_active_trades(message: Message):
-    """Show active trade lifecycles from TradeManager."""
+    """Show active trade lifecycles from TradeManager via /activetrades."""
     if not _is_authorized(message):
         return
 

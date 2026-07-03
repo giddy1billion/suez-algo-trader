@@ -136,7 +136,15 @@ class DatabaseManager:
     """Manages database connections and provides CRUD operations."""
 
     def __init__(self, database_url: str = "sqlite:///data_cache/trading.db"):
-        self.engine = create_engine(database_url, echo=False)
+        # Thread-safe SQLite configuration
+        engine_kwargs = {"echo": False}
+        if "sqlite" in database_url:
+            engine_kwargs["connect_args"] = {"check_same_thread": False}
+            # Use StaticPool for single-connection thread safety with SQLite
+            from sqlalchemy.pool import StaticPool
+            engine_kwargs["poolclass"] = StaticPool
+
+        self.engine = create_engine(database_url, **engine_kwargs)
         Base.metadata.create_all(self.engine)
         self.SessionFactory = sessionmaker(bind=self.engine)
 

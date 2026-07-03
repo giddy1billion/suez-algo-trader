@@ -9,7 +9,6 @@ Integrates:
 """
 
 import threading
-import time
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -20,6 +19,13 @@ from src.risk.models import TradeRequest, RiskDecision
 from src.strategy.base import BaseStrategy, TradeSignal, Signal
 from src.data.store import DatabaseManager
 from src.utils.logger import get_logger
+
+# Event types — imported at top for reliability
+from src.core.events import (
+    SignalGenerated, RiskEvaluated, OrderSubmitted, OrderFilled,
+    OrderRejected, TradeOpened, TradeClosed, RiskHalt,
+)
+from src.core.state_machine import TradeState
 
 logger = get_logger(__name__)
 
@@ -71,6 +77,7 @@ class ExecutionEngine:
         self.risk_engine = risk_engine or RiskEngine()
         self._last_cycle_time: Optional[datetime] = None
         self._current_strategy_name: str = "unknown"
+        self._cycle_count: int = 0
 
         # Event-driven components (optional but recommended)
         self._event_bus = event_bus
@@ -110,8 +117,6 @@ class ExecutionEngine:
         can_trade, reason = self.risk.can_trade()
         if not can_trade:
             logger.warning("engine.halted", reason=reason)
-            # Publish risk halt event
-            from src.core.events import RiskHalt
             self._publish(RiskHalt(reason=reason, level="WARNING", source="engine"))
             return []
 
@@ -135,7 +140,6 @@ class ExecutionEngine:
         logger.info("engine.signals", count=len(signals), actionable=actionable_count)
 
         # Publish signal events
-        from src.core.events import SignalGenerated
         for sig in signals:
             if sig.is_actionable:
                 self._publish(SignalGenerated(
@@ -170,6 +174,13 @@ class ExecutionEngine:
 
         # 6. Snapshot portfolio
         self._snapshot_portfolio(account, positions)
+
+        # 7. Periodic cleanup (every 50 cycles, remove terminal trades from memory)
+        self._cycle_count += 1
+        if self._trade_manager and self._cycle_count % 50 == 0:
+            removed = self._trade_manager.remove_terminal()
+            if removed > 0:
+                logger.info("engine.cleanup_terminal", removed=removed)
 
         return results
 
@@ -223,10 +234,9 @@ class ExecutionEngine:
         # Create trade lifecycle if TradeManager available
         trade_lifecycle = None
         if self._trade_manager:
-            from src.core.state_machine import TradeState
-            trade_id = self._trade_manager.create_trade(signal.symbol, side)
-            trade_lifecycle = self._trade_manager.get_trade(trade_id)
-            trade_lifecycle.transition(TradeState.PENDING_RISK, "risk evaluation")
+            trade_lifecycle = self._trade_manager.create_trade(signal.symbol, side)
+            if not trade_lifecycle.transition(TradeState.PENDING_RISK, "risk evaluation"):
+                logger.warning("engine.invalid_transition", symbol=signal.symbol, state="PENDING_RISK")
 
         # Get account cash for risk evaluation
         try:
@@ -256,7 +266,6 @@ class ExecutionEngine:
         )
 
         # Publish risk evaluation event
-        from src.core.events import RiskEvaluated
         self._publish(RiskEvaluated(
             symbol=signal.symbol,
             approved=decision.approved,
@@ -269,15 +278,12 @@ class ExecutionEngine:
         if not decision.approved:
             logger.info("engine.trade_rejected", symbol=signal.symbol, reasons=decision.reasons)
             self._log_signal(signal, executed=False)
-            # Transition lifecycle to RISK_REJECTED
             if trade_lifecycle:
-                from src.core.state_machine import TradeState
                 trade_lifecycle.transition(TradeState.RISK_REJECTED, "; ".join(decision.reasons))
             return None
 
         # Risk approved — transition lifecycle
         if trade_lifecycle:
-            from src.core.state_machine import TradeState
             trade_lifecycle.transition(TradeState.RISK_APPROVED, "all layers passed")
 
         final_qty = decision.adjusted_qty
@@ -320,11 +326,15 @@ class ExecutionEngine:
             )
 
             if not sim_result.get('executed', True):
-                # Simulated rejection
+                # Simulated rejection — publish event and abort
                 logger.warning("engine.sim_rejected", symbol=signal.symbol,
                              reason=sim_result.get('rejection_reason'))
+                self._publish(OrderRejected(
+                    order_id="",
+                    reason=f"sim_rejected: {sim_result.get('rejection_reason', 'no_fill')}",
+                    source="simulator",
+                ))
                 if trade_lifecycle:
-                    from src.core.state_machine import TradeState
                     trade_lifecycle.transition(TradeState.CANCELLED, "sim_rejected")
                 return None
 
@@ -337,7 +347,6 @@ class ExecutionEngine:
 
         # Transition lifecycle: SUBMITTED
         if trade_lifecycle:
-            from src.core.state_machine import TradeState
             trade_lifecycle.transition(TradeState.SUBMITTED, "order submitted to broker")
 
         # Place the order
@@ -358,7 +367,6 @@ class ExecutionEngine:
                 )
 
             # Publish OrderSubmitted event
-            from src.core.events import OrderSubmitted, OrderFilled, TradeOpened
             self._publish(OrderSubmitted(
                 symbol=signal.symbol,
                 side=side,
@@ -370,11 +378,15 @@ class ExecutionEngine:
             ))
 
             # Transition lifecycle: ACCEPTED → FILLED → ACTIVE
+            # Use trade lifecycle ID as the canonical trade_id for event correlation
+            trade_id = trade_lifecycle.trade_id if trade_lifecycle else order.get("id", "")
             if trade_lifecycle:
-                from src.core.state_machine import TradeState
                 trade_lifecycle.transition(TradeState.ACCEPTED, "broker accepted")
                 trade_lifecycle.transition(TradeState.FILLED, f"filled qty={final_qty}")
                 trade_lifecycle.transition(TradeState.ACTIVE, "position active")
+                # Store order_id in lifecycle metadata for exit correlation
+                trade_lifecycle.metadata['order_id'] = order.get("id", "")
+                trade_lifecycle.metadata['symbol'] = signal.symbol
 
             # Publish OrderFilled
             fill_price = sim_result['avg_price'] if sim_result else signal.price
@@ -387,9 +399,9 @@ class ExecutionEngine:
                 source="engine",
             ))
 
-            # Publish TradeOpened
+            # Publish TradeOpened with consistent trade_id
             self._publish(TradeOpened(
-                trade_id=order.get("id", ""),
+                trade_id=trade_id,
                 symbol=signal.symbol,
                 side=side,
                 entry_price=fill_price,
@@ -443,16 +455,12 @@ class ExecutionEngine:
 
         except Exception as e:
             logger.error("engine.order_failed", symbol=signal.symbol, error=str(e))
-            # Publish rejection event
-            from src.core.events import OrderRejected
             self._publish(OrderRejected(
                 order_id="",
                 reason=str(e),
                 source="engine",
             ))
-            # Transition lifecycle to ERROR
             if trade_lifecycle:
-                from src.core.state_machine import TradeState
                 trade_lifecycle.transition(TradeState.ERROR, f"order_failed: {str(e)[:80]}")
             return None
 
@@ -472,12 +480,26 @@ class ExecutionEngine:
                         self.risk.record_trade({"symbol": symbol, "pnl": pnl})
                         results.append({"action": "exit", "symbol": symbol, "pnl": pnl})
 
-                        # Publish TradeClosed event
-                        from src.core.events import TradeClosed
+                        # Compute consistent PnL%
                         entry_price = pos.get('avg_entry_price', pos.get('cost_basis', 0))
-                        pnl_pct = (current_price - entry_price) / entry_price * 100 if entry_price else 0
+                        pnl_pct = 0.0
+                        if entry_price and abs(entry_price) > 1e-8:
+                            pnl_pct = (current_price - entry_price) / entry_price * 100
+
+                        # Find and transition trade lifecycle to CLOSED
+                        trade_id = pos.get('asset_id', '')
+                        if self._trade_manager:
+                            active_trades = self._trade_manager.get_trades_by_symbol(symbol)
+                            for t in active_trades:
+                                if not t.is_terminal:
+                                    t.transition(TradeState.CLOSING, "strategy_exit")
+                                    t.transition(TradeState.CLOSED, f"pnl={pnl:.2f}")
+                                    trade_id = t.trade_id
+                                    break
+
+                        # Publish TradeClosed event
                         self._publish(TradeClosed(
-                            trade_id=pos.get('asset_id', ''),
+                            trade_id=trade_id,
                             symbol=symbol,
                             exit_price=current_price,
                             pnl=pnl,
@@ -546,14 +568,56 @@ class ExecutionEngine:
         """PANIC: Close all positions and cancel all orders immediately."""
         logger.warning("engine.EMERGENCY_LIQUIDATE")
         self.broker.cancel_all_orders()
+
+        # Get positions BEFORE closing to publish per-position events
+        try:
+            positions = self.broker.get_positions()
+        except Exception:
+            positions = []
+
+        # Close all and publish individual TradeClosed events
         self.broker.close_all_positions()
+
+        for pos in positions:
+            symbol = pos.get('symbol', '?')
+            pnl = pos.get('unrealized_pl', 0)
+            current_price = pos.get('current_price', 0)
+            entry_price = pos.get('avg_entry_price', 0)
+            pnl_pct = 0.0
+            if entry_price and abs(entry_price) > 1e-8:
+                pnl_pct = (current_price - entry_price) / entry_price * 100
+
+            # Transition trade lifecycle
+            trade_id = pos.get('asset_id', '')
+            if self._trade_manager:
+                active_trades = self._trade_manager.get_trades_by_symbol(symbol)
+                for t in active_trades:
+                    if not t.is_terminal:
+                        t.transition(TradeState.CLOSING, "emergency_liquidation")
+                        t.transition(TradeState.CLOSED, "emergency_liquidation")
+                        trade_id = t.trade_id
+                        break
+
+            self._publish(TradeClosed(
+                trade_id=trade_id,
+                symbol=symbol,
+                exit_price=current_price,
+                pnl=pnl,
+                pnl_pct=pnl_pct,
+                reason="emergency_liquidation",
+                source="engine",
+            ))
+
         self.risk.daily_stats.is_halted = True
         self.risk.daily_stats.halt_reason = "Emergency liquidation triggered"
 
-        # Publish critical risk halt
-        from src.core.events import RiskHalt
         self._publish(RiskHalt(
             reason="Emergency liquidation triggered",
             level="CRITICAL",
             source="engine",
         ))
+
+        # Cleanup terminal trades from memory
+        if self._trade_manager:
+            removed = self._trade_manager.remove_terminal()
+            logger.info("engine.cleanup_terminal_trades", removed=removed)

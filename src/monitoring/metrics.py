@@ -264,7 +264,8 @@ class LiveMetrics:
         mean_r = sum(daily_returns) / len(daily_returns)
         downside = [r for r in daily_returns if r < 0]
         if not downside:
-            return 0.0 if mean_r <= 0 else 999.99
+            # No downside returns: Sortino is theoretically infinite; cap for display safety
+            return 0.0 if mean_r <= 0 else 99.99
         downside_std = _std(downside)
         if downside_std == 0:
             return 0.0
@@ -274,7 +275,8 @@ class LiveMetrics:
         """Calmar ratio: annualized return / max drawdown."""
         if not daily_returns or max_dd == 0:
             return 0.0
-        annualized_return = sum(daily_returns) * (252.0 / len(daily_returns))
+        mean_daily_return = sum(daily_returns) / len(daily_returns)
+        annualized_return = ((1 + mean_daily_return) ** 252) - 1
         return annualized_return / (abs(max_dd) / 100.0) if max_dd != 0 else 0.0
 
     def _calc_drawdowns(self) -> tuple[float, float]:
@@ -401,7 +403,7 @@ class LiveMetrics:
 
 
 def _std(values: list[float]) -> float:
-    """Standard deviation (population)."""
+    """Sample standard deviation (Bessel-corrected, divides by n-1)."""
     if len(values) < 2:
         return 0.0
     mean = sum(values) / len(values)

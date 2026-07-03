@@ -81,6 +81,11 @@ class MeanReversionStrategy(BaseStrategy):
         signals = []
 
         for symbol, df in data.items():
+            required = {'close', 'high', 'low', 'volume'}
+            if not required.issubset(df.columns):
+                logger.warning("mean_reversion.missing_columns", symbol=symbol, missing=list(required - set(df.columns)))
+                continue
+
             if len(df) < self.bb_period + 10:
                 continue
 
@@ -93,6 +98,8 @@ class MeanReversionStrategy(BaseStrategy):
 
     def _evaluate_symbol(self, symbol: str, df: pd.DataFrame) -> Optional[TradeSignal]:
         """Evaluate mean reversion opportunity for one symbol."""
+        if len(df) < 2:
+            return None
         latest = df.iloc[-1]
         price = latest['close']
 

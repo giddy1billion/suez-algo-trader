@@ -33,7 +33,8 @@ def _safe_profit_factor(wins: list, losses: list) -> float:
     gross_loss = abs(sum(t['pnl'] for t in losses)) if losses else 0.0
     gross_profit = sum(t['pnl'] for t in wins) if wins else 0.0
     if gross_loss < 1e-9:
-        return float('inf') if gross_profit > 0 else 0.0
+        # Cap at 999.99 for downstream safety instead of infinity
+        return 999.99 if gross_profit > 0 else 0.0
     return gross_profit / gross_loss
 
 
@@ -111,7 +112,8 @@ def _numpy_ema_crossover_backtest(
     losses = [t for t in trades if t['pnl'] <= 0]
     win_rate = len(wins) / len(trades) if trades else 0.0
 
-    # Sharpe ratio (annualized from trade returns)
+    # Trade Sharpe (not annualized daily Sharpe) — computed from per-trade returns,
+    # scaled by sqrt(252) as a rough annualization proxy.
     if trades:
         returns = np.array([t['return'] for t in trades])
         sharpe = (returns.mean() / returns.std() * np.sqrt(252)) if returns.std() > 0 else 0.0
@@ -134,6 +136,8 @@ def _numpy_ema_crossover_backtest(
         equity[i] = c + pos * close[i]
 
     running_max = np.maximum.accumulate(equity)
+    # Guard against division by zero when running_max is 0
+    running_max = np.where(running_max > 0, running_max, 1.0)
     drawdown = (equity - running_max) / running_max
     max_drawdown = drawdown.min()
 

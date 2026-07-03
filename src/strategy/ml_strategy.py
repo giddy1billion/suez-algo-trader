@@ -4,6 +4,7 @@ Uses XGBoost with engineered features for price direction prediction.
 """
 
 import os
+import threading
 from datetime import datetime
 from typing import Optional
 
@@ -42,33 +43,36 @@ class MLStrategy(BaseStrategy):
         self.model = None
         self._last_train_time: Optional[datetime] = None
         self._feature_columns: list[str] = []
+        self._model_lock = threading.Lock()  # Protects model load/save/predict
 
         self._load_model()
 
     def _load_model(self):
-        """Load a previously trained model from disk."""
-        if os.path.exists(self.model_path):
-            try:
-                data = joblib.load(self.model_path)
-                self.model = data['model']
-                self._feature_columns = data.get('features', [])
-                self._last_train_time = data.get('trained_at')
-                logger.info("ml.model_loaded", path=self.model_path,
-                           features=len(self._feature_columns))
-            except Exception as e:
-                logger.error("ml.model_load_failed", error=str(e))
-                self.model = None
+        """Load a previously trained model from disk. Thread-safe."""
+        with self._model_lock:
+            if os.path.exists(self.model_path):
+                try:
+                    data = joblib.load(self.model_path)
+                    self.model = data['model']
+                    self._feature_columns = data.get('features', [])
+                    self._last_train_time = data.get('trained_at')
+                    logger.info("ml.model_loaded", path=self.model_path,
+                               features=len(self._feature_columns))
+                except Exception as e:
+                    logger.error("ml.model_load_failed", error=str(e))
+                    self.model = None
 
     def save_model(self):
-        """Save the trained model to disk with versioning."""
-        if self.model is None:
-            return
-        os.makedirs(os.path.dirname(self.model_path), exist_ok=True)
-        joblib.dump({
-            'model': self.model,
-            'features': self._feature_columns,
-            'trained_at': datetime.now(),
-        }, self.model_path)
+        """Save the trained model to disk with versioning. Thread-safe."""
+        with self._model_lock:
+            if self.model is None:
+                return
+            os.makedirs(os.path.dirname(self.model_path), exist_ok=True)
+            joblib.dump({
+                'model': self.model,
+                'features': self._feature_columns,
+                'trained_at': datetime.now(),
+            }, self.model_path)
 
         # Version the model
         try:
@@ -136,15 +140,22 @@ class MLStrategy(BaseStrategy):
         for symbol, df in training_data.items():
             df = self.calculate_indicators(df)
 
-            # Target: direction over next N bars
+            # Target: direction over next N bars (ONLY look-ahead in pipeline)
+            # Features are strictly backward-looking (rolling, EMA with adjust=False).
+            # dropna removes: first ~50 rows (feature warmup NaN) + last forward_bars rows (target NaN).
+            # No temporal embargo needed because features[t] depend only on data[0:t].
             df['future_return'] = df['close'].shift(-forward_bars) / df['close'] - 1
             df['target'] = np.where(
                 df['future_return'] > threshold, 1,   # UP
                 np.where(df['future_return'] < -threshold, -1, 0)  # DOWN / FLAT
             )
 
+            # Drop 'future_return' from feature set to prevent leakage
+            if 'future_return' in df.columns:
+                df = df.drop(columns=['future_return'])
+
             # Use only features that actually exist in the data
-            available_cols = [c for c in feature_cols if c in df.columns]
+            available_cols = [c for c in feature_cols if c in df.columns and c != 'target']
             valid = df.dropna(subset=available_cols + ['target'])
             if len(valid) < 100:
                 continue
@@ -207,7 +218,7 @@ class MLStrategy(BaseStrategy):
     # ──────────────────────────────────────────────────────────────────────
 
     def generate_signals(self, data: dict[str, pd.DataFrame]) -> list[TradeSignal]:
-        """Generate ML-based signals."""
+        """Generate ML-based signals. Thread-safe model access."""
         if self.model is None:
             logger.warning("ml.no_model", msg="Train model first")
             return []
@@ -232,8 +243,13 @@ class MLStrategy(BaseStrategy):
             if features.isna().any(axis=1).iloc[0]:
                 continue
 
-            # Predict
-            proba = self.model.predict_proba(features)[0]
+            # Predict (thread-safe)
+            with self._model_lock:
+                try:
+                    proba = self.model.predict_proba(features)[0]
+                except Exception as e:
+                    logger.error("ml.predict_failed", symbol=symbol, error=str(e))
+                    continue
             # proba: [P(down), P(flat), P(up)]
             pred_class = np.argmax(proba)
             confidence = proba[pred_class]

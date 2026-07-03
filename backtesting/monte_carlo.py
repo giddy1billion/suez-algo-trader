@@ -41,6 +41,7 @@ def monte_carlo_simulation(
     initial_cash: float = 10000.0,
     n_simulations: int = 1000,
     confidence_levels: Optional[List[int]] = None,
+    seed: Optional[int] = 42,
 ) -> Dict[str, Any]:
     """Run Monte Carlo simulation by shuffling trade order.
 
@@ -53,6 +54,7 @@ def monte_carlo_simulation(
         initial_cash: Starting capital for equity curve simulation.
         n_simulations: Number of random shuffles to perform.
         confidence_levels: Percentile levels to compute (default: [5, 25, 50, 75, 95]).
+        seed: RNG seed for reproducibility (default: 42). Pass None for non-deterministic.
 
     Returns:
         Dict with simulation statistics and percentile equity curves.
@@ -75,7 +77,7 @@ def monte_carlo_simulation(
     max_drawdowns = np.empty(n_simulations)
     equity_curves = np.empty((n_simulations, n_trades + 1))
 
-    rng = np.random.default_rng()
+    rng = np.random.default_rng(seed=seed)
 
     for i in range(n_simulations):
         # Shuffle trade order
@@ -175,6 +177,7 @@ def monte_carlo_from_backtest(
     initial_cash: float = 10000.0,
     fees: float = 0.001,
     n_simulations: int = 1000,
+    seed: Optional[int] = 42,
 ) -> Dict[str, Any]:
     """Run EMA crossover backtest then Monte Carlo on the resulting trades.
 
@@ -189,6 +192,7 @@ def monte_carlo_from_backtest(
         initial_cash: Starting capital.
         fees: Trading fee fraction.
         n_simulations: Number of Monte Carlo shuffles.
+        seed: RNG seed for reproducibility (default: 42). Pass None for non-deterministic.
 
     Returns:
         Dict with Monte Carlo results plus backtest metadata.
@@ -259,6 +263,7 @@ def monte_carlo_from_backtest(
         trades=trades,
         initial_cash=initial_cash,
         n_simulations=n_simulations,
+        seed=seed,
     )
 
     # Add backtest context

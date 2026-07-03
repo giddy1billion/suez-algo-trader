@@ -6,6 +6,7 @@ logging, auditing, metrics, and notifications.
 """
 
 import logging
+import threading
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -112,6 +113,7 @@ class MetricsSubscriber:
     """Listens for TradeClosed events and updates running performance metrics."""
 
     def __init__(self) -> None:
+        self._lock = threading.Lock()
         self.total_trades: int = 0
         self.winning_trades: int = 0
         self.losing_trades: int = 0
@@ -125,43 +127,50 @@ class MetricsSubscriber:
     def handle(self, event: TradeClosed) -> None:
         """Update metrics on trade close."""
         try:
-            self.total_trades += 1
-            self.total_pnl += event.pnl
+            with self._lock:
+                self.total_trades += 1
+                self.total_pnl += event.pnl
 
-            if event.pnl > 0:
-                self.winning_trades += 1
-                self.max_win = max(self.max_win, event.pnl)
-                if self._last_was_win is True:
-                    self.consecutive_wins += 1
+                if event.pnl > 0:
+                    self.winning_trades += 1
+                    self.max_win = max(self.max_win, event.pnl)
+                    if self._last_was_win is True:
+                        self.consecutive_wins += 1
+                    else:
+                        self.consecutive_wins = 1
+                        self.consecutive_losses = 0
+                    self._last_was_win = True
+                elif event.pnl < 0:
+                    self.losing_trades += 1
+                    self.max_loss = min(self.max_loss, event.pnl)
+                    if self._last_was_win is False:
+                        self.consecutive_losses += 1
+                    else:
+                        self.consecutive_losses = 1
+                        self.consecutive_wins = 0
+                    self._last_was_win = False
                 else:
-                    self.consecutive_wins = 1
-                    self.consecutive_losses = 0
-                self._last_was_win = True
-            elif event.pnl < 0:
-                self.losing_trades += 1
-                self.max_loss = min(self.max_loss, event.pnl)
-                if self._last_was_win is False:
-                    self.consecutive_losses += 1
-                else:
-                    self.consecutive_losses = 1
+                    # Break-even trade: track total but don't affect win/loss counts
                     self.consecutive_wins = 0
-                self._last_was_win = False
+                    self.consecutive_losses = 0
+                    self._last_was_win = None
 
-            logger.debug(
-                "Metrics updated: %d trades, %.2f total PnL, %.1f%% win rate",
-                self.total_trades,
-                self.total_pnl,
-                self.win_rate * 100,
-            )
+                logger.debug(
+                    "Metrics updated: %d trades, %.2f total PnL, %.1f%% win rate",
+                    self.total_trades,
+                    self.total_pnl,
+                    self.win_rate * 100,
+                )
         except Exception:
             logger.exception("MetricsSubscriber failed")
 
     @property
     def win_rate(self) -> float:
-        """Current win rate as a ratio (0.0 to 1.0)."""
-        if self.total_trades == 0:
+        """Current win rate as a ratio (0.0 to 1.0). Excludes break-even trades."""
+        decided_trades = self.winning_trades + self.losing_trades
+        if decided_trades == 0:
             return 0.0
-        return self.winning_trades / self.total_trades
+        return self.winning_trades / decided_trades
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize current metrics."""

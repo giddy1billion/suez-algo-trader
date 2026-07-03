@@ -347,12 +347,15 @@ def cmd_run(
     )
 
     # Register default event subscribers (audit log, journal, metrics, notifications)
+    _send_fn = notifier._send_telegram if notifier.telegram_token else None
+
     def _notification_sender(message: str):
         """Send notification via Telegram/Discord if available."""
-        try:
-            notifier._send_telegram(message)
-        except Exception:
-            pass
+        if _send_fn:
+            try:
+                _send_fn(message)
+            except Exception:
+                pass
 
     subscribers = setup_default_subscribers(
         bus=event_bus,
@@ -379,12 +382,6 @@ def cmd_run(
         chat_ids = []
         if settings.telegram_chat_id and settings.telegram_chat_id.isdigit():
             chat_ids = [int(settings.telegram_chat_id)]
-        set_components(broker, engine, risk, strategy, db=db,
-                      authorized_chat_ids=chat_ids,
-                      health_monitor=health_monitor,
-                      live_metrics=live_metrics,
-                      event_bus=event_bus,
-                      trade_manager=trade_manager)
         telegram_bot = TelegramBotManager(
             token=settings.telegram_bot_token,
             authorized_chat_ids=chat_ids,
@@ -645,18 +642,19 @@ def cmd_run(
         active_jobs = [j.id for j in _scheduler.get_jobs()]
         logger.info("scheduler.started", jobs=active_jobs)
 
-        # Pass scheduler to Telegram bot for /health command
-        if telegram_bot:
-            from src.notifications.telegram_bot import set_components as _set_components_update
-            _set_components_update(broker, engine, risk, strategy, db=db,
-                                  authorized_chat_ids=chat_ids,
-                                  health_monitor=health_monitor,
-                                  live_metrics=live_metrics,
-                                  scheduler=_scheduler,
-                                  event_bus=event_bus,
-                                  trade_manager=trade_manager)
     except ImportError:
         logger.debug("scheduler.apscheduler_not_available")
+
+    # Single set_components call AFTER all initialization is complete
+    if telegram_bot:
+        from src.notifications.telegram_bot import set_components as _set_components_update
+        _set_components_update(broker, engine, risk, strategy, db=db,
+                              authorized_chat_ids=chat_ids,
+                              health_monitor=health_monitor,
+                              live_metrics=live_metrics,
+                              scheduler=_scheduler,
+                              event_bus=event_bus,
+                              trade_manager=trade_manager)
 
     # Cache crypto-only strategy to avoid re-creating each cycle
     crypto_only = [s for s in symbols if "/" in s]
@@ -665,6 +663,12 @@ def cmd_run(
     while not _shutdown_event.is_set():
         cycle_count += 1
         cycle_start = time.time()
+
+        # Periodic TradeManager cleanup to prevent unbounded memory growth
+        if trade_manager and cycle_count % 100 == 0:
+            removed = trade_manager.remove_terminal()
+            if removed > 0:
+                logger.info("trade_manager.cleanup", removed=removed, cycle=cycle_count)
 
         # Check if paused via Telegram
         if telegram_bot and telegram_bot.is_paused():
