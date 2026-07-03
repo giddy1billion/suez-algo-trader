@@ -1,5 +1,9 @@
 """
-Risk Manager — Enforces position sizing, exposure limits, drawdown protection.
+Risk Manager — Legacy compatibility shim.
+
+This module is preserved for backward compatibility. New code should use
+the multi-layer RiskEngine (src.risk.engine) directly.
+
 All trading decisions pass through here before execution.
 """
 

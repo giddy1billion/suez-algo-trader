@@ -100,6 +100,47 @@ class Settings(BaseSettings):
     backtest_slippage_pct: float = 0.0005
     backtest_initial_cash: float = 10000.0
 
+    # --- Risk Engine (Multi-Layer) ---
+    # Portfolio Risk Layer
+    risk_max_positions: int = 10
+    risk_max_single_stock_pct: float = 0.20
+    risk_max_sector_exposure_pct: float = 0.40
+    risk_max_correlation: float = 0.80
+    risk_max_gross_exposure_pct: float = 2.00
+    risk_max_net_exposure_pct: float = 1.00
+    risk_max_var_pct: float = 0.05
+    risk_max_portfolio_heat_pct: float = 0.10
+    risk_portfolio_layer_enabled: bool = True
+
+    # Account Risk Layer
+    risk_max_daily_loss_pct: float = 0.03
+    risk_max_weekly_loss_pct: float = 0.07
+    risk_max_drawdown_pct: float = 0.15
+    risk_min_cash_reserve_pct: float = 0.20
+    risk_pdt_account_threshold: float = 25000.0
+    risk_consecutive_loss_limit: int = 5
+    risk_daily_trade_limit: int = 20
+    risk_account_layer_enabled: bool = True
+
+    # Exposure Risk Layer
+    risk_require_stop_loss: bool = True
+    risk_max_adv_pct: float = 0.01
+    risk_max_trade_concentration_pct: float = 0.05
+    risk_max_overnight_exposure_pct: float = 0.60
+    risk_earnings_blackout_days: int = 1
+    risk_high_vol_threshold: float = 0.03
+    risk_high_vol_size_reduction: float = 0.50
+    risk_exposure_layer_enabled: bool = True
+
+    # Execution Risk Layer
+    risk_max_spread_pct: float = 0.005
+    risk_min_volume: int = 10000
+    risk_max_slippage_pct: float = 0.003
+    risk_max_orders_per_minute: int = 10
+    risk_cooldown_after_loss_minutes: int = 5
+    risk_large_loss_threshold_pct: float = 0.01
+    risk_execution_layer_enabled: bool = True
+
     # --- Automation Scheduler ---
     auto_backtest_interval_hours: int = 6       # Run backtests every N hours (0=disabled)
     auto_train_interval_hours: int = 24         # Retrain ML every N hours (0=disabled)

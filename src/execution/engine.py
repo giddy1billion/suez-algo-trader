@@ -10,6 +10,8 @@ from typing import Optional
 
 from src.broker.alpaca_client import AlpacaBroker
 from src.risk.manager import RiskManager, RiskLimits
+from src.risk.engine import RiskEngine
+from src.risk.models import TradeRequest, RiskDecision
 from src.strategy.base import BaseStrategy, TradeSignal, Signal
 from src.data.store import DatabaseManager
 from src.utils.logger import get_logger
@@ -50,11 +52,13 @@ class ExecutionEngine:
         risk_manager: RiskManager,
         db: DatabaseManager,
         dry_run: bool = False,
+        risk_engine: Optional[RiskEngine] = None,
     ):
         self.broker = broker
         self.risk = risk_manager
         self.db = db
         self.dry_run = dry_run
+        self.risk_engine = risk_engine or RiskEngine()
         self._last_cycle_time: Optional[datetime] = None
 
     # ──────────────────────────────────────────────────────────────────────
@@ -125,7 +129,7 @@ class ExecutionEngine:
         return results
 
     def _process_signal(self, signal: TradeSignal, portfolio_value: float, positions: list[dict]) -> Optional[dict]:
-        """Process a single trade signal through risk check and execution."""
+        """Process a single trade signal through risk engine and execution."""
 
         # Determine side
         if signal.signal in (Signal.BUY, Signal.STRONG_BUY):
@@ -159,22 +163,39 @@ class ExecutionEngine:
         if qty <= 0:
             return None
 
-        # Risk evaluation
-        approved, reason, params = self.risk.evaluate_trade(
+        # Build TradeRequest for the new risk engine
+        trade_request = TradeRequest(
             symbol=signal.symbol,
             side=side,
             qty=qty,
             price=signal.price,
-            portfolio_value=portfolio_value,
-            current_positions=positions,
+            stop_loss=signal.stop_loss,
+            take_profit=signal.take_profit,
+            strategy=getattr(self, '_current_strategy_name', 'unknown'),
+            confidence=signal.confidence,
         )
 
-        if not approved:
-            logger.info("engine.trade_rejected", symbol=signal.symbol, reason=reason)
+        # Get account cash for risk evaluation
+        try:
+            account = self.broker.get_account()
+            cash = account.get('cash', 0.0)
+        except Exception:
+            cash = portfolio_value * 0.5  # Fallback estimate
+
+        # Evaluate through the multi-layer risk engine
+        decision: RiskDecision = self.risk_engine.evaluate(
+            request=trade_request,
+            portfolio_value=portfolio_value,
+            cash=cash,
+            positions=positions,
+        )
+
+        if not decision.approved:
+            logger.info("engine.trade_rejected", symbol=signal.symbol, reasons=decision.reasons)
             self._log_signal(signal, executed=False)
             return None
 
-        final_qty = params.get('adjusted_qty', qty)
+        final_qty = decision.adjusted_qty
 
         # Log signal
         self._log_signal(signal, executed=True)
