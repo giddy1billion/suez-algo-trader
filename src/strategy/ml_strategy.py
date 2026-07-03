@@ -60,7 +60,7 @@ class MLStrategy(BaseStrategy):
                 self.model = None
 
     def save_model(self):
-        """Save the trained model to disk."""
+        """Save the trained model to disk with versioning."""
         if self.model is None:
             return
         os.makedirs(os.path.dirname(self.model_path), exist_ok=True)
@@ -69,6 +69,20 @@ class MLStrategy(BaseStrategy):
             'features': self._feature_columns,
             'trained_at': datetime.now(),
         }, self.model_path)
+
+        # Version the model
+        try:
+            from src.ml.model_registry import ModelRegistry
+            registry = ModelRegistry()
+            registry.save_version(
+                model=self.model,
+                features=self._feature_columns,
+                metrics=getattr(self, '_last_train_metrics', {}),
+                symbols=self.symbols,
+            )
+        except Exception as e:
+            logger.warning("ml.versioning_failed", error=str(e))
+
         logger.info("ml.model_saved", path=self.model_path)
 
     def needs_retraining(self) -> bool:
@@ -172,6 +186,13 @@ class MLStrategy(BaseStrategy):
             model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
             score = model.score(X_val, y_val)
             scores.append(score)
+
+        self._last_train_metrics = {
+            "cv_accuracy": float(np.mean(scores)),
+            "cv_std": float(np.std(scores)),
+            "n_samples": len(X),
+            "n_features": len(self._feature_columns) if self._feature_columns else X.shape[1],
+        }
 
         # Final fit on all data
         model.fit(X, y_mapped, verbose=False)

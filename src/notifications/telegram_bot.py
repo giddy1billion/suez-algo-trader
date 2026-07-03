@@ -4,39 +4,46 @@ Provides interactive controls, real-time alerts, and portfolio management.
 ALL settings configurable in real-time via Telegram.
 
 Commands:
-    /start       - Welcome + status overview
-    /status      - Account balance, equity, positions
-    /positions   - Detailed position list
-    /orders      - Open orders
-    /pnl         - Today's P&L summary
-    /trades      - Recent trade history
-    /signals     - Current active signals
-    /buy         - Manual buy order (e.g., /buy AAPL 10)
-    /sell        - Manual sell order (e.g., /sell AAPL 10)
-    /close       - Close position (e.g., /close AAPL)
-    /closeall    - Emergency: close all positions
-    /cancelall   - Cancel all pending orders
-    /pause       - Pause bot trading
-    /resume      - Resume bot trading
-    /strategy    - Show/switch active strategy
-    /risk        - Show risk parameters
-    /config      - View all settings (e.g., /config risk)
-    /set         - Universal setter (e.g., /set momentum_fast_ema 8)
-    /setrisk     - Set risk param (e.g., /setrisk max_daily_loss_pct 0.05)
-    /setstrategy - Switch strategy (momentum|mean_reversion|ml)
-    /setsymbols  - Change symbols (e.g., /setsymbols AAPL,TSLA,BTC/USD)
-    /setinterval - Change cycle interval (e.g., /setinterval 120)
-    /settf       - Change timeframe (e.g., /settf 15Min)
-    /setlookback - Change lookback (e.g., /setlookback 500)
-    /setauto     - Configure automation (e.g., /setauto train 12)
-    /setnotify   - Toggle alerts (e.g., /setnotify signal on)
-    /backtest    - Backtrader backtest (e.g., /backtest AAPL 30)
-    /backtestvbt - VectorBT backtest (e.g., /backtestvbt AAPL 30)
-    /sweep       - Parameter sweep (e.g., /sweep TSLA 60)
-    /train       - Train ML model (e.g., /train AAPL,TSLA 1000)
-    /modelinfo   - ML model metadata (type, date, features, accuracy)
-    /predict     - ML prediction (e.g., /predict BTC/USD)
-    /help        - Show all commands
+    /start        - Welcome + status overview
+    /status       - Account balance, equity, positions
+    /positions    - Detailed position list
+    /orders       - Open orders
+    /pnl          - Today's P&L summary
+    /trades       - Recent trade history
+    /signals      - Current active signals
+    /buy          - Manual buy order (e.g., /buy AAPL 10)
+    /sell         - Manual sell order (e.g., /sell AAPL 10)
+    /close        - Close position (e.g., /close AAPL)
+    /closeall     - Emergency: close all positions
+    /cancelall    - Cancel all pending orders
+    /pause        - Pause bot trading
+    /resume       - Resume bot trading
+    /strategy     - Show/switch active strategy
+    /risk         - Show risk parameters
+    /config       - View all settings (e.g., /config risk)
+    /set          - Universal setter (e.g., /set momentum_fast_ema 8)
+    /setrisk      - Set risk param (e.g., /setrisk max_daily_loss_pct 0.05)
+    /setstrategy  - Switch strategy (momentum|mean_reversion|ml)
+    /setsymbols   - Change symbols (e.g., /setsymbols AAPL,TSLA,BTC/USD)
+    /setinterval  - Change cycle interval (e.g., /setinterval 120)
+    /settf        - Change timeframe (e.g., /settf 15Min)
+    /setlookback  - Change lookback (e.g., /setlookback 500)
+    /setauto      - Configure automation (e.g., /setauto train 12)
+    /setnotify    - Toggle alerts (e.g., /setnotify signal on)
+    /backtest     - Backtrader backtest (e.g., /backtest AAPL 30)
+    /backtestvbt  - VectorBT backtest (e.g., /backtestvbt AAPL 30)
+    /sweep        - Parameter sweep (e.g., /sweep TSLA 60)
+    /train        - Train ML model (e.g., /train AAPL,TSLA 1000)
+    /modelinfo    - ML model metadata (type, date, features, accuracy)
+    /predict      - ML prediction (e.g., /predict BTC/USD)
+    /walkforward  - Walk-forward optimization (e.g., /walkforward BTC/USD 1000)
+    /montecarlo   - Monte Carlo simulation (e.g., /montecarlo AAPL 1000 500)
+    /portfolio    - Portfolio-level backtest (e.g., /portfolio 500)
+    /models       - List model versions
+    /rollback     - Rollback model (e.g., /rollback v001)
+    /journal      - Recent trade journal (e.g., /journal AAPL 10)
+    /journalstats - Journal performance analytics
+    /help         - Show all commands
 """
 
 import asyncio
@@ -196,7 +203,15 @@ async def cmd_help(message: Message):
         "/sweep [SYMBOL] [DAYS] - Parameter sweep\n"
         "/train [SYMBOLS] [BARS] - Train ML model\n"
         "/modelinfo - ML model metadata\n"
-        "/predict [SYMBOL] - ML prediction + confidence\n"
+        "/predict [SYMBOL] - ML prediction + confidence\n\n"
+        "<b>Advanced Research:</b>\n"
+        "/walkforward [SYMBOL] [BARS] - Walk-forward optimization\n"
+        "/montecarlo [SYMBOL] [BARS] [SIMS] - Monte Carlo sim\n"
+        "/portfolio [BARS] - Portfolio-level backtest\n"
+        "/models - List model versions\n"
+        "/rollback vXXX - Rollback to model version\n"
+        "/journal [SYMBOL] [N] - Trade journal entries\n"
+        "/journalstats - Journal analytics\n"
     )
     await message.answer(text, parse_mode=ParseMode.HTML)
 
@@ -1577,6 +1592,414 @@ async def cmd_predict(message: Message):
         await message.answer(text, parse_mode=ParseMode.HTML)
     except Exception as e:
         await message.answer(f"Prediction error: {e}")
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Advanced Research Commands
+# ──────────────────────────────────────────────────────────────────────────
+
+@router.message(Command("walkforward"))
+async def cmd_walkforward(message: Message):
+    """Walk-forward optimization on a symbol."""
+    if not _is_authorized(message):
+        return
+
+    args = message.text.split()[1:]
+    # Parse: /walkforward [SYMBOL] [BARS]
+    from config.settings import settings
+    symbols = settings.symbols
+    bars = 1000
+
+    if args:
+        if args[0].replace("/", "").isalpha() or "/" in args[0]:
+            symbols = [args[0].upper()]
+            if len(args) > 1:
+                try:
+                    bars = int(args[1])
+                except ValueError:
+                    pass
+        else:
+            try:
+                bars = int(args[0])
+            except ValueError:
+                pass
+
+    symbol = symbols[0]
+    await message.answer(f"Running walk-forward optimization on {symbol} ({bars} bars)...\nThis may take a minute.")
+
+    try:
+        import asyncio
+        loop = asyncio.get_event_loop()
+
+        def _run_wf():
+            from backtesting.walk_forward import walk_forward_ema_backtest
+            with _broker_lock:
+                df = _broker.get_bars(symbol, settings.timeframe, bars)
+            return walk_forward_ema_backtest(
+                df, train_window=min(500, bars // 3),
+                test_window=min(100, bars // 6),
+                step=min(100, bars // 6),
+                initial_cash=settings.backtest_initial_cash,
+            )
+
+        result = await loop.run_in_executor(None, _run_wf)
+
+        text = (
+            f"<b>Walk-Forward: {symbol}</b>\n"
+            f"{'=' * 30}\n"
+            f"Windows: {result['n_windows']}\n"
+            f"OOS Return: {result['oos_return']:.2%}\n"
+            f"OOS Sharpe: {result['oos_sharpe']:.2f}\n"
+            f"OOS Max DD: {result['oos_max_drawdown']:.2%}\n"
+            f"OOS Win Rate: {result['oos_win_rate']:.1%}\n"
+            f"Param Stability: {result['param_stability']:.1%}\n"
+            f"IS Return: {result['is_return']:.4f}\n"
+            f"\n<b>Strategy:</b> {result.get('strategy', 'ema_crossover')}\n"
+            f"<b>Param Ranges:</b>\n"
+        )
+        for k, v in result.get('param_ranges', {}).items():
+            text += f"  {k}: {v}\n"
+
+        if result['best_params_per_window']:
+            last_best = result['best_params_per_window'][-1]
+            text += f"\n<b>Last Window Best:</b> {last_best}"
+
+        await message.answer(text, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        await message.answer(f"Walk-forward error: {e}")
+
+
+@router.message(Command("montecarlo"))
+async def cmd_montecarlo(message: Message):
+    """Monte Carlo simulation on a symbol."""
+    if not _is_authorized(message):
+        return
+
+    args = message.text.split()[1:]
+    from config.settings import settings
+    symbols = settings.symbols
+    bars = 1000
+    n_sims = 1000
+
+    if args:
+        if args[0].replace("/", "").isalpha() or "/" in args[0]:
+            symbols = [args[0].upper()]
+            if len(args) > 1:
+                try:
+                    bars = int(args[1])
+                except ValueError:
+                    pass
+            if len(args) > 2:
+                try:
+                    n_sims = int(args[2])
+                except ValueError:
+                    pass
+        else:
+            try:
+                bars = int(args[0])
+            except ValueError:
+                pass
+
+    symbol = symbols[0]
+    await message.answer(f"Running Monte Carlo ({n_sims} simulations) on {symbol} ({bars} bars)...")
+
+    try:
+        import asyncio
+        loop = asyncio.get_event_loop()
+
+        def _run_mc():
+            from backtesting.monte_carlo import monte_carlo_from_backtest
+            with _broker_lock:
+                df = _broker.get_bars(symbol, settings.timeframe, bars)
+            return monte_carlo_from_backtest(
+                df, initial_cash=settings.backtest_initial_cash,
+                n_simulations=n_sims,
+            )
+
+        result = await loop.run_in_executor(None, _run_mc)
+
+        prob_profit = result['probability_of_profit'] * 100
+        prob_ruin = result['probability_of_ruin'] * 100
+
+        text = (
+            f"<b>Monte Carlo: {symbol}</b>\n"
+            f"{'=' * 30}\n"
+            f"Simulations: {result['n_simulations']}\n"
+            f"Trades Used: {result['n_trades']}\n\n"
+            f"<b>Return Distribution:</b>\n"
+            f"  P5 (worst):  {result['p5_return']:.2%}\n"
+            f"  P25:         {result['p25_return']:.2%}\n"
+            f"  Median:      {result['median_return']:.2%}\n"
+            f"  P75:         {result['p75_return']:.2%}\n"
+            f"  P95 (best):  {result['p95_return']:.2%}\n\n"
+            f"<b>Risk Metrics:</b>\n"
+            f"  Expected Return: {result['expected_return']:.2%}\n"
+            f"  Std Dev: {result['return_std']:.2%}\n"
+            f"  Median Max DD: {result['median_max_drawdown']:.2%}\n"
+            f"  P(Profit): {prob_profit:.1f}%\n"
+            f"  P(Ruin <50%): {prob_ruin:.1f}%\n"
+        )
+        await message.answer(text, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        await message.answer(f"Monte Carlo error: {e}")
+
+
+@router.message(Command("portfolio"))
+async def cmd_portfolio_backtest(message: Message):
+    """Portfolio-level backtest across all symbols."""
+    if not _is_authorized(message):
+        return
+
+    args = message.text.split()[1:]
+    from config.settings import settings
+    bars = 500
+
+    if args:
+        try:
+            bars = int(args[0])
+        except ValueError:
+            pass
+
+    symbols = settings.symbols
+    await message.answer(f"Running portfolio backtest on {len(symbols)} symbols ({bars} bars)...\nSymbols: {', '.join(symbols)}")
+
+    try:
+        import asyncio
+        loop = asyncio.get_event_loop()
+
+        def _run_portfolio():
+            from backtesting.portfolio_backtest import portfolio_backtest
+            data = {}
+            with _broker_lock:
+                for sym in symbols:
+                    try:
+                        df = _broker.get_bars(sym, settings.timeframe, bars)
+                        if df is not None and len(df) > 50:
+                            data[sym] = df
+                    except Exception:
+                        continue
+            if not data:
+                return None
+            return portfolio_backtest(
+                data, initial_cash=settings.backtest_initial_cash,
+                fees=0.001,
+            )
+
+        result = await loop.run_in_executor(None, _run_portfolio)
+
+        if result is None:
+            await message.answer("No data available for portfolio backtest.")
+            return
+
+        text = (
+            f"<b>Portfolio Backtest</b>\n"
+            f"{'=' * 30}\n"
+            f"Symbols: {result.get('n_symbols', 0)}\n"
+            f"Total Trades: {result.get('total_trades', 0)}\n"
+            f"Final Equity: ${result.get('final_equity', 0):,.2f}\n"
+            f"Return: {result.get('total_return', 0):.2%}\n"
+            f"Sharpe: {result.get('sharpe_ratio', 0):.2f}\n"
+            f"Max DD: {result.get('max_drawdown', 0):.2%}\n"
+            f"Win Rate: {result.get('win_rate', 0):.1%}\n"
+        )
+
+        # Per-symbol breakdown
+        per_symbol = result.get('per_symbol', {})
+        if per_symbol:
+            text += f"\n<b>Per Symbol:</b>\n"
+            for sym, stats in per_symbol.items():
+                pnl = stats.get('pnl', 0)
+                trades = stats.get('trades', 0)
+                emoji = "+" if pnl >= 0 else ""
+                text += f"  {sym}: {emoji}${pnl:.2f} ({trades} trades)\n"
+
+        await message.answer(text, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        await message.answer(f"Portfolio backtest error: {e}")
+
+
+@router.message(Command("models"))
+async def cmd_models(message: Message):
+    """List all model versions."""
+    if not _is_authorized(message):
+        return
+
+    try:
+        from src.ml.model_registry import ModelRegistry
+        registry = ModelRegistry()
+        versions = registry.list_versions()
+
+        if not versions:
+            await message.answer("No model versions found. Train a model first with /train")
+            return
+
+        text = "<b>Model Registry</b>\n" + "=" * 30 + "\n\n"
+        for v in versions[:10]:  # Show last 10
+            active = " [ACTIVE]" if v.get("is_active") else ""
+            metrics = v.get("metrics", {})
+            acc = metrics.get("accuracy", 0)
+            text += (
+                f"<b>{v['version']}</b>{active}\n"
+                f"  Trained: {v.get('trained_at', '?')[:16]}\n"
+                f"  Accuracy: {acc:.2%}\n"
+                f"  Symbols: {', '.join(v.get('symbols', []))}\n"
+                f"  Features: {v.get('n_features', '?')}\n"
+                f"  Samples: {v.get('n_samples', '?')}\n"
+            )
+            if v.get("note"):
+                text += f"  Note: {v['note']}\n"
+            text += "\n"
+
+        text += f"<i>Total versions: {len(versions)}</i>"
+        await message.answer(text, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        await message.answer(f"Registry error: {e}")
+
+
+@router.message(Command("rollback"))
+async def cmd_rollback(message: Message):
+    """Rollback to a previous model version."""
+    if not _is_authorized(message):
+        return
+
+    args = message.text.split()[1:]
+    if not args:
+        await message.answer("Usage: /rollback v001\nUse /models to see available versions.")
+        return
+
+    version = args[0].lower()
+    if not version.startswith("v"):
+        version = f"v{version}"
+
+    try:
+        from src.ml.model_registry import ModelRegistry
+        registry = ModelRegistry()
+        success = registry.rollback(version)
+
+        if success:
+            # Trigger strategy reload
+            with _runtime_lock:
+                _runtime_changes["config_updates"]["reload_model"] = True
+            await message.answer(
+                f"Rolled back to <b>{version}</b>\n"
+                f"Model will be loaded on next trading cycle.",
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            await message.answer(f"Rollback failed. Version '{version}' not found.\nUse /models to list versions.")
+    except Exception as e:
+        await message.answer(f"Rollback error: {e}")
+
+
+@router.message(Command("journal"))
+async def cmd_journal(message: Message):
+    """Show recent trade journal entries."""
+    if not _is_authorized(message):
+        return
+
+    args = message.text.split()[1:]
+    limit = 10
+    symbol = None
+
+    if args:
+        if args[0].isdigit():
+            limit = int(args[0])
+        else:
+            symbol = args[0].upper()
+            if len(args) > 1 and args[1].isdigit():
+                limit = int(args[1])
+
+    try:
+        from src.data.journal import TradeJournal
+        from src.data.store import DatabaseManager
+        db = _db or DatabaseManager()
+        journal = TradeJournal(db)
+        entries = journal.get_journal(symbol=symbol, limit=limit)
+
+        if not entries:
+            await message.answer("No journal entries found." + (f" (filter: {symbol})" if symbol else ""))
+            return
+
+        text = f"<b>Trade Journal</b>"
+        if symbol:
+            text += f" — {symbol}"
+        text += f"\n{'=' * 30}\n\n"
+
+        for e in entries:
+            pnl = e.get("pnl")
+            pnl_str = f"${pnl:.2f}" if pnl is not None else "open"
+            emoji = "+" if pnl and pnl > 0 else ("" if pnl and pnl < 0 else "")
+            conf = e.get("confidence")
+            conf_str = f"{conf:.0%}" if conf else "?"
+
+            text += (
+                f"<b>{e.get('side', '?').upper()} {e.get('symbol', '?')}</b> "
+                f"| PnL: {emoji}{pnl_str} | Conf: {conf_str}\n"
+                f"  Strategy: {e.get('strategy_name', '?')} "
+                f"| Model: {e.get('model_version', '?')}\n"
+                f"  Entry: ${e.get('entry_price', 0):.2f}"
+            )
+            if e.get("exit_price"):
+                text += f" → ${e['exit_price']:.2f}"
+            if e.get("exit_reason"):
+                text += f" ({e['exit_reason']})"
+            text += f"\n  Time: {str(e.get('entry_time', ''))[:16]}\n\n"
+
+        await message.answer(text, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        await message.answer(f"Journal error: {e}")
+
+
+@router.message(Command("journalstats"))
+async def cmd_journalstats(message: Message):
+    """Trade journal performance analytics."""
+    if not _is_authorized(message):
+        return
+
+    try:
+        from src.data.journal import TradeJournal
+        from src.data.store import DatabaseManager
+        db = _db or DatabaseManager()
+        journal = TradeJournal(db)
+
+        # Summary stats
+        summary = journal.get_summary(days=30)
+
+        text = (
+            f"<b>Journal Analytics (30 days)</b>\n"
+            f"{'=' * 30}\n\n"
+            f"Total Trades: {summary.get('total_trades', 0)}\n"
+            f"Win Rate: {summary.get('win_rate', 0):.1%}\n"
+            f"Avg PnL: ${summary.get('avg_pnl', 0):.2f}\n"
+            f"Total PnL: ${summary.get('total_pnl', 0):.2f}\n"
+            f"Best Trade: ${summary.get('best_trade', 0):.2f}\n"
+            f"Worst Trade: ${summary.get('worst_trade', 0):.2f}\n"
+            f"Avg Holding: {summary.get('avg_holding_bars', 0):.0f} bars\n"
+        )
+
+        # Confidence analysis
+        conf_stats = journal.get_performance_by_confidence()
+        if conf_stats:
+            text += f"\n<b>By Confidence:</b>\n"
+            for bucket, stats in conf_stats.items():
+                text += (
+                    f"  {bucket}: WR {stats['win_rate']:.0%} "
+                    f"({stats['trades']} trades, avg ${stats['avg_pnl']:.2f})\n"
+                )
+
+        # Model version analysis
+        model_stats = journal.get_performance_by_model_version()
+        if model_stats:
+            text += f"\n<b>By Model Version:</b>\n"
+            for ver, stats in model_stats.items():
+                text += (
+                    f"  {ver}: WR {stats['win_rate']:.0%} "
+                    f"({stats['trades']} trades, PnL ${stats['total_pnl']:.2f})\n"
+                )
+
+        await message.answer(text, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        await message.answer(f"Journal stats error: {e}")
 
 
 # ──────────────────────────────────────────────────────────────────────────

@@ -72,6 +72,44 @@ class PortfolioSnapshot(Base):
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
 
 
+class JournalEntry(Base):
+    """Trade journal entry for analysis and model retraining."""
+    __tablename__ = 'trade_journal'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    trade_id = Column(Integer, index=True)  # links to Trade.id
+    symbol = Column(String(20), nullable=False, index=True)
+    side = Column(String(10), nullable=False)
+
+    # Entry context
+    entry_price = Column(Float)
+    entry_time = Column(DateTime)
+    qty = Column(Float)
+
+    # ML/Strategy context at time of entry
+    strategy_name = Column(String(50))
+    model_version = Column(String(20))
+    prediction = Column(String(20))  # BUY/SELL/HOLD
+    confidence = Column(Float)
+    features_snapshot = Column(Text)  # JSON: all feature values at entry time
+
+    # Exit context
+    exit_price = Column(Float)
+    exit_time = Column(DateTime)
+    exit_reason = Column(String(50))  # signal, stop_loss, take_profit, manual, timeout
+
+    # Outcome
+    pnl = Column(Float)
+    pnl_pct = Column(Float)
+    holding_bars = Column(Integer)
+
+    # Market context
+    market_regime = Column(String(20))  # trending, ranging, volatile
+    volatility_at_entry = Column(Float)  # ATR% at entry
+
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+
 class MarketData(Base):
     """Cached market data for backtesting and feature calculation."""
     __tablename__ = 'market_data'
@@ -184,6 +222,12 @@ class DatabaseManager:
                 }
                 for s in snapshots
             ]
+
+    # --- Journal ---
+
+    def get_journal_session(self):
+        """Get session for journal operations."""
+        return self.get_session()
 
     # --- Performance Metrics ---
 

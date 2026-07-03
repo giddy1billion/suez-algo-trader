@@ -15,6 +15,21 @@ from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+# Lazy-initialized trade journal
+_journal = None
+
+
+def _get_journal(db: DatabaseManager):
+    """Lazy-load the trade journal to avoid circular imports."""
+    global _journal
+    if _journal is None:
+        try:
+            from src.data.journal import TradeJournal
+            _journal = TradeJournal(db)
+        except Exception as e:
+            logger.debug("journal.init_skipped", error=str(e))
+    return _journal
+
 
 class ExecutionEngine:
     """
@@ -204,6 +219,25 @@ class ExecutionEngine:
                 "take_profit": signal.take_profit,
             })
 
+            # Journal trade entry for analysis
+            journal = _get_journal(self.db)
+            if journal:
+                try:
+                    journal.log_entry({
+                        "trade_id": order.get("id"),
+                        "symbol": signal.symbol,
+                        "side": side,
+                        "entry_price": signal.price,
+                        "qty": final_qty,
+                        "strategy_name": getattr(self, '_current_strategy_name', 'unknown'),
+                        "model_version": getattr(signal, 'model_version', None),
+                        "prediction": side,
+                        "confidence": signal.confidence,
+                        "features_snapshot": signal.indicators,
+                    })
+                except Exception as e:
+                    logger.debug("journal.log_entry_error", error=str(e))
+
             logger.info("engine.order_placed",
                        symbol=signal.symbol, side=side, qty=final_qty,
                        confidence=f"{signal.confidence:.1%}")
@@ -226,8 +260,27 @@ class ExecutionEngine:
                 if not self.dry_run:
                     try:
                         self.broker.close_position(symbol)
-                        self.risk.record_trade({"symbol": symbol, "pnl": pos.get('unrealized_pl', 0)})
-                        results.append({"action": "exit", "symbol": symbol, "pnl": pos.get('unrealized_pl', 0)})
+                        pnl = pos.get('unrealized_pl', 0)
+                        self.risk.record_trade({"symbol": symbol, "pnl": pnl})
+                        results.append({"action": "exit", "symbol": symbol, "pnl": pnl})
+
+                        # Journal the exit
+                        journal = _get_journal(self.db)
+                        if journal:
+                            try:
+                                # Find journal entry for this position
+                                entries = journal.get_journal(symbol=symbol, limit=1)
+                                if entries and entries[0].get("exit_price") is None:
+                                    entry_price = entries[0].get("entry_price", 0)
+                                    pnl_pct = (current_price - entry_price) / entry_price if entry_price else 0
+                                    journal.log_exit(entries[0]["id"], {
+                                        "exit_price": current_price,
+                                        "exit_reason": exit_signal.reason[:50] if exit_signal.reason else "strategy_exit",
+                                        "pnl": pnl,
+                                        "pnl_pct": pnl_pct,
+                                    })
+                            except Exception as e:
+                                logger.debug("journal.log_exit_error", error=str(e))
                     except Exception as e:
                         logger.error("engine.exit_failed", symbol=symbol, error=str(e))
                 else:
