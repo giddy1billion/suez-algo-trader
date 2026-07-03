@@ -43,6 +43,17 @@ def _numpy_ema_crossover_backtest(
     close = df['close'].values.astype(float)
     n = len(close)
 
+    if n < slow_ema + 2:
+        return {
+            "total_return": 0.0, "sharpe_ratio": 0.0, "max_drawdown": 0.0,
+            "win_rate": 0.0, "total_trades": 0, "profit_factor": 0.0,
+            "final_value": initial_cash, "trades": [], "equity_curve": [initial_cash],
+        }
+
+    # Validate data - drop NaN from close
+    if np.any(np.isnan(close)):
+        close = pd.Series(close).ffill().bfill().values
+
     # Calculate EMAs
     fast = pd.Series(close).ewm(span=fast_ema, adjust=False).mean().values
     slow = pd.Series(close).ewm(span=slow_ema, adjust=False).mean().values

@@ -108,7 +108,6 @@ def get_runtime_changes() -> dict:
         _runtime_changes["lookback"] = None
         _runtime_changes["config_updates"] = {}
         return changes
-        return changes
 
 
 def set_components(broker, engine, risk_manager, strategy, db=None, authorized_chat_ids: list[int] = None):
@@ -223,8 +222,9 @@ async def cmd_status(message: Message):
         return
 
     try:
-        account = _broker.get_account()
-        positions = _broker.get_positions()
+        with _broker_lock:
+            account = _broker.get_account()
+            positions = _broker.get_positions()
 
         pnl = account['equity'] - account['last_equity']
         pnl_pct = (pnl / account['last_equity'] * 100) if account['last_equity'] > 0 else 0
@@ -251,7 +251,8 @@ async def cmd_positions(message: Message):
         return
 
     try:
-        positions = _broker.get_positions()
+        with _broker_lock:
+            positions = _broker.get_positions()
         if not positions:
             await message.answer("No open positions.")
             return
@@ -279,7 +280,8 @@ async def cmd_orders(message: Message):
         return
 
     try:
-        orders = _broker.get_orders(status="open")
+        with _broker_lock:
+            orders = _broker.get_orders(status="open")
         if not orders:
             await message.answer("No pending orders.")
             return
@@ -349,13 +351,14 @@ async def cmd_signals(message: Message):
 
     try:
         data = {}
-        for symbol in _strategy.symbols[:5]:
-            try:
-                df = _broker.get_bars_df(symbol, _strategy.timeframe, 200)
-                if df is not None and len(df) >= 50:
-                    data[symbol] = df
-            except Exception:
-                continue
+        with _broker_lock:
+            for symbol in _strategy.symbols[:5]:
+                try:
+                    df = _broker.get_bars_df(symbol, _strategy.timeframe, 200)
+                    if df is not None and len(df) >= 50:
+                        data[symbol] = df
+                except Exception:
+                    continue
 
         if not data:
             await message.answer("No data available for signal generation.")
@@ -488,7 +491,8 @@ async def cmd_cancelall(message: Message):
         return
 
     try:
-        _broker.cancel_all_orders()
+        with _broker_lock:
+            _broker.cancel_all_orders()
         await message.answer("All pending orders cancelled.")
     except Exception as e:
         await message.answer(f"Error: {e}")
@@ -1170,7 +1174,7 @@ async def cmd_backtest(message: Message):
 
     parts = message.text.split()
     symbol = parts[1].upper() if len(parts) > 1 else (_strategy.symbols[0] if _strategy else "AAPL")
-    days = int(parts[2]) if len(parts) > 2 else 30
+    days = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 30
 
     await message.answer(f"Running backtest for {symbol} ({days} days)...")
 
@@ -1546,7 +1550,7 @@ async def cmd_predict(message: Message):
             strength = "WEAK"
 
         # ATR for SL/TP
-        atr = float(latest['atr'].iloc[0]) if 'atr' in df_feat.columns and not np.isnan(latest['atr'].iloc[0]) else price * 0.02
+        atr = float(latest['atr_14'].iloc[0]) if 'atr_14' in df_feat.columns and not np.isnan(latest['atr_14'].iloc[0]) else price * 0.02
 
         text = (
             f"<b>🔮 ML Prediction: {symbol}</b>\n"
@@ -1603,6 +1607,9 @@ async def cmd_walkforward(message: Message):
     """Walk-forward optimization on a symbol."""
     if not _is_authorized(message):
         return
+    if not _broker:
+        await message.answer("Broker not connected.")
+        return
 
     args = message.text.split()[1:]
     # Parse: /walkforward [SYMBOL] [BARS]
@@ -1634,7 +1641,7 @@ async def cmd_walkforward(message: Message):
         def _run_wf():
             from backtesting.walk_forward import walk_forward_ema_backtest
             with _broker_lock:
-                df = _broker.get_bars(symbol, settings.timeframe, bars)
+                df = _broker.get_bars_df(symbol, settings.timeframe, bars)
             return walk_forward_ema_backtest(
                 df, train_window=min(500, bars // 3),
                 test_window=min(100, bars // 6),
@@ -1674,6 +1681,9 @@ async def cmd_montecarlo(message: Message):
     """Monte Carlo simulation on a symbol."""
     if not _is_authorized(message):
         return
+    if not _broker:
+        await message.answer("Broker not connected.")
+        return
 
     args = message.text.split()[1:]
     from config.settings import settings
@@ -1710,7 +1720,7 @@ async def cmd_montecarlo(message: Message):
         def _run_mc():
             from backtesting.monte_carlo import monte_carlo_from_backtest
             with _broker_lock:
-                df = _broker.get_bars(symbol, settings.timeframe, bars)
+                df = _broker.get_bars_df(symbol, settings.timeframe, bars)
             return monte_carlo_from_backtest(
                 df, initial_cash=settings.backtest_initial_cash,
                 n_simulations=n_sims,
@@ -1749,6 +1759,9 @@ async def cmd_portfolio_backtest(message: Message):
     """Portfolio-level backtest across all symbols."""
     if not _is_authorized(message):
         return
+    if not _broker:
+        await message.answer("Broker not connected.")
+        return
 
     args = message.text.split()[1:]
     from config.settings import settings
@@ -1773,7 +1786,7 @@ async def cmd_portfolio_backtest(message: Message):
             with _broker_lock:
                 for sym in symbols:
                     try:
-                        df = _broker.get_bars(sym, settings.timeframe, bars)
+                        df = _broker.get_bars_df(sym, settings.timeframe, bars)
                         if df is not None and len(df) > 50:
                             data[sym] = df
                     except Exception:
@@ -2008,6 +2021,9 @@ async def cmd_journalstats(message: Message):
 
 @router.callback_query(F.data.startswith("buy|"))
 async def callback_confirm_buy(callback: CallbackQuery):
+    if callback.from_user.id not in _authorized_users:
+        await callback.answer("Unauthorized", show_alert=True)
+        return
     parts = callback.data.split("|")
     symbol = parts[1]
     qty = float(parts[2])
@@ -2025,6 +2041,9 @@ async def callback_confirm_buy(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("sell|"))
 async def callback_confirm_sell(callback: CallbackQuery):
+    if callback.from_user.id not in _authorized_users:
+        await callback.answer("Unauthorized", show_alert=True)
+        return
     parts = callback.data.split("|")
     symbol = parts[1]
     qty = float(parts[2])
@@ -2042,6 +2061,9 @@ async def callback_confirm_sell(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("close|"))
 async def callback_confirm_close(callback: CallbackQuery):
+    if callback.from_user.id not in _authorized_users:
+        await callback.answer("Unauthorized", show_alert=True)
+        return
     symbol = callback.data.split("|")[1]
     try:
         with _broker_lock:
@@ -2054,6 +2076,9 @@ async def callback_confirm_close(callback: CallbackQuery):
 
 @router.callback_query(F.data == "closeall")
 async def callback_confirm_closeall(callback: CallbackQuery):
+    if callback.from_user.id not in _authorized_users:
+        await callback.answer("Unauthorized", show_alert=True)
+        return
     try:
         with _broker_lock:
             _broker.cancel_all_orders()

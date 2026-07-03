@@ -171,7 +171,6 @@ class MLStrategy(BaseStrategy):
             objective='multi:softprob',
             num_class=3,
             eval_metric='mlogloss',
-            use_label_encoder=False,
             random_state=42,
         )
 
@@ -223,7 +222,12 @@ class MLStrategy(BaseStrategy):
             df = self.calculate_indicators(df)
             latest = df.iloc[-1:]
 
-            # Check for NaN features
+            # Validate feature columns exist and check for NaN
+            available_cols = [c for c in feature_cols if c in latest.columns]
+            if len(available_cols) < len(feature_cols):
+                missing = set(feature_cols) - set(available_cols)
+                logger.warning("ml.predict_missing_features", symbol=symbol, missing=list(missing)[:5])
+                continue
             features = latest[feature_cols]
             if features.isna().any(axis=1).iloc[0]:
                 continue
@@ -235,7 +239,7 @@ class MLStrategy(BaseStrategy):
             confidence = proba[pred_class]
 
             price = float(latest['close'].iloc[0])
-            atr = float(latest['atr'].iloc[0]) if not pd.isna(latest['atr'].iloc[0]) else price * 0.02
+            atr = float(latest['atr_14'].iloc[0]) if 'atr_14' in latest.columns and not pd.isna(latest['atr_14'].iloc[0]) else price * 0.02
 
             if pred_class == 2 and confidence >= self.min_confidence:  # UP
                 signal = Signal.STRONG_BUY if confidence >= 0.8 else Signal.BUY

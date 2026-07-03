@@ -388,9 +388,9 @@ def cmd_run(
         from apscheduler.schedulers.background import BackgroundScheduler
         from apscheduler.triggers.cron import CronTrigger
         from apscheduler.triggers.interval import IntervalTrigger
-        from concurrent.futures import ThreadPoolExecutor
+        from apscheduler.executors.pool import ThreadPoolExecutor as APThreadPoolExecutor
 
-        _auto_executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="auto")
+        _auto_executor = APThreadPoolExecutor(max_workers=3)
 
         def _send_telegram(text: str):
             """Helper: send message via Telegram bot (thread-safe)."""
@@ -681,11 +681,13 @@ def cmd_run(
                 next_open = broker.next_market_open()
                 logger.info("market.closed", next_open=str(next_open))
                 if crypto_strategy:
-                    results = engine.run_cycle(crypto_strategy)
+                    with _broker_lock:
+                        results = engine.run_cycle(crypto_strategy)
                 else:
                     results = []
             else:
-                results = engine.run_cycle(strategy)
+                with _broker_lock:
+                    results = engine.run_cycle(strategy)
 
             consecutive_errors = 0
 

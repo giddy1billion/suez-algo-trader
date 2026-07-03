@@ -14,10 +14,12 @@ logger = get_logger(__name__)
 
 
 def _compute_equity_curve(pnls: np.ndarray, initial_cash: float) -> np.ndarray:
-    """Compute equity curve from a sequence of PnL values."""
+    """Compute equity curve from a sequence of PnL values. Floors at 0."""
     equity = np.empty(len(pnls) + 1)
     equity[0] = initial_cash
     equity[1:] = initial_cash + np.cumsum(pnls)
+    # Floor at 0 — cannot go negative (account wiped out)
+    np.maximum(equity, 0.0, out=equity)
     return equity
 
 

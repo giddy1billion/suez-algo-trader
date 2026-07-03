@@ -3,6 +3,7 @@ Execution Engine — Orchestrates strategy signals → risk check → order plac
 The central coordinator between strategies, risk manager, and broker.
 """
 
+import threading
 import time
 from datetime import datetime
 from typing import Optional
@@ -15,19 +16,22 @@ from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# Lazy-initialized trade journal
+# Lazy-initialized trade journal (double-checked locking)
 _journal = None
+_journal_lock = threading.Lock()
 
 
 def _get_journal(db: DatabaseManager):
-    """Lazy-load the trade journal to avoid circular imports."""
+    """Lazy-load the trade journal to avoid circular imports. Thread-safe."""
     global _journal
     if _journal is None:
-        try:
-            from src.data.journal import TradeJournal
-            _journal = TradeJournal(db)
-        except Exception as e:
-            logger.debug("journal.init_skipped", error=str(e))
+        with _journal_lock:
+            if _journal is None:
+                try:
+                    from src.data.journal import TradeJournal
+                    _journal = TradeJournal(db)
+                except Exception as e:
+                    logger.debug("journal.init_skipped", error=str(e))
     return _journal
 
 
@@ -268,12 +272,14 @@ class ExecutionEngine:
                         journal = _get_journal(self.db)
                         if journal:
                             try:
-                                # Find journal entry for this position
-                                entries = journal.get_journal(symbol=symbol, limit=1)
-                                if entries and entries[0].get("exit_price") is None:
-                                    entry_price = entries[0].get("entry_price", 0)
+                                # Find the oldest OPEN journal entry for this symbol
+                                entries = journal.get_journal(symbol=symbol, limit=20)
+                                open_entries = [e for e in entries if e.get("exit_price") is None]
+                                if open_entries:
+                                    target = open_entries[-1]  # oldest open entry (list is newest-first)
+                                    entry_price = target.get("entry_price", 0)
                                     pnl_pct = (current_price - entry_price) / entry_price if entry_price else 0
-                                    journal.log_exit(entries[0]["id"], {
+                                    journal.log_exit(target["id"], {
                                         "exit_price": current_price,
                                         "exit_reason": exit_signal.reason[:50] if exit_signal.reason else "strategy_exit",
                                         "pnl": pnl,

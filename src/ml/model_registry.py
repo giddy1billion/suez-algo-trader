@@ -61,50 +61,51 @@ class ModelRegistry:
         Returns:
             Version string, e.g. "v003".
         """
-        registry = self._load_registry()
-        version_num = len(registry) + 1
-        version_str = f"v{version_num:03d}"
-        timestamp = datetime.now()
-        timestamp_str = timestamp.strftime("%Y%m%d_%H%M%S")
-        filename = f"{version_str}_{timestamp_str}.joblib"
-        filepath = os.path.join(self.models_dir, filename)
+        with _registry_lock:
+            registry = self._load_registry()
+            version_num = len(registry) + 1
+            version_str = f"v{version_num:03d}"
+            timestamp = datetime.now()
+            timestamp_str = timestamp.strftime("%Y%m%d_%H%M%S")
+            filename = f"{version_str}_{timestamp_str}.joblib"
+            filepath = os.path.join(self.models_dir, filename)
 
-        # Save model artifact
-        artifact = {
-            "model": model,
-            "features": features,
-            "trained_at": timestamp,
-        }
-        joblib.dump(artifact, filepath)
+            # Save model artifact
+            artifact = {
+                "model": model,
+                "features": features,
+                "trained_at": timestamp,
+            }
+            joblib.dump(artifact, filepath)
 
-        # Update latest_model.joblib (copy for cross-platform compatibility)
-        shutil.copy2(filepath, self.latest_path)
+            # Update latest_model.joblib (copy for cross-platform compatibility)
+            shutil.copy2(filepath, self.latest_path)
 
-        # Mark all previous versions as inactive
-        for entry in registry:
-            entry["is_active"] = False
+            # Mark all previous versions as inactive
+            for entry in registry:
+                entry["is_active"] = False
 
-        # Build metadata entry
-        entry = {
-            "version": version_str,
-            "filename": filename,
-            "trained_at": timestamp.isoformat(),
-            "metrics": metrics,
-            "symbols": symbols,
-            "n_features": len(features),
-            "n_samples": metrics.get("n_samples", 0),
-            "note": note,
-            "is_active": True,
-        }
-        registry.append(entry)
+            # Build metadata entry
+            entry = {
+                "version": version_str,
+                "filename": filename,
+                "trained_at": timestamp.isoformat(),
+                "metrics": metrics,
+                "symbols": symbols,
+                "n_features": len(features),
+                "n_samples": metrics.get("n_samples", 0),
+                "note": note,
+                "is_active": True,
+            }
+            registry.append(entry)
 
-        self._save_registry(registry)
-        logger.info(
-            "ml.registry.version_saved",
-            version=version_str,
-            metrics=metrics,
-        )
-        return version_str
+            self._save_registry(registry)
+            logger.info(
+                "ml.registry.version_saved",
+                version=version_str,
+                metrics=metrics,
+            )
+            return version_str
 
     def list_versions(self) -> list[dict]:
         """
@@ -159,34 +160,35 @@ class ModelRegistry:
         Returns:
             True on success, False on failure.
         """
-        try:
-            registry = self._load_registry()
-            entry = self._find_entry(registry, version_str)
+        with _registry_lock:
+            try:
+                registry = self._load_registry()
+                entry = self._find_entry(registry, version_str)
 
-            filepath = os.path.join(self.models_dir, entry["filename"])
-            if not os.path.exists(filepath):
+                filepath = os.path.join(self.models_dir, entry["filename"])
+                if not os.path.exists(filepath):
+                    logger.error(
+                        "ml.registry.rollback_failed",
+                        version=version_str,
+                        reason="file_missing",
+                    )
+                    return False
+
+                shutil.copy2(filepath, self.latest_path)
+
+                for e in registry:
+                    e["is_active"] = (e["version"] == version_str)
+
+                self._save_registry(registry)
+                logger.info("ml.registry.rollback", version=version_str)
+                return True
+            except (KeyError, FileNotFoundError) as exc:
                 logger.error(
                     "ml.registry.rollback_failed",
                     version=version_str,
-                    reason="file_missing",
+                    error=str(exc),
                 )
                 return False
-
-            shutil.copy2(filepath, self.latest_path)
-
-            for e in registry:
-                e["is_active"] = (e["version"] == version_str)
-
-            self._save_registry(registry)
-            logger.info("ml.registry.rollback", version=version_str)
-            return True
-        except (KeyError, FileNotFoundError) as exc:
-            logger.error(
-                "ml.registry.rollback_failed",
-                version=version_str,
-                error=str(exc),
-            )
-            return False
 
     def compare_versions(self, v1: str, v2: str) -> dict:
         """
