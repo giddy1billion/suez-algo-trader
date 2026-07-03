@@ -1,7 +1,9 @@
 """
-Notification system — Telegram, Discord, and console alerts for trades and errors.
+Notification system — Telegram (aiogram), Discord, and console alerts for trades and errors.
+Supports both simple webhook mode and full interactive Telegram bot mode.
 """
 
+import asyncio
 import json
 from datetime import datetime
 from typing import Optional
