@@ -314,7 +314,50 @@ def cmd_run(
         default_take_profit_pct=settings.default_take_profit_pct,
     ))
     db = DatabaseManager(settings.database_url)
-    engine = ExecutionEngine(broker=broker, risk_manager=risk, db=db, dry_run=dry_run)
+
+    # Initialize event-driven infrastructure
+    from src.core.events import EventBus
+    from src.core.state_machine import TradeManager
+    from src.core.subscribers import setup_default_subscribers
+
+    event_bus = EventBus()
+    trade_manager = TradeManager()
+
+    # Execution simulator (opt-in via settings or default to realistic)
+    execution_simulator = None
+    if getattr(settings, 'enable_execution_simulator', True):
+        from src.execution.simulator import ExecutionSimulator
+        sim_preset = getattr(settings, 'execution_simulator_preset', 'realistic')
+        if sim_preset == 'conservative':
+            execution_simulator = ExecutionSimulator.conservative()
+        elif sim_preset == 'ideal':
+            execution_simulator = ExecutionSimulator.ideal()
+        else:
+            execution_simulator = ExecutionSimulator.realistic()
+        logger.info("execution_simulator.enabled", preset=sim_preset)
+
+    engine = ExecutionEngine(
+        broker=broker,
+        risk_manager=risk,
+        db=db,
+        dry_run=dry_run,
+        event_bus=event_bus,
+        trade_manager=trade_manager,
+        execution_simulator=execution_simulator,
+    )
+
+    # Register default event subscribers (audit log, journal, metrics, notifications)
+    def _notification_sender(message: str):
+        """Send notification via Telegram/Discord if available."""
+        try:
+            notifier._send_telegram(message)
+        except Exception:
+            pass
+
+    subscribers = setup_default_subscribers(
+        bus=event_bus,
+        notification_send_func=_notification_sender if notifier.telegram_token else None,
+    )
 
     # Initialize monitoring components
     health_monitor = HealthMonitor()
@@ -339,7 +382,9 @@ def cmd_run(
         set_components(broker, engine, risk, strategy, db=db,
                       authorized_chat_ids=chat_ids,
                       health_monitor=health_monitor,
-                      live_metrics=live_metrics)
+                      live_metrics=live_metrics,
+                      event_bus=event_bus,
+                      trade_manager=trade_manager)
         telegram_bot = TelegramBotManager(
             token=settings.telegram_bot_token,
             authorized_chat_ids=chat_ids,
@@ -607,7 +652,9 @@ def cmd_run(
                                   authorized_chat_ids=chat_ids,
                                   health_monitor=health_monitor,
                                   live_metrics=live_metrics,
-                                  scheduler=_scheduler)
+                                  scheduler=_scheduler,
+                                  event_bus=event_bus,
+                                  trade_manager=trade_manager)
     except ImportError:
         logger.debug("scheduler.apscheduler_not_available")
 

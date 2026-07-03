@@ -73,6 +73,8 @@ _authorized_users: set[int] = set()
 _health_monitor = None
 _live_metrics = None
 _scheduler = None
+_event_bus = None
+_trade_manager = None
 
 # Thread-safe lock for broker operations (broker is called from Telegram's async thread)
 import threading
@@ -114,10 +116,11 @@ def get_runtime_changes() -> dict:
 
 
 def set_components(broker, engine, risk_manager, strategy, db=None, authorized_chat_ids: list[int] = None,
-                   health_monitor=None, live_metrics=None, scheduler=None):
+                   health_monitor=None, live_metrics=None, scheduler=None,
+                   event_bus=None, trade_manager=None):
     """Inject trading components into the bot module."""
     global _broker, _engine, _risk_manager, _strategy, _db, _authorized_users
-    global _health_monitor, _live_metrics, _scheduler
+    global _health_monitor, _live_metrics, _scheduler, _event_bus, _trade_manager
     _broker = broker
     _engine = engine
     _risk_manager = risk_manager
@@ -131,6 +134,10 @@ def set_components(broker, engine, risk_manager, strategy, db=None, authorized_c
         _live_metrics = live_metrics
     if scheduler:
         _scheduler = scheduler
+    if event_bus:
+        _event_bus = event_bus
+    if trade_manager:
+        _trade_manager = trade_manager
 
 
 def _is_authorized(message: Message) -> bool:
@@ -2184,6 +2191,70 @@ async def cmd_uptime(message: Message):
         await message.answer(text, parse_mode=ParseMode.HTML)
     except Exception as e:
         await message.answer(f"Uptime error: {e}")
+
+
+@router.message(Command("events"))
+async def cmd_events(message: Message):
+    """Show recent event bus activity."""
+    if not _is_authorized(message):
+        return
+
+    if not _event_bus:
+        await message.answer("Event bus not configured.")
+        return
+
+    try:
+        history = _event_bus.get_history(limit=15)
+        if not history:
+            await message.answer("No events recorded yet.")
+            return
+
+        lines = ["<b>📡 Recent Events</b>", f"{'═' * 25}"]
+        for ev in reversed(history[-15:]):
+            ts = ev.timestamp.strftime("%H:%M:%S") if hasattr(ev, 'timestamp') else "?"
+            etype = type(ev).__name__
+            symbol = getattr(ev, 'symbol', '')
+            extra = f" {symbol}" if symbol else ""
+            lines.append(f"<code>{ts}</code> {etype}{extra}")
+
+        lines.append(f"\nTotal events: {len(_event_bus.get_history(limit=9999))}")
+        lines.append(f"Subscribers: {_event_bus.subscriber_count}")
+        await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
+    except Exception as e:
+        await message.answer(f"Events error: {e}")
+
+
+@router.message(Command("trades"))
+async def cmd_active_trades(message: Message):
+    """Show active trade lifecycles from TradeManager."""
+    if not _is_authorized(message):
+        return
+
+    if not _trade_manager:
+        await message.answer("Trade manager not configured.")
+        return
+
+    try:
+        active = _trade_manager.get_active_trades()
+        total = _trade_manager.count
+
+        if not active:
+            await message.answer(f"No active trades. Total tracked: {total}")
+            return
+
+        lines = ["<b>🔄 Active Trades</b>", f"{'═' * 25}"]
+        for t in active[:20]:
+            dur = t.duration
+            dur_str = f"{dur / 60:.0f}m" if dur and dur < 3600 else f"{dur / 3600:.1f}h" if dur else "?"
+            lines.append(
+                f"<code>{t.trade_id}</code> {t.symbol} {t.side}\n"
+                f"   State: {t.state.value} | Age: {dur_str}"
+            )
+
+        lines.append(f"\nActive: {len(active)} | Total tracked: {total}")
+        await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
+    except Exception as e:
+        await message.answer(f"Trades error: {e}")
 
 
 # ──────────────────────────────────────────────────────────────────────────

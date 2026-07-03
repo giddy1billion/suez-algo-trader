@@ -148,6 +148,10 @@ class Settings(BaseSettings):
     auto_backtest_symbols: str = ""             # Override symbols for backtest (empty=use trading_symbols)
     auto_train_bars: int = 1000                 # Bars to use for training
 
+    # --- Execution Simulator ---
+    enable_execution_simulator: bool = True     # Enable realistic execution simulation
+    execution_simulator_preset: str = "realistic"  # "realistic", "conservative", or "ideal"
+
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 
     # --- Computed Properties ---

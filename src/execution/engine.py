@@ -1,11 +1,16 @@
 """
 Execution Engine — Orchestrates strategy signals → risk check → order placement.
 The central coordinator between strategies, risk manager, and broker.
+
+Integrates:
+- EventBus for decoupled event publishing
+- TradeManager for trade lifecycle tracking
+- ExecutionSimulator for realistic fill modeling (opt-in)
 """
 
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from src.broker.alpaca_client import AlpacaBroker
@@ -42,8 +47,10 @@ class ExecutionEngine:
     Core trading engine:
     1. Receives signals from strategies
     2. Validates through risk manager
-    3. Executes via broker
-    4. Records everything to database
+    3. Executes via broker (with optional execution simulation)
+    4. Publishes events to EventBus
+    5. Tracks trade lifecycle via TradeManager
+    6. Records everything to database
     """
 
     def __init__(
@@ -53,6 +60,9 @@ class ExecutionEngine:
         db: DatabaseManager,
         dry_run: bool = False,
         risk_engine: Optional[RiskEngine] = None,
+        event_bus=None,
+        trade_manager=None,
+        execution_simulator=None,
     ):
         self.broker = broker
         self.risk = risk_manager
@@ -61,6 +71,23 @@ class ExecutionEngine:
         self.risk_engine = risk_engine or RiskEngine()
         self._last_cycle_time: Optional[datetime] = None
         self._current_strategy_name: str = "unknown"
+
+        # Event-driven components (optional but recommended)
+        self._event_bus = event_bus
+        self._trade_manager = trade_manager
+        self._simulator = execution_simulator  # None = no simulation (direct broker)
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Event Publishing Helpers
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _publish(self, event) -> None:
+        """Publish event to bus if available. Never crashes."""
+        if self._event_bus:
+            try:
+                self._event_bus.publish(event)
+            except Exception as e:
+                logger.debug("event_bus.publish_error", error=str(e))
 
     # ──────────────────────────────────────────────────────────────────────
     # Main Loop
@@ -83,6 +110,9 @@ class ExecutionEngine:
         can_trade, reason = self.risk.can_trade()
         if not can_trade:
             logger.warning("engine.halted", reason=reason)
+            # Publish risk halt event
+            from src.core.events import RiskHalt
+            self._publish(RiskHalt(reason=reason, level="WARNING", source="engine"))
             return []
 
         # 2. Fetch market data
@@ -101,8 +131,22 @@ class ExecutionEngine:
 
         # 3. Generate signals
         signals = strategy.generate_signals(data)
-        logger.info("engine.signals", count=len(signals),
-                   actionable=len([s for s in signals if s.is_actionable]))
+        actionable_count = len([s for s in signals if s.is_actionable])
+        logger.info("engine.signals", count=len(signals), actionable=actionable_count)
+
+        # Publish signal events
+        from src.core.events import SignalGenerated
+        for sig in signals:
+            if sig.is_actionable:
+                self._publish(SignalGenerated(
+                    symbol=sig.symbol,
+                    signal=sig.signal.name,
+                    confidence=sig.confidence,
+                    strategy=self._current_strategy_name,
+                    price=sig.price,
+                    indicators=sig.indicators or {},
+                    source="engine",
+                ))
 
         # 4. Process each signal
         account = self.broker.get_account()
@@ -116,7 +160,7 @@ class ExecutionEngine:
             if not signal.is_actionable:
                 continue
 
-            result = self._process_signal(signal, portfolio_value, positions)
+            result = self._process_signal(signal, portfolio_value, positions, data)
             if result:
                 results.append(result)
 
@@ -129,7 +173,8 @@ class ExecutionEngine:
 
         return results
 
-    def _process_signal(self, signal: TradeSignal, portfolio_value: float, positions: list[dict]) -> Optional[dict]:
+    def _process_signal(self, signal: TradeSignal, portfolio_value: float,
+                        positions: list[dict], market_data: dict = None) -> Optional[dict]:
         """Process a single trade signal through risk engine and execution."""
 
         # Determine side
@@ -157,7 +202,6 @@ class ExecutionEngine:
                 portfolio_value=portfolio_value,
             )
         else:
-            # Fallback: use max single stock allocation
             max_value = portfolio_value * self.risk.limits.max_single_stock_pct
             qty = max_value / signal.price
 
@@ -172,16 +216,35 @@ class ExecutionEngine:
             price=signal.price,
             stop_loss=signal.stop_loss,
             take_profit=signal.take_profit,
-            strategy=getattr(self, '_current_strategy_name', 'unknown'),
+            strategy=self._current_strategy_name,
             confidence=signal.confidence,
         )
+
+        # Create trade lifecycle if TradeManager available
+        trade_lifecycle = None
+        if self._trade_manager:
+            from src.core.state_machine import TradeState
+            trade_id = self._trade_manager.create_trade(signal.symbol, side)
+            trade_lifecycle = self._trade_manager.get_trade(trade_id)
+            trade_lifecycle.transition(TradeState.PENDING_RISK, "risk evaluation")
 
         # Get account cash for risk evaluation
         try:
             account = self.broker.get_account()
             cash = account.get('cash', 0.0)
         except Exception:
-            cash = portfolio_value * 0.5  # Fallback estimate
+            cash = portfolio_value * 0.5
+
+        # Build market_data context for risk engine
+        risk_market_data = {}
+        if market_data and signal.symbol in market_data:
+            df = market_data[signal.symbol]
+            if len(df) > 0:
+                risk_market_data = {
+                    "volume": float(df['volume'].iloc[-1]) if 'volume' in df.columns else 0,
+                    "adv": float(df['volume'].rolling(20).mean().iloc[-1]) if 'volume' in df.columns else 0,
+                    "daily_vol": float(df['close'].pct_change().rolling(20).std().iloc[-1]) if len(df) > 20 else 0,
+                }
 
         # Evaluate through the multi-layer risk engine
         decision: RiskDecision = self.risk_engine.evaluate(
@@ -189,12 +252,33 @@ class ExecutionEngine:
             portfolio_value=portfolio_value,
             cash=cash,
             positions=positions,
+            market_data=risk_market_data,
         )
+
+        # Publish risk evaluation event
+        from src.core.events import RiskEvaluated
+        self._publish(RiskEvaluated(
+            symbol=signal.symbol,
+            approved=decision.approved,
+            reasons=decision.reasons,
+            adjusted_qty=decision.adjusted_qty,
+            risk_score=getattr(decision, 'risk_score', 0.0),
+            source="risk_engine",
+        ))
 
         if not decision.approved:
             logger.info("engine.trade_rejected", symbol=signal.symbol, reasons=decision.reasons)
             self._log_signal(signal, executed=False)
+            # Transition lifecycle to RISK_REJECTED
+            if trade_lifecycle:
+                from src.core.state_machine import TradeState
+                trade_lifecycle.transition(TradeState.RISK_REJECTED, "; ".join(decision.reasons))
             return None
+
+        # Risk approved — transition lifecycle
+        if trade_lifecycle:
+            from src.core.state_machine import TradeState
+            trade_lifecycle.transition(TradeState.RISK_APPROVED, "all layers passed")
 
         final_qty = decision.adjusted_qty
 
@@ -213,6 +297,49 @@ class ExecutionEngine:
                 "dry_run": True,
             }
 
+        # --- Execution Simulation (opt-in) ---
+        sim_result = None
+        if self._simulator:
+            volume = risk_market_data.get("volume", 1_000_000)
+            atr = None
+            if market_data and signal.symbol in market_data:
+                df = market_data[signal.symbol]
+                if len(df) > 14:
+                    # Quick ATR estimate
+                    tr = (df['high'] - df['low']).rolling(14).mean()
+                    atr = float(tr.iloc[-1]) if not tr.empty else None
+
+            sim_result = self._simulator.simulate_execution(
+                symbol=signal.symbol,
+                side=side,
+                qty=final_qty,
+                price=signal.price,
+                volume=volume,
+                atr=atr,
+                asset_type="crypto" if "/" in signal.symbol else "equity",
+            )
+
+            if not sim_result.get('executed', True):
+                # Simulated rejection
+                logger.warning("engine.sim_rejected", symbol=signal.symbol,
+                             reason=sim_result.get('rejection_reason'))
+                if trade_lifecycle:
+                    from src.core.state_machine import TradeState
+                    trade_lifecycle.transition(TradeState.CANCELLED, "sim_rejected")
+                return None
+
+            # Use simulated average price for logging
+            logger.info("engine.sim_fill",
+                       symbol=signal.symbol,
+                       avg_price=sim_result.get('avg_price'),
+                       slippage_bps=sim_result.get('slippage_bps', 0),
+                       fees=sim_result.get('fees', 0))
+
+        # Transition lifecycle: SUBMITTED
+        if trade_lifecycle:
+            from src.core.state_machine import TradeState
+            trade_lifecycle.transition(TradeState.SUBMITTED, "order submitted to broker")
+
         # Place the order
         try:
             if signal.stop_loss and signal.take_profit:
@@ -230,7 +357,49 @@ class ExecutionEngine:
                     side=side,
                 )
 
-            # Record trade
+            # Publish OrderSubmitted event
+            from src.core.events import OrderSubmitted, OrderFilled, TradeOpened
+            self._publish(OrderSubmitted(
+                symbol=signal.symbol,
+                side=side,
+                qty=final_qty,
+                price=signal.price,
+                order_type="bracket" if signal.stop_loss else "market",
+                order_id=order.get("id", ""),
+                source="engine",
+            ))
+
+            # Transition lifecycle: ACCEPTED → FILLED → ACTIVE
+            if trade_lifecycle:
+                from src.core.state_machine import TradeState
+                trade_lifecycle.transition(TradeState.ACCEPTED, "broker accepted")
+                trade_lifecycle.transition(TradeState.FILLED, f"filled qty={final_qty}")
+                trade_lifecycle.transition(TradeState.ACTIVE, "position active")
+
+            # Publish OrderFilled
+            fill_price = sim_result['avg_price'] if sim_result else signal.price
+            fill_fees = sim_result['fees'] if sim_result else 0.0
+            self._publish(OrderFilled(
+                order_id=order.get("id", ""),
+                fill_price=fill_price,
+                fill_qty=final_qty,
+                fees=fill_fees,
+                source="engine",
+            ))
+
+            # Publish TradeOpened
+            self._publish(TradeOpened(
+                trade_id=order.get("id", ""),
+                symbol=signal.symbol,
+                side=side,
+                entry_price=fill_price,
+                qty=final_qty,
+                stop_loss=signal.stop_loss or 0.0,
+                take_profit=signal.take_profit or 0.0,
+                source="engine",
+            ))
+
+            # Record trade to database
             self.db.record_trade({
                 "symbol": signal.symbol,
                 "side": side,
@@ -243,6 +412,8 @@ class ExecutionEngine:
                 "signal_confidence": signal.confidence,
                 "stop_loss": signal.stop_loss,
                 "take_profit": signal.take_profit,
+                "sim_slippage_bps": sim_result.get("slippage_bps") if sim_result else None,
+                "sim_fees": fill_fees if sim_result else None,
             })
 
             # Journal trade entry for analysis
@@ -253,9 +424,9 @@ class ExecutionEngine:
                         "trade_id": order.get("id"),
                         "symbol": signal.symbol,
                         "side": side,
-                        "entry_price": signal.price,
+                        "entry_price": fill_price,
                         "qty": final_qty,
-                        "strategy_name": getattr(self, '_current_strategy_name', 'unknown'),
+                        "strategy_name": self._current_strategy_name,
                         "model_version": getattr(signal, 'model_version', None),
                         "prediction": side,
                         "confidence": signal.confidence,
@@ -272,6 +443,17 @@ class ExecutionEngine:
 
         except Exception as e:
             logger.error("engine.order_failed", symbol=signal.symbol, error=str(e))
+            # Publish rejection event
+            from src.core.events import OrderRejected
+            self._publish(OrderRejected(
+                order_id="",
+                reason=str(e),
+                source="engine",
+            ))
+            # Transition lifecycle to ERROR
+            if trade_lifecycle:
+                from src.core.state_machine import TradeState
+                trade_lifecycle.transition(TradeState.ERROR, f"order_failed: {str(e)[:80]}")
             return None
 
     def _check_exits(self, strategy: BaseStrategy, positions: list[dict], data: dict) -> list[dict]:
@@ -290,17 +472,28 @@ class ExecutionEngine:
                         self.risk.record_trade({"symbol": symbol, "pnl": pnl})
                         results.append({"action": "exit", "symbol": symbol, "pnl": pnl})
 
+                        # Publish TradeClosed event
+                        from src.core.events import TradeClosed
+                        entry_price = pos.get('avg_entry_price', pos.get('cost_basis', 0))
+                        pnl_pct = (current_price - entry_price) / entry_price * 100 if entry_price else 0
+                        self._publish(TradeClosed(
+                            trade_id=pos.get('asset_id', ''),
+                            symbol=symbol,
+                            exit_price=current_price,
+                            pnl=pnl,
+                            pnl_pct=pnl_pct,
+                            reason=exit_signal.reason[:50] if exit_signal.reason else "strategy_exit",
+                            source="engine",
+                        ))
+
                         # Journal the exit
                         journal = _get_journal(self.db)
                         if journal:
                             try:
-                                # Find the oldest OPEN journal entry for this symbol
                                 entries = journal.get_journal(symbol=symbol, limit=20)
                                 open_entries = [e for e in entries if e.get("exit_price") is None]
                                 if open_entries:
-                                    target = open_entries[-1]  # oldest open entry (list is newest-first)
-                                    entry_price = target.get("entry_price", 0)
-                                    pnl_pct = (current_price - entry_price) / entry_price if entry_price else 0
+                                    target = open_entries[-1]
                                     journal.log_exit(target["id"], {
                                         "exit_price": current_price,
                                         "exit_reason": exit_signal.reason[:50] if exit_signal.reason else "strategy_exit",
@@ -322,7 +515,7 @@ class ExecutionEngine:
         try:
             self.db.log_signal({
                 "symbol": signal.symbol,
-                "strategy": getattr(self, '_current_strategy_name', 'unknown'),
+                "strategy": self._current_strategy_name,
                 "signal": signal.signal.name,
                 "confidence": signal.confidence,
                 "price_at_signal": signal.price,
@@ -356,3 +549,11 @@ class ExecutionEngine:
         self.broker.close_all_positions()
         self.risk.daily_stats.is_halted = True
         self.risk.daily_stats.halt_reason = "Emergency liquidation triggered"
+
+        # Publish critical risk halt
+        from src.core.events import RiskHalt
+        self._publish(RiskHalt(
+            reason="Emergency liquidation triggered",
+            level="CRITICAL",
+            source="engine",
+        ))
