@@ -6,7 +6,9 @@ Thread-safe, lightweight (<100ms per full check).
 
 import threading
 import time
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from typing import Optional
 
 import psutil
 
@@ -17,6 +19,21 @@ logger = get_logger(__name__)
 # Boot time for uptime calculation
 _BOOT_TIME = datetime.now(timezone.utc)
 
+# Threshold (seconds) after which a missing heartbeat marks component degraded/down
+_DEGRADED_THRESHOLD = 60
+_DOWN_THRESHOLD = 180
+
+
+@dataclass
+class ComponentHealth:
+    """Health state for a single component."""
+    name: str
+    status: str = "unknown"  # "healthy", "degraded", "down", "unknown"
+    last_heartbeat: Optional[datetime] = None
+    latency_ms: float = 0.0
+    error_count: int = 0
+    metadata: dict = field(default_factory=dict)
+
 
 class HealthMonitor:
     """Monitors system health across all components."""
@@ -24,14 +41,134 @@ class HealthMonitor:
     def __init__(self):
         self._heartbeats: dict[str, datetime] = {}
         self._component_status: dict[str, str] = {}
+        self._components: dict[str, ComponentHealth] = {}
         self._lock = threading.Lock()
         self._start_time = datetime.now(timezone.utc)
+        # Register default components
+        for name in ['broker', 'database', 'ml_model', 'event_bus',
+                     'risk_engine', 'telegram', 'scheduler']:
+            self._components[name] = ComponentHealth(name=name, status="unknown")
 
-    def heartbeat(self, component: str):
+    def heartbeat(self, component: str, latency_ms: float = 0.0, metadata: dict = None):
         """Record a heartbeat from a component."""
         with self._lock:
-            self._heartbeats[component] = datetime.now(timezone.utc)
+            now = datetime.now(timezone.utc)
+            self._heartbeats[component] = now
             self._component_status[component] = "ok"
+            # Update ComponentHealth entry
+            if component not in self._components:
+                self._components[component] = ComponentHealth(name=component)
+            ch = self._components[component]
+            ch.last_heartbeat = now
+            ch.latency_ms = latency_ms
+            ch.status = "healthy"
+            if metadata:
+                ch.metadata.update(metadata)
+
+    def report_error(self, component: str, error: str):
+        """Record an error for a component."""
+        with self._lock:
+            if component not in self._components:
+                self._components[component] = ComponentHealth(name=component)
+            ch = self._components[component]
+            ch.error_count += 1
+            ch.metadata["last_error"] = error
+            # Escalate status based on error count
+            if ch.error_count >= 5:
+                ch.status = "down"
+            elif ch.error_count >= 1:
+                ch.status = "degraded"
+            self._component_status[component] = "error" if ch.error_count >= 5 else "warning"
+        logger.warning("health.error_reported", component=component, error=error)
+
+    def get_status(self, component: str) -> ComponentHealth:
+        """Get status of a specific component."""
+        with self._lock:
+            if component in self._components:
+                self._refresh_component_status(self._components[component])
+                return self._components[component]
+            return ComponentHealth(name=component, status="unknown")
+
+    def get_full_report(self) -> dict:
+        """Get comprehensive health report including system metrics."""
+        with self._lock:
+            # Refresh all component statuses
+            for ch in self._components.values():
+                self._refresh_component_status(ch)
+
+            components = {}
+            for name, ch in self._components.items():
+                components[name] = {
+                    "status": ch.status,
+                    "last_heartbeat": ch.last_heartbeat.isoformat() if ch.last_heartbeat else None,
+                    "latency_ms": ch.latency_ms,
+                    "error_count": ch.error_count,
+                }
+
+        system = self.get_system_metrics()
+        overall, issues = self.check_component_health()
+
+        return {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "uptime_seconds": self.uptime_seconds,
+            "overall_status": overall,
+            "issues": issues,
+            "system": system,
+            "components": components,
+        }
+
+    def get_system_metrics(self) -> dict:
+        """Get OS-level metrics: memory, CPU, disk."""
+        try:
+            proc = psutil.Process()
+            memory_mb = round(proc.memory_info().rss / (1024 * 1024), 1)
+            cpu_pct = psutil.cpu_percent(interval=None)
+            disk = psutil.disk_usage("C:\\") if _is_windows() else psutil.disk_usage("/")
+            return {
+                "memory_mb": memory_mb,
+                "cpu_percent": round(cpu_pct, 1),
+                "disk_percent": round(disk.percent, 1),
+                "disk_free_gb": round(disk.free / (1024 ** 3), 1),
+            }
+        except Exception as e:
+            return {"error": str(e)}
+
+    def check_component_health(self) -> tuple[str, list[str]]:
+        """Quick health check across ComponentHealth entries.
+
+        Returns (overall_status, list_of_issues).
+        """
+        issues: list[str] = []
+        has_degraded = False
+        has_down = False
+
+        with self._lock:
+            for ch in self._components.values():
+                self._refresh_component_status(ch)
+                if ch.status == "down":
+                    has_down = True
+                    issues.append(f"{ch.name}: DOWN (errors={ch.error_count})")
+                elif ch.status == "degraded":
+                    has_degraded = True
+                    issues.append(f"{ch.name}: degraded (errors={ch.error_count})")
+
+        if has_down:
+            return "down", issues
+        elif has_degraded:
+            return "degraded", issues
+        return "healthy", issues
+
+    def _refresh_component_status(self, ch: ComponentHealth):
+        """Update component status based on heartbeat freshness (must hold lock)."""
+        if ch.status == "unknown" and ch.last_heartbeat is None:
+            return  # Never received a heartbeat — keep unknown
+        if ch.last_heartbeat is None:
+            return
+        elapsed = (datetime.now(timezone.utc) - ch.last_heartbeat).total_seconds()
+        if elapsed > _DOWN_THRESHOLD and ch.error_count < 5:
+            ch.status = "down"
+        elif elapsed > _DEGRADED_THRESHOLD and ch.error_count < 1:
+            ch.status = "degraded"
 
     def set_status(self, component: str, status: str):
         """Manually set component status (ok, warning, error)."""

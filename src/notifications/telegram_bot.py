@@ -75,6 +75,8 @@ _live_metrics = None
 _scheduler = None
 _event_bus = None
 _trade_manager = None
+_reconciler = None
+_ops_handler = None
 
 # Thread-safe lock for broker operations (broker is called from Telegram's async thread)
 import threading
@@ -117,10 +119,11 @@ def get_runtime_changes() -> dict:
 
 def set_components(broker, engine, risk_manager, strategy, db=None, authorized_chat_ids: list[int] = None,
                    health_monitor=None, live_metrics=None, scheduler=None,
-                   event_bus=None, trade_manager=None):
+                   event_bus=None, trade_manager=None, reconciler=None, ops_handler=None):
     """Inject trading components into the bot module."""
     global _broker, _engine, _risk_manager, _strategy, _db, _authorized_users
     global _health_monitor, _live_metrics, _scheduler, _event_bus, _trade_manager
+    global _reconciler, _ops_handler
     _broker = broker
     _engine = engine
     _risk_manager = risk_manager
@@ -138,6 +141,10 @@ def set_components(broker, engine, risk_manager, strategy, db=None, authorized_c
         _event_bus = event_bus
     if trade_manager:
         _trade_manager = trade_manager
+    if reconciler:
+        _reconciler = reconciler
+    if ops_handler:
+        _ops_handler = ops_handler
 
 
 def _is_authorized(message: Message) -> bool:
@@ -2255,6 +2262,259 @@ async def cmd_active_trades(message: Message):
         await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
     except Exception as e:
         await message.answer(f"Trades error: {e}")
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Operational Commands (health, risk, reconcile, latency, performance, system)
+# ──────────────────────────────────────────────────────────────────────────
+
+def _get_ops_handler():
+    """Lazy-create OpsCommandHandler with current components."""
+    from src.monitoring.ops_commands import OpsCommandHandler
+    return OpsCommandHandler(
+        health_monitor=_health_monitor,
+        event_bus=_event_bus,
+        trade_manager=_trade_manager,
+        broker=_broker,
+        reconciler=None,  # No reconciler wired yet
+        risk_manager=_risk_manager,
+        metrics=_live_metrics,
+    )
+
+
+@router.message(Command("health"))
+async def cmd_health(message: Message):
+    """Show component health status, uptime, memory, CPU."""
+    if not _is_authorized(message):
+        return
+    try:
+        ops = _get_ops_handler()
+        text = ops.format_health()
+        await message.answer(text, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        await message.answer(f"Health error: {e}")
+
+
+@router.message(Command("riskreport"))
+async def cmd_riskreport(message: Message):
+    """Show current risk metrics: exposure, drawdown, daily PnL."""
+    if not _is_authorized(message):
+        return
+    try:
+        ops = _get_ops_handler()
+        text = ops.format_risk_report()
+        await message.answer(text, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        await message.answer(f"Risk report error: {e}")
+
+
+@router.message(Command("reconcile"))
+async def cmd_reconcile(message: Message):
+    """Trigger portfolio reconciliation and show results."""
+    if not _is_authorized(message):
+        return
+    try:
+        ops = _get_ops_handler()
+        text = ops.format_reconciliation()
+        await message.answer(text, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        await message.answer(f"Reconcile error: {e}")
+
+
+@router.message(Command("latency"))
+async def cmd_latency(message: Message):
+    """Show broker/system latency metrics."""
+    if not _is_authorized(message):
+        return
+    try:
+        ops = _get_ops_handler()
+        text = ops.format_latency()
+        await message.answer(text, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        await message.answer(f"Latency error: {e}")
+
+
+@router.message(Command("performance"))
+async def cmd_performance(message: Message):
+    """Show live trading performance: Sharpe, Sortino, win rate, PnL."""
+    if not _is_authorized(message):
+        return
+    try:
+        ops = _get_ops_handler()
+        text = ops.format_performance()
+        await message.answer(text, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        await message.answer(f"Performance error: {e}")
+
+
+@router.message(Command("system"))
+async def cmd_system(message: Message):
+    """Show system info: Python version, uptime, disk, memory, active threads."""
+    if not _is_authorized(message):
+        return
+    try:
+        ops = _get_ops_handler()
+        text = ops.format_system()
+        await message.answer(text, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        await message.answer(f"System error: {e}")
+
+
+@router.message(Command("replay"))
+async def cmd_replay(message: Message):
+    """Replay a session: /replay [session_id] or /replay list."""
+    if not _is_authorized(message):
+        return
+    try:
+        from src.core.event_store import EventStore
+        from src.core.replay import ReplayEngine
+
+        args = message.text.split(maxsplit=1)
+        store = EventStore(db_path="data_cache/events.db")
+        engine = ReplayEngine(store)
+
+        if len(args) < 2 or args[1].strip().lower() == "list":
+            sessions = engine.list_sessions(limit=10)
+            if not sessions:
+                await message.answer("No sessions found in event store.")
+                return
+            lines = ["<b>📼 Available Sessions</b>\n"]
+            for s in sessions:
+                lines.append(
+                    f"• <code>{s['session_id'][:12]}</code> — "
+                    f"{s['event_count']} events"
+                )
+            await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
+        else:
+            session_id = args[1].strip()
+            summary = engine.get_session_summary(session_id)
+            if not summary.get("found"):
+                await message.answer(f"Session not found: {session_id}")
+                return
+            lines = [
+                f"<b>📼 Session: {session_id[:12]}...</b>\n",
+                f"Events: {summary['total_events']}",
+                f"First: {summary.get('first_event', 'N/A')}",
+                f"Last: {summary.get('last_event', 'N/A')}",
+                "\n<b>Event Types:</b>",
+            ]
+            for etype, count in sorted(summary.get("event_types", {}).items()):
+                lines.append(f"  {etype}: {count}")
+            await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
+    except Exception as e:
+        await message.answer(f"Replay error: {e}")
+
+
+@router.message(Command("recover"))
+async def cmd_recover(message: Message):
+    """Trigger crash recovery sequence."""
+    if not _is_authorized(message):
+        return
+    try:
+        from src.core.recovery import RecoveryManager
+        from src.core.event_store import EventStore
+
+        if not _broker or not _event_bus or not _trade_manager:
+            await message.answer("Components not initialized.")
+            return
+
+        store = EventStore(db_path="data_cache/events.db")
+        rm = RecoveryManager(_broker, _event_bus, _trade_manager, store)
+        report = rm.recover()
+
+        lines = [
+            "<b>🔄 Recovery Report</b>\n",
+            f"Success: {'✅' if report.success else '❌'}",
+            f"Positions recovered: {report.positions_recovered}",
+            f"Orphans detected: {report.orphans_detected}",
+            f"Events replayed: {report.events_replayed}",
+        ]
+        if report.warnings:
+            lines.append(f"\n⚠️ Warnings: {len(report.warnings)}")
+            for w in report.warnings[:5]:
+                lines.append(f"  • {w}")
+        await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
+    except Exception as e:
+        await message.answer(f"Recovery error: {e}")
+
+
+@router.message(Command("governance"))
+async def cmd_governance(message: Message):
+    """Show model governance audit report."""
+    if not _is_authorized(message):
+        return
+    try:
+        from src.ml.governance import ModelGovernance
+
+        gov = ModelGovernance()
+        report = gov.audit_report()
+
+        lines = [
+            "<b>🏛️ Model Governance</b>\n",
+            f"Total versions: {report['total_versions']}",
+            f"Currently deployed: {report['currently_deployed']}",
+            f"Retired: {report['retired']}",
+            f"With git commit: {report['with_git_commit']}",
+            f"With dataset hash: {report['with_dataset_hash']}",
+            f"Completeness: {report['governance_completeness']:.0%}",
+        ]
+        if report["versions"]:
+            lines.append("\n<b>Versions:</b>")
+            for v in report["versions"][:5]:
+                status = "🟢" if v["deployed"] else "⚪"
+                lines.append(
+                    f"  {status} {v['version']} — "
+                    f"acc={v['cv_accuracy']:.3f} "
+                    f"({v['git_commit'] or 'no-git'})"
+                )
+        await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
+    except Exception as e:
+        await message.answer(f"Governance error: {e}")
+
+
+@router.message(Command("modelaudit"))
+async def cmd_modelaudit(message: Message):
+    """Validate current model for deployment readiness."""
+    if not _is_authorized(message):
+        return
+    try:
+        from src.ml.governance import ModelGovernance
+        from src.ml.model_registry import ModelRegistry
+
+        registry = ModelRegistry()
+        gov = ModelGovernance()
+
+        active = registry.get_active_version()
+        if not active:
+            await message.answer("No active model version found.")
+            return
+
+        is_valid, issues = gov.validate_for_deployment(active)
+
+        lines = [
+            f"<b>🔍 Model Audit: {active}</b>\n",
+            f"Status: {'✅ PASS' if is_valid else '❌ FAIL'}",
+        ]
+        if issues:
+            lines.append(f"\nIssues ({len(issues)}):")
+            for issue in issues:
+                lines.append(f"  ⚠️ {issue}")
+        else:
+            lines.append("\nAll governance checks passed.")
+
+        lineage = gov.get_lineage(active)
+        if lineage:
+            lines.extend([
+                f"\nGit: {lineage.git_commit[:8] if lineage.git_commit else 'N/A'}",
+                f"Features: {lineage.n_features}",
+                f"Dataset rows: {lineage.training_dataset_rows}",
+                f"CV accuracy: {lineage.cv_accuracy:.3f}",
+                f"WF Sharpe: {lineage.walk_forward_sharpe:.3f}",
+                f"MC prob profit: {lineage.monte_carlo_prob_profit:.1%}",
+            ])
+        await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
+    except Exception as e:
+        await message.answer(f"Model audit error: {e}")
 
 
 # ──────────────────────────────────────────────────────────────────────────

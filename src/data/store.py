@@ -139,12 +139,30 @@ class DatabaseManager:
         # Thread-safe SQLite configuration
         engine_kwargs = {"echo": False}
         if "sqlite" in database_url:
-            engine_kwargs["connect_args"] = {"check_same_thread": False}
+            engine_kwargs["connect_args"] = {
+                "check_same_thread": False,
+                "timeout": 30,  # Wait up to 30s on locked DB
+            }
             # Use StaticPool for single-connection thread safety with SQLite
             from sqlalchemy.pool import StaticPool
             engine_kwargs["poolclass"] = StaticPool
 
         self.engine = create_engine(database_url, **engine_kwargs)
+
+        # SQLite pragmas for production robustness
+        if "sqlite" in database_url:
+            from sqlalchemy import event as sa_event
+
+            @sa_event.listens_for(self.engine, "connect")
+            def _set_sqlite_pragmas(dbapi_conn, connection_record):
+                cursor = dbapi_conn.cursor()
+                cursor.execute("PRAGMA journal_mode=WAL")      # Concurrent reads during writes
+                cursor.execute("PRAGMA busy_timeout=30000")    # 30s retry on lock
+                cursor.execute("PRAGMA synchronous=NORMAL")    # Good balance of safety/speed
+                cursor.execute("PRAGMA foreign_keys=ON")       # Enforce FK constraints
+                cursor.execute("PRAGMA cache_size=-64000")     # 64MB cache
+                cursor.close()
+
         Base.metadata.create_all(self.engine)
         self.SessionFactory = sessionmaker(bind=self.engine)
 

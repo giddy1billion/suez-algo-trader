@@ -362,9 +362,53 @@ def cmd_run(
         notification_send_func=_notification_sender if notifier.telegram_token else None,
     )
 
+    # --- Event Persistence (durable event log for replay & auditing) ---
+    from src.core.event_store import EventStore, EventPersistenceSubscriber
+    event_store = EventStore(db_path="data_cache/events.db")
+    persistence_subscriber = EventPersistenceSubscriber(event_store)
+    persistence_subscriber.attach(event_bus)
+    logger.info("event_store.initialized", session_id=event_store.session_id)
+
+    # --- Crash Recovery (reconstruct state from broker on startup) ---
+    from src.core.recovery import RecoveryManager
+    recovery_manager = RecoveryManager(broker, event_bus, trade_manager, event_store)
+    recovery_report = recovery_manager.recover()
+    if recovery_report.positions_recovered > 0:
+        logger.info(
+            "recovery.complete",
+            positions=recovery_report.positions_recovered,
+            orphans=recovery_report.orphans_detected,
+        )
+
+    # --- Portfolio Reconciliation (periodic broker vs internal state check) ---
+    from src.core.reconciliation import PortfolioReconciler
+    reconciler = PortfolioReconciler(broker, trade_manager, event_bus)
+
+    # --- CQRS Read Models (incremental projections for fast dashboard queries) ---
+    from src.core.projections import ReadModelManager
+    read_models = ReadModelManager()
+    read_models.attach(event_bus)
+
+    # --- State Snapshotting (periodic persistence for fast recovery) ---
+    from src.core.snapshots import SnapshotStore, SnapshotManager
+    snapshot_store = SnapshotStore(db_path="data_cache/snapshots.db")
+    snapshot_manager = SnapshotManager(snapshot_store, event_store, snapshot_interval_events=500)
+
     # Initialize monitoring components
     health_monitor = HealthMonitor()
     live_metrics = LiveMetrics()
+
+    # --- Operational Commands Handler ---
+    from src.monitoring.ops_commands import OpsCommandHandler
+    ops_handler = OpsCommandHandler(
+        health_monitor=health_monitor,
+        event_bus=event_bus,
+        trade_manager=trade_manager,
+        broker=broker,
+        reconciler=reconciler,
+        risk_manager=risk,
+        metrics=live_metrics,
+    )
 
     # Initialize risk manager
     account = broker.get_account()
@@ -654,7 +698,9 @@ def cmd_run(
                               live_metrics=live_metrics,
                               scheduler=_scheduler,
                               event_bus=event_bus,
-                              trade_manager=trade_manager)
+                              trade_manager=trade_manager,
+                              reconciler=reconciler,
+                              ops_handler=ops_handler)
 
     # Cache crypto-only strategy to avoid re-creating each cycle
     crypto_only = [s for s in symbols if "/" in s]
@@ -669,6 +715,33 @@ def cmd_run(
             removed = trade_manager.remove_terminal()
             if removed > 0:
                 logger.info("trade_manager.cleanup", removed=removed, cycle=cycle_count)
+
+        # Periodic portfolio reconciliation (every 5 minutes / ~5 cycles at 60s interval)
+        if reconciler and cycle_count % 5 == 0:
+            try:
+                recon_report = reconciler.reconcile()
+                if not recon_report.is_reconciled:
+                    logger.warning(
+                        "reconciliation.drift_detected",
+                        discrepancies=len(recon_report.discrepancies),
+                    )
+                    # Auto-fix safe discrepancies
+                    reconciler.auto_fix(recon_report)
+            except Exception as e:
+                logger.error("reconciliation.error", error=str(e))
+
+        # Health heartbeats
+        if health_monitor:
+            health_monitor.heartbeat("engine", latency_ms=(time.time() - cycle_start) * 1000)
+
+        # Periodic snapshots (every 500 events for fast recovery)
+        if snapshot_manager and snapshot_manager.should_snapshot():
+            try:
+                dashboard = read_models.get_dashboard()
+                last_event_id = event_store.count_events()
+                snapshot_manager.take_snapshot(event_store.session_id, last_event_id, dashboard)
+            except Exception as e:
+                logger.error("snapshot.error", error=str(e))
 
         # Check if paused via Telegram
         if telegram_bot and telegram_bot.is_paused():
