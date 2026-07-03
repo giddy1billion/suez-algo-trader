@@ -2282,9 +2282,9 @@ def _get_ops_handler():
     )
 
 
-@router.message(Command("health"))
-async def cmd_health(message: Message):
-    """Show component health status, uptime, memory, CPU."""
+@router.message(Command("healthops"))
+async def cmd_healthops(message: Message):
+    """Show ops-formatted health status, uptime, memory, CPU."""
     if not _is_authorized(message):
         return
     try:

@@ -21,6 +21,7 @@ MISSING_INTERNAL = "MISSING_INTERNAL"
 MISSING_BROKER = "MISSING_BROKER"
 QTY_MISMATCH = "QTY_MISMATCH"
 SIDE_MISMATCH = "SIDE_MISMATCH"
+BROKER_ERROR = "BROKER_ERROR"
 
 
 @dataclass
@@ -28,7 +29,7 @@ class Discrepancy:
     """A single discrepancy between broker and internal state."""
 
     symbol: str
-    type: str  # MISSING_INTERNAL, MISSING_BROKER, QTY_MISMATCH, SIDE_MISMATCH
+    type: str  # MISSING_INTERNAL, MISSING_BROKER, QTY_MISMATCH, SIDE_MISMATCH, BROKER_ERROR
     broker_state: dict = field(default_factory=dict)
     internal_state: dict = field(default_factory=dict)
     severity: str = "MEDIUM"  # LOW, MEDIUM, HIGH
@@ -78,7 +79,7 @@ class PortfolioReconciler:
             report.discrepancies.append(
                 Discrepancy(
                     symbol="N/A",
-                    type="BROKER_ERROR",
+                    type=BROKER_ERROR,
                     broker_state={"error": str(e)},
                     internal_state={},
                     severity="HIGH",

@@ -242,11 +242,16 @@ class ReadModelManager:
     def get_snapshot(self) -> PortfolioSnapshot:
         """Get a point-in-time snapshot for persistence."""
         metrics = self.performance.get_metrics()
+        positions = self.positions.get_positions()
+        unrealized_pnl = sum(p.unrealized_pnl for p in positions)
+        total_exposure = self.positions.get_exposure()
         return PortfolioSnapshot(
             timestamp=datetime.now(timezone.utc),
-            positions=self.positions.get_positions(),
-            total_exposure=self.positions.get_exposure(),
+            positions=positions,
+            total_equity=total_exposure + unrealized_pnl,
+            total_exposure=total_exposure,
             realized_pnl=metrics["realized_pnl"],
+            unrealized_pnl=unrealized_pnl,
             trade_count=metrics["trade_count"],
             win_count=metrics["win_count"],
             loss_count=metrics["loss_count"],

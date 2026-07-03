@@ -171,7 +171,7 @@ class TestRecoveryManager:
     def test_recover_with_event_store(self, mock_broker, event_bus, trade_manager):
         """Recovery replays events from event store."""
         mock_event_store = MagicMock()
-        mock_event_store.get_recent_events.return_value = [
+        mock_event_store.get_latest_events.return_value = [
             SystemHealth(component="test", status="healthy"),
             SystemHealth(component="test2", status="healthy"),
         ]

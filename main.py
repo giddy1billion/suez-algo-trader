@@ -393,6 +393,8 @@ def cmd_run(
     from src.core.snapshots import SnapshotStore, SnapshotManager
     snapshot_store = SnapshotStore(db_path="data_cache/snapshots.db")
     snapshot_manager = SnapshotManager(snapshot_store, event_store, snapshot_interval_events=500)
+    # Wire snapshot manager to event bus so event-count trigger works
+    event_bus.subscribe(None, snapshot_manager.on_event)
 
     # Initialize monitoring components
     health_monitor = HealthMonitor()
@@ -824,9 +826,6 @@ def cmd_run(
                     logger.error("ml.auto_retrain_error", error=str(e))
 
         try:
-            # Record heartbeat for health monitoring
-            health_monitor.heartbeat("engine")
-
             # Check risk halt and notify
             can_trade, halt_reason = risk.can_trade()
             if not can_trade:

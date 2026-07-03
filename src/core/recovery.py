@@ -139,7 +139,7 @@ class RecoveryManager:
             return 0
 
         try:
-            events = self.event_store.get_recent_events()
+            events = self.event_store.get_latest_events(limit=1000)
             count = 0
             for event in events:
                 self.event_bus.publish(event)
