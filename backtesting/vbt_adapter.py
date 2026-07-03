@@ -27,6 +27,16 @@ except (ImportError, OSError):
 # Pure numpy/pandas fallback (no vectorbt/numba required)
 # ──────────────────────────────────────────────────────────────────────────
 
+
+def _safe_profit_factor(wins: list, losses: list) -> float:
+    """Compute profit factor safely avoiding division by zero."""
+    gross_loss = abs(sum(t['pnl'] for t in losses)) if losses else 0.0
+    gross_profit = sum(t['pnl'] for t in wins) if wins else 0.0
+    if gross_loss < 1e-9:
+        return float('inf') if gross_profit > 0 else 0.0
+    return gross_profit / gross_loss
+
+
 def _numpy_ema_crossover_backtest(
     df: pd.DataFrame,
     fast_ema: int = 12,
@@ -133,8 +143,7 @@ def _numpy_ema_crossover_backtest(
         'max_drawdown': abs(max_drawdown),
         'win_rate': win_rate,
         'total_trades': len(trades),
-        'profit_factor': (sum(t['pnl'] for t in wins) / abs(sum(t['pnl'] for t in losses)))
-                         if losses and sum(t['pnl'] for t in losses) != 0 else float('inf') if wins else 0,
+        'profit_factor': _safe_profit_factor(wins, losses),
         'final_value': final_value,
     }
 

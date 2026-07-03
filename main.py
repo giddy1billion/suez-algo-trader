@@ -45,6 +45,20 @@ _shutdown_event = threading.Event()
 logger = None
 
 
+def _send_telegram_async(coro):
+    """Run an async telegram coroutine from sync context safely."""
+    import asyncio
+    loop = None
+    try:
+        loop = asyncio.new_event_loop()
+        loop.run_until_complete(coro)
+    except Exception:
+        pass
+    finally:
+        if loop:
+            loop.close()
+
+
 def signal_handler(sig, frame):
     """Handle Ctrl+C gracefully."""
     _shutdown_event.set()
@@ -698,13 +712,7 @@ def cmd_run(
                         notifier.notify_trade(r)
                         # Also notify via Telegram bot
                         if telegram_bot:
-                            import asyncio
-                            try:
-                                loop = asyncio.new_event_loop()
-                                loop.run_until_complete(telegram_bot.notify_trade(r))
-                                loop.close()
-                            except Exception:
-                                pass
+                            _send_telegram_async(telegram_bot.notify_trade(r))
             else:
                 logger.debug("cycle.no_signals", cycle=cycle_count)
 

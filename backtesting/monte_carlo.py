@@ -14,12 +14,15 @@ logger = get_logger(__name__)
 
 
 def _compute_equity_curve(pnls: np.ndarray, initial_cash: float) -> np.ndarray:
-    """Compute equity curve from a sequence of PnL values. Floors at 0."""
+    """Compute equity curve from PnL sequence. Once ruined (<=0), stays at 0."""
     equity = np.empty(len(pnls) + 1)
     equity[0] = initial_cash
     equity[1:] = initial_cash + np.cumsum(pnls)
-    # Floor at 0 — cannot go negative (account wiped out)
-    np.maximum(equity, 0.0, out=equity)
+    # Once equity hits 0 or below, it stays at 0 (ruin is permanent)
+    ruin_idx = np.where(equity <= 0)[0]
+    if len(ruin_idx) > 0:
+        first_ruin = ruin_idx[0]
+        equity[first_ruin:] = 0.0
     return equity
 
 

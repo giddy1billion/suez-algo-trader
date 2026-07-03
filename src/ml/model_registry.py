@@ -267,36 +267,37 @@ class ModelRegistry:
         Returns:
             True on success, False on failure.
         """
-        try:
-            registry = self._load_registry()
-            entry = self._find_entry(registry, version_str)
+        with _registry_lock:
+            try:
+                registry = self._load_registry()
+                entry = self._find_entry(registry, version_str)
 
-            if entry.get("is_active"):
-                logger.warning(
-                    "ml.registry.delete_refused",
+                if entry.get("is_active"):
+                    logger.warning(
+                        "ml.registry.delete_refused",
+                        version=version_str,
+                        reason="cannot_delete_active",
+                    )
+                    return False
+
+                # Remove file
+                filepath = os.path.join(self.models_dir, entry["filename"])
+                if os.path.exists(filepath):
+                    os.remove(filepath)
+
+                # Remove from registry
+                registry = [e for e in registry if e["version"] != version_str]
+                self._save_registry(registry)
+
+                logger.info("ml.registry.deleted", version=version_str)
+                return True
+            except (KeyError, OSError) as exc:
+                logger.error(
+                    "ml.registry.delete_failed",
                     version=version_str,
-                    reason="cannot_delete_active",
+                    error=str(exc),
                 )
                 return False
-
-            # Remove file
-            filepath = os.path.join(self.models_dir, entry["filename"])
-            if os.path.exists(filepath):
-                os.remove(filepath)
-
-            # Remove from registry
-            registry = [e for e in registry if e["version"] != version_str]
-            self._save_registry(registry)
-
-            logger.info("ml.registry.deleted", version=version_str)
-            return True
-        except (KeyError, OSError) as exc:
-            logger.error(
-                "ml.registry.delete_failed",
-                version=version_str,
-                error=str(exc),
-            )
-            return False
 
     def auto_version_check(self, new_metrics: dict, threshold: float = 0.05) -> bool:
         """

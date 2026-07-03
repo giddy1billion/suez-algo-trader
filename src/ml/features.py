@@ -17,6 +17,10 @@ import numpy as np
 import pandas as pd
 from typing import Optional
 
+from src.utils.logger import get_logger
+
+logger = get_logger(__name__)
+
 # Minimum bars needed before features are valid (due to rolling windows)
 MINIMUM_BARS_REQUIRED = 100
 
@@ -47,6 +51,17 @@ def _true_range(high: pd.Series, low: pd.Series, close: pd.Series) -> pd.Series:
         (high - prev_close).abs(),
         (low - prev_close).abs()
     ], axis=1).max(axis=1)
+
+
+def _count_trailing(x, value) -> int:
+    """Count trailing consecutive occurrences of value at end of array."""
+    count = 0
+    for i in range(len(x) - 1, -1, -1):
+        if x[i] == value:
+            count += 1
+        else:
+            break
+    return count
 
 
 def _ema(series: pd.Series, span: int) -> pd.Series:
@@ -86,6 +101,22 @@ def engineer_features(
         forward_bars: Lookahead bars for target computation.
         threshold: Return threshold for classification target.
     """
+    # Input validation
+    if df is None or len(df) == 0:
+        raise ValueError("Cannot engineer features from empty DataFrame")
+
+    required_cols = {'open', 'high', 'low', 'close', 'volume'}
+    missing = required_cols - set(c.lower() for c in df.columns)
+    if missing:
+        raise ValueError(f"Missing required columns: {missing}")
+
+    if len(df) < MINIMUM_BARS_REQUIRED:
+        logger.warning(
+            "ml.features.insufficient_bars",
+            bars=len(df),
+            minimum=MINIMUM_BARS_REQUIRED,
+        )
+
     df = df.copy()
 
     close = df['close']

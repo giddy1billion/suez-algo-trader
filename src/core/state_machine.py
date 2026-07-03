@@ -135,7 +135,7 @@ class TradeLifecycle:
         with self._lock:
             valid = list(_TRANSITIONS.get(self.state, set()))
             # ERROR is always reachable from non-terminal states
-            terminal = {TradeState.CLOSED, TradeState.CANCELLED, TradeState.EXPIRED, TradeState.ERROR}
+            terminal = {TradeState.CLOSED, TradeState.CANCELLED, TradeState.EXPIRED, TradeState.ERROR, TradeState.RISK_REJECTED}
             if self.state not in terminal:
                 valid.append(TradeState.ERROR)
             return valid
@@ -162,7 +162,7 @@ class TradeLifecycle:
     def _is_valid_transition(self, new_state: TradeState) -> bool:
         """Check if a transition is valid from the current state."""
         # ERROR is always reachable from non-terminal states
-        terminal = {TradeState.CLOSED, TradeState.CANCELLED, TradeState.EXPIRED, TradeState.ERROR}
+        terminal = {TradeState.CLOSED, TradeState.CANCELLED, TradeState.EXPIRED, TradeState.ERROR, TradeState.RISK_REJECTED}
         if new_state == TradeState.ERROR and self.state not in terminal:
             return True
 

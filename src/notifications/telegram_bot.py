@@ -70,6 +70,9 @@ _strategy = None
 _db = None
 _bot_paused = False
 _authorized_users: set[int] = set()
+_health_monitor = None
+_live_metrics = None
+_scheduler = None
 
 # Thread-safe lock for broker operations (broker is called from Telegram's async thread)
 import threading
@@ -110,9 +113,11 @@ def get_runtime_changes() -> dict:
         return changes
 
 
-def set_components(broker, engine, risk_manager, strategy, db=None, authorized_chat_ids: list[int] = None):
+def set_components(broker, engine, risk_manager, strategy, db=None, authorized_chat_ids: list[int] = None,
+                   health_monitor=None, live_metrics=None, scheduler=None):
     """Inject trading components into the bot module."""
     global _broker, _engine, _risk_manager, _strategy, _db, _authorized_users
+    global _health_monitor, _live_metrics, _scheduler
     _broker = broker
     _engine = engine
     _risk_manager = risk_manager
@@ -120,6 +125,12 @@ def set_components(broker, engine, risk_manager, strategy, db=None, authorized_c
     _db = db
     if authorized_chat_ids:
         _authorized_users = set(authorized_chat_ids)
+    if health_monitor:
+        _health_monitor = health_monitor
+    if live_metrics:
+        _live_metrics = live_metrics
+    if scheduler:
+        _scheduler = scheduler
 
 
 def _is_authorized(message: Message) -> bool:
@@ -2016,6 +2027,166 @@ async def cmd_journalstats(message: Message):
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# Health & Metrics Commands
+# ──────────────────────────────────────────────────────────────────────────
+
+@router.message(Command("health"))
+async def cmd_health(message: Message):
+    """Show full system health status."""
+    if not _is_authorized(message):
+        return
+
+    if not _health_monitor:
+        await message.answer("Health monitor not configured.")
+        return
+
+    try:
+        report = _health_monitor.check_all(
+            broker=_broker,
+            db=_db,
+            strategy=_strategy,
+            scheduler=_scheduler,
+        )
+
+        def _status_icon(component: dict) -> str:
+            s = component.get("status", "unknown")
+            if s == "ok":
+                return "✅"
+            elif s == "warning":
+                return "⚠️"
+            elif s == "error":
+                return "❌"
+            elif s == "not_configured":
+                return "⬜"
+            return "❓"
+
+        # System
+        sys_info = report["system"]
+        mem = sys_info.get('memory_mb')
+        mem_str = f"{mem:.0f}" if isinstance(mem, (int, float)) else "?"
+        sys_line = f"{_status_icon(sys_info)} System: CPU {sys_info.get('cpu_percent', '?')}%, RAM {mem_str}MB"
+
+        # Broker
+        br = report["broker"]
+        if br.get("status") == "not_configured":
+            br_line = "⬜ Broker: Not configured"
+        else:
+            latency = br.get("latency_ms", "?")
+            br_line = f"{_status_icon(br)} Broker: {'Connected' if br.get('connected') else 'Disconnected'} ({latency}ms)"
+
+        # Database
+        db_info = report["database"]
+        if db_info.get("status") == "not_configured":
+            db_line = "⬜ Database: Not configured"
+        else:
+            db_line = f"{_status_icon(db_info)} Database: OK ({db_info.get('size_mb', '?')}MB, {db_info.get('query_latency_ms', '?')}ms)"
+
+        # ML
+        ml = report["ml"]
+        if ml.get("status") == "not_configured":
+            ml_line = "⬜ ML Model: Not configured"
+        else:
+            loaded = "Loaded" if ml.get("model_loaded") else "Not loaded"
+            age = ml.get("model_age_hours")
+            age_str = f" ({age}h old)" if age else ""
+            ml_line = f"{_status_icon(ml)} ML Model: {loaded}{age_str}"
+
+        # Telegram
+        tg = report["telegram"]
+        if tg.get("status") == "not_configured":
+            tg_line = "⬜ Telegram: Not configured"
+        else:
+            polling = "Polling" if tg.get("polling_active") else "Idle"
+            tg_line = f"{_status_icon(tg)} Telegram: {polling}"
+
+        # Scheduler
+        sched = report["scheduler"]
+        if sched.get("status") == "not_configured":
+            sched_line = "⬜ Scheduler: Not configured"
+        else:
+            n_jobs = len(sched.get("next_jobs", []))
+            running = "active" if sched.get("running") else "stopped"
+            sched_line = f"{_status_icon(sched)} Scheduler: {n_jobs} jobs {running}"
+
+        text = (
+            f"<b>System Health</b>\n"
+            f"{'═' * 23}\n"
+            f"{sys_line}\n"
+            f"{br_line}\n"
+            f"{db_line}\n"
+            f"{ml_line}\n"
+            f"{tg_line}\n"
+            f"{sched_line}\n"
+        )
+
+        await message.answer(text, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        await message.answer(f"Health check error: {e}")
+
+
+@router.message(Command("metrics"))
+async def cmd_metrics(message: Message):
+    """Show live trading performance metrics."""
+    if not _is_authorized(message):
+        return
+
+    if not _live_metrics:
+        await message.answer("Live metrics not configured.")
+        return
+
+    try:
+        args = message.text.split()[1:]
+        period = 30
+        if args and args[0].isdigit():
+            period = int(args[0])
+
+        text = _live_metrics.get_summary_text(period_days=period)
+        await message.answer(text, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        await message.answer(f"Metrics error: {e}")
+
+
+@router.message(Command("uptime"))
+async def cmd_uptime(message: Message):
+    """Show bot uptime and start time."""
+    if not _is_authorized(message):
+        return
+
+    try:
+        if _health_monitor:
+            uptime_secs = _health_monitor.uptime_seconds
+        else:
+            uptime_secs = 0
+
+        # Format uptime
+        days = int(uptime_secs // 86400)
+        hours = int((uptime_secs % 86400) // 3600)
+        minutes = int((uptime_secs % 3600) // 60)
+
+        if days > 0:
+            uptime_str = f"{days}d {hours}h {minutes}m"
+        elif hours > 0:
+            uptime_str = f"{hours}h {minutes}m"
+        else:
+            uptime_str = f"{minutes}m"
+
+        start_time = _health_monitor._start_time.strftime("%Y-%m-%d %H:%M UTC") if _health_monitor else "unknown"
+        paused_str = "PAUSED" if _bot_paused else "ACTIVE"
+
+        text = (
+            f"<b>Bot Uptime</b>\n"
+            f"{'═' * 23}\n"
+            f"Status:  {paused_str}\n"
+            f"Uptime:  {uptime_str}\n"
+            f"Started: {start_time}\n"
+        )
+
+        await message.answer(text, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        await message.answer(f"Uptime error: {e}")
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # Callback Handlers (inline button confirmations)
 # ──────────────────────────────────────────────────────────────────────────
 
@@ -2025,8 +2196,15 @@ async def callback_confirm_buy(callback: CallbackQuery):
         await callback.answer("Unauthorized", show_alert=True)
         return
     parts = callback.data.split("|")
+    if len(parts) < 3:
+        await callback.answer("Invalid action data", show_alert=True)
+        return
     symbol = parts[1]
-    qty = float(parts[2])
+    try:
+        qty = float(parts[2])
+    except ValueError:
+        await callback.answer("Invalid quantity", show_alert=True)
+        return
 
     try:
         with _broker_lock:
@@ -2045,8 +2223,15 @@ async def callback_confirm_sell(callback: CallbackQuery):
         await callback.answer("Unauthorized", show_alert=True)
         return
     parts = callback.data.split("|")
+    if len(parts) < 3:
+        await callback.answer("Invalid action data", show_alert=True)
+        return
     symbol = parts[1]
-    qty = float(parts[2])
+    try:
+        qty = float(parts[2])
+    except ValueError:
+        await callback.answer("Invalid quantity", show_alert=True)
+        return
 
     try:
         with _broker_lock:
@@ -2091,6 +2276,9 @@ async def callback_confirm_closeall(callback: CallbackQuery):
 
 @router.callback_query(F.data == "cancel_order")
 async def callback_cancel(callback: CallbackQuery):
+    if callback.from_user.id not in _authorized_users:
+        await callback.answer("Unauthorized", show_alert=True)
+        return
     await callback.message.edit_text("Action cancelled.")
     await callback.answer()
 

@@ -60,6 +60,7 @@ class ExecutionEngine:
         self.dry_run = dry_run
         self.risk_engine = risk_engine or RiskEngine()
         self._last_cycle_time: Optional[datetime] = None
+        self._current_strategy_name: str = "unknown"
 
     # ──────────────────────────────────────────────────────────────────────
     # Main Loop
