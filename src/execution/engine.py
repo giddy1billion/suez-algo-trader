@@ -30,6 +30,19 @@ from src.core.state_machine import TradeState
 
 logger = get_logger(__name__)
 
+# Static sector map for known trading symbols. Used by PortfolioRiskLayer
+# for sector concentration checks. Extend as new symbols are added.
+_SECTOR_MAP = {
+    "AAPL": "technology", "MSFT": "technology", "GOOGL": "technology",
+    "AMZN": "technology", "NVDA": "technology", "META": "technology",
+    "TSLA": "consumer_discretionary", "AMD": "technology", "INTC": "technology",
+    "NFLX": "communication_services", "DIS": "communication_services",
+    "JPM": "financials", "BAC": "financials", "GS": "financials",
+    "JNJ": "healthcare", "UNH": "healthcare", "PFE": "healthcare",
+    "XOM": "energy", "CVX": "energy",
+    "WMT": "consumer_staples", "PG": "consumer_staples",
+}
+
 # Lazy-initialized trade journal (double-checked locking)
 _journal = None
 _journal_lock = threading.Lock()
@@ -278,7 +291,7 @@ class ExecutionEngine:
             cash = portfolio_value * 0.5
 
         # Build market_data context for risk engine
-        risk_market_data = {}
+        risk_market_data = {"sector_map": _SECTOR_MAP}
         if market_data and signal.symbol in market_data:
             df = market_data[signal.symbol]
             if len(df) > 0:
@@ -543,6 +556,10 @@ class ExecutionEngine:
                         self.broker.close_position(symbol)
                         pnl = pos.get('unrealized_pl', 0)
                         self.risk.record_trade({"symbol": symbol, "pnl": pnl})
+                        self.risk_engine.record_trade_result(
+                            pnl=pnl,
+                            portfolio_value=pos.get('market_value', 0) or 1,
+                        )
                         results.append({"action": "exit", "symbol": symbol, "pnl": pnl})
 
                         # Compute consistent PnL%
