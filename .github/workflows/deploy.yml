@@ -11,16 +11,15 @@ on:
         default: ""
 
 env:
-  ACR_NAME: ${{ secrets.ACR_NAME }}
   IMAGE_NAME: suez-algo-trader
-  RESOURCE_GROUP: ${{ secrets.AZURE_RESOURCE_GROUP }}
   CONTAINER_NAME: suez-algo-trader
 
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
     outputs:
-      image_tag: ${{ steps.meta.outputs.image_tag }}
+      image_tag: ${{ steps.export.outputs.image_tag }}
+      image_latest: ${{ steps.export.outputs.image_latest }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -31,42 +30,50 @@ jobs:
           creds: ${{ secrets.AZ_CREDENTIALS }}
 
       - name: Login to ACR
-        run: az acr login --name ${{ env.ACR_NAME }}
+        run: az acr login --name "${{ secrets.ACR_NAME }}"
 
       - name: Determine image tag
         id: meta
-        env:
-          ROLLBACK_SHA: ${{ github.event.inputs.rollback_sha }}
-          COMMIT_SHA: ${{ github.sha }}
-          REGISTRY: ${{ env.ACR_NAME }}
-          IMAGE: ${{ env.IMAGE_NAME }}
         run: |
-          SHA="${ROLLBACK_SHA:-${COMMIT_SHA}}"
+          REGISTRY="${{ secrets.ACR_NAME }}"
+          IMAGE="${{ env.IMAGE_NAME }}"
+          SHA="${{ github.event.inputs.rollback_sha || github.sha }}"
+
+          if [ -z "${REGISTRY}" ]; then
+            echo "::error::ACR_NAME secret is not set"
+            exit 1
+          fi
+          if [ -z "${SHA}" ]; then
+            SHA="${{ github.sha }}"
+          fi
+
           IMAGE_TAG="${REGISTRY}.azurecr.io/${IMAGE}:${SHA}"
           IMAGE_LATEST="${REGISTRY}.azurecr.io/${IMAGE}:latest"
 
           echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
           echo "image_latest=${IMAGE_LATEST}" >> "$GITHUB_OUTPUT"
-          echo "Resolved: image_tag=${IMAGE_TAG}"
+          echo "::notice::Resolved image_tag=${IMAGE_TAG}"
 
-      - name: Validate meta outputs
-        env:
-          TAG: ${{ steps.meta.outputs.image_tag }}
+      - name: Export outputs
+        id: export
         run: |
-          if [ -z "${TAG}" ]; then
-            echo "::error::steps.meta.outputs.image_tag is empty"
+          echo "image_tag=${{ steps.meta.outputs.image_tag }}" >> "$GITHUB_OUTPUT"
+          echo "image_latest=${{ steps.meta.outputs.image_latest }}" >> "$GITHUB_OUTPUT"
+
+      - name: Validate outputs
+        run: |
+          echo "meta.image_tag=${{ steps.meta.outputs.image_tag }}"
+          echo "export.image_tag=${{ steps.export.outputs.image_tag }}"
+          if [ -z "${{ steps.export.outputs.image_tag }}" ]; then
+            echo "::error::image_tag is empty after export"
             exit 1
           fi
-          echo "Validated: ${TAG}"
 
       - name: Build and push image
-        env:
-          IMAGE_TAG: ${{ steps.meta.outputs.image_tag }}
-          IMAGE_LATEST: ${{ steps.meta.outputs.image_latest }}
         run: |
-          docker build -t "${IMAGE_TAG}" -t "${IMAGE_LATEST}" .
-          docker push "${IMAGE_TAG}"
-          docker push "${IMAGE_LATEST}"
+          docker build -t "${{ steps.export.outputs.image_tag }}" -t "${{ steps.export.outputs.image_latest }}" .
+          docker push "${{ steps.export.outputs.image_tag }}"
+          docker push "${{ steps.export.outputs.image_latest }}"
 
   deploy:
     needs: build-and-push
@@ -77,39 +84,36 @@ jobs:
         with:
           creds: ${{ secrets.AZ_CREDENTIALS }}
 
-      - name: Validate image output
-        env:
-          IMAGE_TAG: ${{ needs.build-and-push.outputs.image_tag }}
+      - name: Validate image tag
         run: |
+          IMAGE_TAG="${{ needs.build-and-push.outputs.image_tag }}"
+          echo "Received image_tag=${IMAGE_TAG}"
           if [ -z "${IMAGE_TAG}" ]; then
-            echo "::error::Image tag output is empty"
+            echo "::error::Image tag output is empty from build job"
             exit 1
           fi
-          echo "Deploying image: ${IMAGE_TAG}"
 
       - name: Deploy to Azure Container Instances
-        env:
-          IMAGE_TAG: ${{ needs.build-and-push.outputs.image_tag }}
         run: |
           az container create \
-            --resource-group ${{ env.RESOURCE_GROUP }} \
-            --name ${{ env.CONTAINER_NAME }} \
-            --image "${IMAGE_TAG}" \
-            --registry-login-server ${{ env.ACR_NAME }}.azurecr.io \
-            --registry-username ${{ secrets.ACR_USERNAME }} \
-            --registry-password ${{ secrets.ACR_PASSWORD }} \
+            --resource-group "${{ secrets.AZURE_RESOURCE_GROUP }}" \
+            --name "${{ env.CONTAINER_NAME }}" \
+            --image "${{ needs.build-and-push.outputs.image_tag }}" \
+            --registry-login-server "${{ secrets.ACR_NAME }}.azurecr.io" \
+            --registry-username "${{ secrets.ACR_USERNAME }}" \
+            --registry-password "${{ secrets.ACR_PASSWORD }}" \
             --cpu 1 --memory 2 \
             --restart-policy Always \
             --secure-environment-variables \
-              TRADING_MODE=${{ secrets.TRADING_MODE }} \
-              ALPACA_PAPER_API_KEY=${{ secrets.ALPACA_PAPER_API_KEY }} \
-              ALPACA_PAPER_SECRET_KEY=${{ secrets.ALPACA_PAPER_SECRET_KEY }} \
-              ALPACA_LIVE_API_KEY=${{ secrets.ALPACA_LIVE_API_KEY }} \
-              ALPACA_LIVE_SECRET_KEY=${{ secrets.ALPACA_LIVE_SECRET_KEY }} \
-              TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }} \
-              TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }} \
-            --log-analytics-workspace ${{ secrets.LOG_ANALYTICS_WORKSPACE_ID }} \
-            --log-analytics-workspace-key ${{ secrets.LOG_ANALYTICS_WORKSPACE_KEY }} \
+              TRADING_MODE="${{ secrets.TRADING_MODE }}" \
+              ALPACA_PAPER_API_KEY="${{ secrets.ALPACA_PAPER_API_KEY }}" \
+              ALPACA_PAPER_SECRET_KEY="${{ secrets.ALPACA_PAPER_SECRET_KEY }}" \
+              ALPACA_LIVE_API_KEY="${{ secrets.ALPACA_LIVE_API_KEY }}" \
+              ALPACA_LIVE_SECRET_KEY="${{ secrets.ALPACA_LIVE_SECRET_KEY }}" \
+              TELEGRAM_BOT_TOKEN="${{ secrets.TELEGRAM_BOT_TOKEN }}" \
+              TELEGRAM_CHAT_ID="${{ secrets.TELEGRAM_CHAT_ID }}" \
+            --log-analytics-workspace "${{ secrets.LOG_ANALYTICS_WORKSPACE_ID }}" \
+            --log-analytics-workspace-key "${{ secrets.LOG_ANALYTICS_WORKSPACE_KEY }}" \
             --command-line "python main.py --telegram --interval 60"
 
       - name: Wait for container to start
@@ -118,8 +122,8 @@ jobs:
       - name: Verify deployment
         run: |
           STATE=$(az container show \
-            --resource-group ${{ env.RESOURCE_GROUP }} \
-            --name ${{ env.CONTAINER_NAME }} \
+            --resource-group "${{ secrets.AZURE_RESOURCE_GROUP }}" \
+            --name "${{ env.CONTAINER_NAME }}" \
             --query "instanceView.state" -o tsv)
 
           echo "Container state: $STATE"
@@ -128,13 +132,13 @@ jobs:
             echo "::error::Container failed to start. State: $STATE"
             echo "--- Container logs ---"
             az container logs \
-              --resource-group ${{ env.RESOURCE_GROUP }} \
-              --name ${{ env.CONTAINER_NAME }} || true
+              --resource-group "${{ secrets.AZURE_RESOURCE_GROUP }}" \
+              --name "${{ env.CONTAINER_NAME }}" || true
             exit 1
           fi
 
           az container show \
-            --resource-group ${{ env.RESOURCE_GROUP }} \
-            --name ${{ env.CONTAINER_NAME }} \
+            --resource-group "${{ secrets.AZURE_RESOURCE_GROUP }}" \
+            --name "${{ env.CONTAINER_NAME }}" \
             --query "{Status:instanceView.state, Image:containers[0].image, StartTime:containers[0].instanceView.currentState.startTime}" \
             --output table
