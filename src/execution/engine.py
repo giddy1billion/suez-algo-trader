@@ -30,6 +30,19 @@ from src.core.state_machine import TradeState
 
 logger = get_logger(__name__)
 
+# Static sector map for known trading symbols. Used by PortfolioRiskLayer
+# for sector concentration checks. Extend as new symbols are added.
+_SECTOR_MAP = {
+    "AAPL": "technology", "MSFT": "technology", "GOOGL": "technology",
+    "AMZN": "technology", "NVDA": "technology", "META": "technology",
+    "TSLA": "consumer_discretionary", "AMD": "technology", "INTC": "technology",
+    "NFLX": "communication_services", "DIS": "communication_services",
+    "JPM": "financials", "BAC": "financials", "GS": "financials",
+    "JNJ": "healthcare", "UNH": "healthcare", "PFE": "healthcare",
+    "XOM": "energy", "CVX": "energy",
+    "WMT": "consumer_staples", "PG": "consumer_staples",
+}
+
 # Lazy-initialized trade journal (double-checked locking)
 _journal = None
 _journal_lock = threading.Lock()
@@ -79,6 +92,7 @@ class ExecutionEngine:
         self.risk_engine = risk_engine or RiskEngine()
         self._last_cycle_time: Optional[datetime] = None
         self._current_strategy_name: str = "unknown"
+        self._current_capital_weight: float = 1.0
         self._cycle_count: int = 0
 
         # Event-driven components (optional but recommended)
@@ -103,7 +117,7 @@ class ExecutionEngine:
     # Main Loop
     # ──────────────────────────────────────────────────────────────────────
 
-    def run_cycle(self, strategy: BaseStrategy) -> list[dict]:
+    def run_cycle(self, strategy: BaseStrategy, capital_weight: float = 1.0) -> list[dict]:
         """
         Execute one complete trading cycle:
         1. Fetch data for all symbols
@@ -111,9 +125,15 @@ class ExecutionEngine:
         3. Filter through risk manager
         4. Execute orders
         5. Log everything
+
+        Args:
+            strategy: The strategy to run.
+            capital_weight: Normalized capital allocation weight (0-1). Applied as
+                a multiplier on computed position size.
         """
         self._last_cycle_time = datetime.now()
         self._current_strategy_name = strategy.name
+        self._current_capital_weight = max(0.0, min(1.0, capital_weight))
         results = []
 
         # 1. Check if trading is allowed
@@ -250,6 +270,12 @@ class ExecutionEngine:
                 self._log_signal(signal, executed=False)
                 return None
 
+        # Apply capital allocation weight from orchestrator
+        if self._current_capital_weight < 1.0:
+            qty *= self._current_capital_weight
+            if qty <= 0:
+                return None
+
         # Build TradeRequest for the new risk engine
         trade_request = TradeRequest(
             symbol=signal.symbol,
@@ -278,15 +304,15 @@ class ExecutionEngine:
             cash = portfolio_value * 0.5
 
         # Build market_data context for risk engine
-        risk_market_data = {}
+        risk_market_data = {"sector_map": _SECTOR_MAP}
         if market_data and signal.symbol in market_data:
             df = market_data[signal.symbol]
             if len(df) > 0:
-                risk_market_data = {
+                risk_market_data.update({
                     "volume": float(df['volume'].iloc[-1]) if 'volume' in df.columns else 0,
                     "adv": float(df['volume'].rolling(20).mean().iloc[-1]) if 'volume' in df.columns else 0,
                     "daily_vol": float(df['close'].pct_change().rolling(20).std().iloc[-1]) if len(df) > 20 else 0,
-                }
+                })
 
         # Evaluate through the multi-layer risk engine (fail-closed: reject on exception)
         try:
@@ -543,6 +569,10 @@ class ExecutionEngine:
                         self.broker.close_position(symbol)
                         pnl = pos.get('unrealized_pl', 0)
                         self.risk.record_trade({"symbol": symbol, "pnl": pnl})
+                        self.risk_engine.record_trade_result(
+                            pnl=pnl,
+                            portfolio_value=pos.get('market_value', 0) or 1,
+                        )
                         results.append({"action": "exit", "symbol": symbol, "pnl": pnl})
 
                         # Compute consistent PnL%

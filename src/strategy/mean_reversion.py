@@ -33,6 +33,7 @@ class MeanReversionStrategy(BaseStrategy):
         rsi_period: int = 14,
         atr_period: int = 14,
         atr_sl_multiplier: float = 1.5,
+        min_confidence: float = 0.60,
     ):
         super().__init__(name="mean_reversion", symbols=symbols, timeframe=timeframe, lookback=lookback)
 
@@ -42,6 +43,7 @@ class MeanReversionStrategy(BaseStrategy):
         self.rsi_period = rsi_period
         self.atr_period = atr_period
         self.atr_sl_multiplier = atr_sl_multiplier
+        self.min_confidence = min_confidence
 
     def calculate_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         """Calculate Bollinger Bands, Z-score, RSI, ATR."""
@@ -121,7 +123,8 @@ class MeanReversionStrategy(BaseStrategy):
             reasons.append(f"Z-score={zscore:.2f} (below -{self.zscore_threshold})")
             reasons.append(f"RSI={rsi:.0f} (oversold)")
             stop_loss = price - (atr * self.atr_sl_multiplier)
-            take_profit = latest['sma']  # Target the mean
+            # Target the mean, but guard against take_profit below entry
+            take_profit = max(latest['sma'], price * 1.001)
 
         # SELL signal: price above upper band + overbought RSI
         elif zscore >= self.zscore_threshold and rsi > 65:
@@ -130,12 +133,20 @@ class MeanReversionStrategy(BaseStrategy):
             reasons.append(f"Z-score={zscore:.2f} (above +{self.zscore_threshold})")
             reasons.append(f"RSI={rsi:.0f} (overbought)")
             stop_loss = price + (atr * self.atr_sl_multiplier)
-            take_profit = latest['sma']  # Target the mean
+            # Target the mean, but guard against take_profit above entry
+            take_profit = min(latest['sma'], price * 0.999)
 
         else:
             return TradeSignal(
                 symbol=symbol, signal=Signal.HOLD, confidence=0.0,
                 price=price, reason="No mean reversion setup"
+            )
+
+        # Gate on min_confidence — reject marginal setups
+        if confidence < self.min_confidence:
+            return TradeSignal(
+                symbol=symbol, signal=Signal.HOLD, confidence=confidence,
+                price=price, reason=f"Confidence {confidence:.2f} below min {self.min_confidence:.2f}"
             )
 
         return TradeSignal(

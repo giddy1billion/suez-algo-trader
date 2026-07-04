@@ -188,6 +188,9 @@ class StrategyOrchestrator:
         if not due:
             return []
 
+        # Compute normalized weights for capital allocation
+        weights = self.get_weights()
+
         all_results = []
         for slot in due:
             try:
@@ -195,7 +198,8 @@ class StrategyOrchestrator:
                 slot.strategy.symbols = slot.symbols
                 slot.strategy.timeframe = slot.timeframe
 
-                results = engine.run_cycle(slot.strategy)
+                capital_weight = weights.get(slot.name, 1.0)
+                results = engine.run_cycle(slot.strategy, capital_weight=capital_weight)
                 signal_count = len(slot.strategy.symbols)  # approximate
                 slot.record_cycle(signal_count, results)
 

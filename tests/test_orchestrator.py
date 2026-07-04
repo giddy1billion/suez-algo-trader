@@ -199,7 +199,7 @@ class TestStrategyOrchestrator:
         results = orchestrator.run_due_strategies(mock_engine)
         assert len(results) == 1
         assert results[0]["_strategy"] == "momentum"
-        mock_engine.run_cycle.assert_called_once_with(mock_strategy)
+        mock_engine.run_cycle.assert_called_once_with(mock_strategy, capital_weight=1.0)
 
     def test_run_due_strategies_empty(self, orchestrator, mock_engine):
         # No strategies registered
