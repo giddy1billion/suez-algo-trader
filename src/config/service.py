@@ -14,6 +14,8 @@ from typing import Any, Optional
 
 from src.config.models import SystemConfiguration
 from src.config.repository import ConfigurationRepository
+from src.config.events import ConfigEventBus, ConfigurationChangedEvent
+from src.config.lock import ConfigurationLock
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -42,6 +44,8 @@ class ConfigurationService:
         repository: ConfigurationRepository,
         refresh_interval_seconds: int = 60,
         auto_refresh: bool = True,
+        event_bus: Optional[ConfigEventBus] = None,
+        config_lock: Optional[ConfigurationLock] = None,
     ):
         self._repo = repository
         self._cache: dict[str, dict[str, Any]] = {}  # {category: {key: parsed_value}}
@@ -52,6 +56,8 @@ class ConfigurationService:
         self._refresh_thread: Optional[threading.Thread] = None
         self._running = False
         self._callbacks: list = []
+        self._event_bus = event_bus or ConfigEventBus()
+        self._config_lock = config_lock or ConfigurationLock()
 
         # Initial load
         self.refresh()
@@ -175,9 +181,19 @@ class ConfigurationService:
         """
         Update a configuration value.
 
-        Validates, persists to DB, updates cache, and notifies listeners.
+        Validates, persists to DB, updates cache, emits events, and notifies listeners.
         Returns True on success.
         """
+        # Check configuration lock
+        if not self._config_lock.can_modify(changed_by):
+            logger.warning(
+                "config_service.locked",
+                category=category,
+                key=key,
+                user=changed_by,
+            )
+            return False
+
         # Auto-detect value type if not provided
         if value_type is None:
             value_type = self._detect_type(value)
@@ -207,6 +223,9 @@ class ConfigurationService:
             )
             return False
 
+        # Capture old value for event
+        old_value = existing.value if existing else None
+
         # Persist to database
         self._repo.set(
             category=category,
@@ -225,7 +244,19 @@ class ConfigurationService:
                 self._cache[category] = {}
             self._cache[category][key] = self._parse_value(str_value, value_type)
 
-        # Notify listeners
+        # Emit structured change event (for distributed invalidation)
+        new_version = (existing.version + 1) if existing else 1
+        self._event_bus.emit(
+            category=category,
+            key=key,
+            old_value=old_value,
+            new_value=str_value,
+            updated_by=changed_by,
+            version=new_version,
+            change_reason=change_reason,
+        )
+
+        # Notify legacy listeners
         self._notify_change(category, key, value)
 
         logger.info(
@@ -321,6 +352,16 @@ class ConfigurationService:
         self._running = False
         if self._refresh_thread and self._refresh_thread.is_alive():
             self._refresh_thread.join(timeout=5)
+
+    @property
+    def event_bus(self) -> ConfigEventBus:
+        """Access the configuration event bus."""
+        return self._event_bus
+
+    @property
+    def config_lock(self) -> ConfigurationLock:
+        """Access the configuration lock."""
+        return self._config_lock
 
     @property
     def last_refresh(self) -> Optional[datetime]:
