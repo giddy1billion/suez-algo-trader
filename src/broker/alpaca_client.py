@@ -202,6 +202,21 @@ class AlpacaBroker:
     def name(self) -> str:
         return "alpaca"
 
+    @property
+    def capabilities(self):
+        """Alpaca broker capabilities."""
+        from src.broker.base import BrokerCapabilities
+        return BrokerCapabilities(
+            supports_fractional=True,
+            supports_shorting=True,
+            supports_options=False,
+            supports_crypto=True,
+            supports_extended_hours=True,
+            supports_bracket_orders=True,
+            supports_notional_orders=True,
+            supports_stop_limit=True,
+        )
+
     @staticmethod
     def _normalize_symbol_for_position(symbol: str) -> str:
         """Normalize crypto symbols for position API calls (BTC/USD → BTCUSD)."""
@@ -296,8 +311,9 @@ class AlpacaBroker:
     # ──────────────────────────────────────────────────────────────────────
 
     @_retry()
-    def market_order(self, symbol: str, qty: float, side: str, time_in_force: str = "day") -> dict:
-        """Place a market order."""
+    def market_order(self, symbol: str, qty: float, side: str, time_in_force: str = "day",
+                     client_order_id: Optional[str] = None) -> dict:
+        """Place a market order with optional idempotency key."""
         try:
             order_side = OrderSide.BUY if side.lower() == "buy" else OrderSide.SELL
             tif = self._parse_time_in_force(time_in_force)
@@ -307,6 +323,7 @@ class AlpacaBroker:
                 qty=qty,
                 side=order_side,
                 time_in_force=tif,
+                client_order_id=client_order_id,
             )
             order = self._call(self.trading_client.submit_order, request)
             logger.info("order.submitted", symbol=symbol, side=side, qty=qty, type="market", order_id=str(order.id))

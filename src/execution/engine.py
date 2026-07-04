@@ -439,6 +439,11 @@ class ExecutionEngine:
         if trade_lifecycle:
             trade_lifecycle.transition(TradeState.SUBMITTED, "order submitted to broker")
 
+        # Generate idempotent client_order_id to prevent duplicate executions
+        import hashlib
+        _idempotency_seed = f"{signal.symbol}:{side}:{final_qty}:{signal.price}:{self._cycle_count}"
+        client_order_id = hashlib.sha256(_idempotency_seed.encode()).hexdigest()[:32]
+
         # Place the order
         try:
             if signal.stop_loss and signal.take_profit:
@@ -454,6 +459,7 @@ class ExecutionEngine:
                     symbol=signal.symbol,
                     qty=final_qty,
                     side=side,
+                    client_order_id=client_order_id,
                 )
 
             # Publish OrderSubmitted event

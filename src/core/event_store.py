@@ -23,6 +23,7 @@ from src.core.events import (
     RiskEvaluated,
     RiskHalt,
     SchedulerEvent,
+    SCHEMA_VERSION,
     SignalGenerated,
     SystemHealth,
     TradeClosed,
@@ -96,6 +97,7 @@ class EventStore:
         self._conn.execute("PRAGMA synchronous=NORMAL")
 
         self._create_tables()
+        self._run_migrations()
         logger.info("EventStore initialized", db_path=db_path, session_id=self.session_id)
 
     def _create_tables(self) -> None:
@@ -108,7 +110,8 @@ class EventStore:
                 timestamp TEXT NOT NULL,
                 source TEXT DEFAULT '',
                 payload TEXT NOT NULL,
-                session_id TEXT NOT NULL
+                session_id TEXT NOT NULL,
+                schema_version TEXT NOT NULL DEFAULT '1.0.0'
             )
         """)
         self._conn.execute("""
@@ -123,19 +126,59 @@ class EventStore:
         self._conn.execute("""
             CREATE UNIQUE INDEX IF NOT EXISTS idx_events_event_id ON events(event_id)
         """)
+        # Metadata table for tracking store schema migrations
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS event_store_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
         self._conn.commit()
 
+    def _run_migrations(self) -> None:
+        """Run database migrations to ensure schema is up-to-date."""
+        current_version = self._get_meta("db_schema_version") or "0"
+
+        if int(current_version) < 1:
+            # Migration 1: Add schema_version column if missing (for pre-existing DBs)
+            try:
+                self._conn.execute("ALTER TABLE events ADD COLUMN schema_version TEXT NOT NULL DEFAULT '1.0.0'")
+            except sqlite3.OperationalError:
+                pass  # Column already exists
+            self._set_meta("db_schema_version", "1")
+
+        self._set_meta("current_event_schema_version", SCHEMA_VERSION)
+        self._conn.commit()
+
+    def _get_meta(self, key: str) -> Optional[str]:
+        """Get a metadata value."""
+        cursor = self._conn.execute(
+            "SELECT value FROM event_store_meta WHERE key = ?", (key,)
+        )
+        row = cursor.fetchone()
+        return row[0] if row else None
+
+    def _set_meta(self, key: str, value: str) -> None:
+        """Set a metadata value."""
+        self._conn.execute(
+            "INSERT OR REPLACE INTO event_store_meta (key, value, updated_at) VALUES (?, ?, ?)",
+            (key, value, datetime.now(timezone.utc).isoformat()),
+        )
+
     def persist(self, event: Event) -> None:
-        """Persist an event to the database. Deduplicates by event_id."""
+        """Persist an event to the database. Deduplicates by event_id. Append-only."""
         try:
             data = event.to_dict()
             event_type = data.pop("_type", type(event).__name__)
+            event_schema_version = data.pop("_schema_version", SCHEMA_VERSION)
             payload_json = json.dumps(data, default=str)
 
             with self._lock:
                 self._conn.execute(
-                    """INSERT OR IGNORE INTO events (event_type, event_id, timestamp, source, payload, session_id)
-                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    """INSERT OR IGNORE INTO events
+                       (event_type, event_id, timestamp, source, payload, session_id, schema_version)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
                     (
                         event_type,
                         event.event_id,
@@ -143,6 +186,7 @@ class EventStore:
                         event.source,
                         payload_json,
                         self.session_id,
+                        event_schema_version,
                     ),
                 )
                 self._conn.commit()
@@ -218,17 +262,71 @@ class EventStore:
                 cursor = self._conn.execute("SELECT COUNT(*) FROM events")
             return cursor.fetchone()[0]
 
-    def cleanup_old_events(self, days: int = 30) -> None:
-        """Delete events older than N days."""
+    def cleanup_old_events(self, days: int = 30) -> int:
+        """Archive events older than N days to maintain store size.
+
+        Events are moved to an archive table (append-only) rather than deleted,
+        preserving the full audit trail. Returns count of archived events.
+        """
         cutoff = datetime.now(timezone.utc) - timedelta(days=days)
         cutoff_str = cutoff.isoformat()
         with self._lock:
+            # Ensure archive table exists
+            self._conn.execute("""
+                CREATE TABLE IF NOT EXISTS events_archive (
+                    id INTEGER PRIMARY KEY,
+                    event_type TEXT NOT NULL,
+                    event_id TEXT NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    source TEXT DEFAULT '',
+                    payload TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    schema_version TEXT NOT NULL DEFAULT '1.0.0',
+                    archived_at TEXT NOT NULL
+                )
+            """)
+            # Move old events to archive
+            self._conn.execute(
+                """INSERT OR IGNORE INTO events_archive
+                   (id, event_type, event_id, timestamp, source, payload, session_id, schema_version, archived_at)
+                   SELECT id, event_type, event_id, timestamp, source, payload, session_id,
+                          COALESCE(schema_version, '1.0.0'), ?
+                   FROM events WHERE timestamp < ?""",
+                (datetime.now(timezone.utc).isoformat(), cutoff_str),
+            )
+            cursor = self._conn.execute(
+                "SELECT COUNT(*) FROM events WHERE timestamp < ?",
+                (cutoff_str,),
+            )
+            archived_count = cursor.fetchone()[0]
             self._conn.execute(
                 "DELETE FROM events WHERE timestamp < ?",
                 (cutoff_str,),
             )
             self._conn.commit()
-        logger.info("Cleaned up events older than %d days", days)
+        logger.info("event_store.retention", archived=archived_count, retention_days=days)
+        return archived_count
+
+    def get_store_stats(self) -> dict:
+        """Get event store statistics for monitoring memory growth."""
+        with self._lock:
+            cursor = self._conn.execute("SELECT COUNT(*) FROM events")
+            total_events = cursor.fetchone()[0]
+            cursor = self._conn.execute(
+                "SELECT MIN(timestamp), MAX(timestamp) FROM events"
+            )
+            row = cursor.fetchone()
+            # DB size
+            cursor = self._conn.execute("PRAGMA page_count")
+            page_count = cursor.fetchone()[0]
+            cursor = self._conn.execute("PRAGMA page_size")
+            page_size = cursor.fetchone()[0]
+        return {
+            "total_events": total_events,
+            "earliest_event": row[0] if row else None,
+            "latest_event": row[1] if row else None,
+            "db_size_bytes": page_count * page_size,
+        }
 
     def close(self) -> None:
         """Close the database connection."""

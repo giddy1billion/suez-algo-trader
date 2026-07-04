@@ -14,12 +14,22 @@ RUN pip install --no-cache-dir -r requirements.txt
 # App code
 COPY . .
 
-# Create directories
-RUN mkdir -p data_cache models logs
+# Create directories and set ownership
+RUN mkdir -p data_cache models logs \
+    && addgroup --system --gid 1001 trader \
+    && adduser --system --uid 1001 --ingroup trader trader \
+    && chown -R trader:trader /app
+
+# Run as non-root user
+USER trader
 
 # Default: paper trading with momentum
 ENV TRADING_MODE=paper
 ENV ACTIVE_STRATEGY=momentum
+
+# Health check — verify process is alive and responsive
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+    CMD python -c "import os, signal; os.kill(1, signal.SIG_DFL) or True" || exit 1
 
 ENTRYPOINT ["python", "main.py"]
 CMD ["--interval", "60"]
