@@ -1234,7 +1234,11 @@ async def cmd_backtest(message: Message):
             if not _BT_AVAILABLE:
                 raise ImportError("backtrader not installed")
 
-            metrics = run_backtrader_backtest(df, initial_cash=10000.0)
+            import asyncio
+            loop = asyncio.get_event_loop()
+            metrics = await loop.run_in_executor(
+                None, lambda: run_backtrader_backtest(df, initial_cash=10000.0)
+            )
             text = (
                 f"<b>Backtest Results: {symbol}</b>\n"
                 f"{'=' * 30}\n"
@@ -1304,6 +1308,7 @@ async def cmd_train(message: Message):
     try:
         from src.strategy.ml_strategy import MLStrategy
         from config.settings import settings
+        import asyncio
 
         strategy = MLStrategy(
             symbols=symbols,
@@ -1324,7 +1329,9 @@ async def cmd_train(message: Message):
             await message.answer("Insufficient data for training. Need 200+ bars per symbol.")
             return
 
-        strategy.train(training_data)
+        # Run training in thread executor to avoid blocking the event loop
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, strategy.train, training_data)
 
         # Trigger strategy reload in main loop
         with _runtime_lock:
@@ -1365,8 +1372,12 @@ async def cmd_backtest_vbt(message: Message):
         try:
             from backtesting.vbt_adapter import vectorbt_momentum_backtest, vectorbt_parameter_sweep
             from config.settings import settings
+            import asyncio
 
-            metrics = vectorbt_momentum_backtest(df, initial_cash=settings.backtest_initial_cash)
+            loop = asyncio.get_event_loop()
+            metrics = await loop.run_in_executor(
+                None, lambda: vectorbt_momentum_backtest(df, initial_cash=settings.backtest_initial_cash)
+            )
             text = (
                 f"<b>VectorBT Results: {symbol}</b>\n"
                 f"{'=' * 30}\n"
@@ -1383,7 +1394,7 @@ async def cmd_backtest_vbt(message: Message):
 
             # Quick parameter sweep (top 3)
             try:
-                sweep_df = vectorbt_parameter_sweep(df)
+                sweep_df = await loop.run_in_executor(None, vectorbt_parameter_sweep, df)
                 if sweep_df is not None and len(sweep_df) > 0:
                     top = sweep_df.sort_values('total_return', ascending=False).head(3)
                     text += f"\n<b>Top 3 Param Combos:</b>\n"
@@ -1425,7 +1436,9 @@ async def cmd_sweep(message: Message):
             return
 
         from backtesting.vbt_adapter import vectorbt_parameter_sweep
-        sweep_df = vectorbt_parameter_sweep(df)
+        import asyncio
+        loop = asyncio.get_event_loop()
+        sweep_df = await loop.run_in_executor(None, vectorbt_parameter_sweep, df)
 
         if sweep_df is None or len(sweep_df) == 0:
             await message.answer("Sweep produced no results.")
@@ -1573,7 +1586,10 @@ async def cmd_predict(message: Message):
 
         # Predict
         import numpy as np
-        proba = ml_strat.model.predict_proba(features)[0]
+        import asyncio
+        loop = asyncio.get_event_loop()
+        proba = await loop.run_in_executor(None, ml_strat.model.predict_proba, features)
+        proba = proba[0]
         pred_class = np.argmax(proba)
         confidence = proba[pred_class]
 
