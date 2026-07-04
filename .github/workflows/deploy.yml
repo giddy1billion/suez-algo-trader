@@ -20,9 +20,9 @@ jobs:
   build-and-push:
     runs-on: ubuntu-latest
     outputs:
-      image-tag: ${{ steps.meta.outputs.image_tag }}
+      image_tag: ${{ steps.meta.outputs.image_tag }}
     steps:
-      - name: Checkout code0
+      - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Azure Login
@@ -55,12 +55,20 @@ jobs:
         with:
           creds: ${{ secrets.AZ_CREDENTIALS }}
 
+      - name: Validate image output
+        run: |
+          if [ -z "${{ needs.build-and-push.outputs.image_tag }}" ]; then
+            echo "::error::Image tag output is empty"
+            exit 1
+          fi
+          echo "Deploying image: ${{ needs.build-and-push.outputs.image_tag }}"
+
       - name: Deploy to Azure Container Instances
         run: |
           az container create \
             --resource-group ${{ env.RESOURCE_GROUP }} \
             --name ${{ env.CONTAINER_NAME }} \
-            --image ${{ needs.build-and-push.outputs.image-tag }} \
+            --image ${{ needs.build-and-push.outputs.image_tag }} \
             --registry-login-server ${{ env.ACR_NAME }}.azurecr.io \
             --registry-username ${{ secrets.ACR_USERNAME }} \
             --registry-password ${{ secrets.ACR_PASSWORD }} \
