@@ -96,6 +96,7 @@ def create_strategy(name: str, symbols: list[str], timeframe: str, lookback: int
         ),
         "mean_reversion": lambda: MeanReversionStrategy(
             symbols=symbols, timeframe=timeframe, lookback=lookback,
+            min_confidence=settings.mean_rev_min_confidence,
         ),
         "ml": lambda: MLStrategy(
             symbols=symbols, timeframe=timeframe, lookback=max(lookback, 500),

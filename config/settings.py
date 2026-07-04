@@ -80,6 +80,7 @@ class Settings(BaseSettings):
     mean_rev_zscore_entry: float = 2.0
     mean_rev_zscore_exit: float = 0.5
     mean_rev_rsi_period: int = 14
+    mean_rev_min_confidence: float = 0.60
 
     # --- ML ---
     ml_model_path: str = "models/latest_model.joblib"
