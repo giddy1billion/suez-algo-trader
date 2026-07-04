@@ -115,7 +115,13 @@ class JournalSubscriber:
 
 
 class MetricsSubscriber:
-    """Listens for TradeClosed events and updates running performance metrics."""
+    """DEPRECATED: Prefer PerformanceProjection in ReadModelManager.
+
+    Kept for backward-compatibility with tests and code that reads
+    `.to_dict()` or `.win_rate`. No longer registered by default in
+    setup_default_subscribers (ReadModelManager.performance already
+    handles TradeClosed → metrics).
+    """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -359,12 +365,10 @@ def setup_default_subscribers(
     """
     audit = AuditSubscriber(audit_logger)
     journal = JournalSubscriber()
-    metrics = MetricsSubscriber()
     notifications = NotificationSubscriber(notification_send_func)
 
     audit.register(bus)
     journal.register(bus)
-    metrics.register(bus)
     notifications.register(bus)
 
     logger.info("Default event subscribers registered (%d handlers)", bus.subscriber_count)
@@ -372,6 +376,5 @@ def setup_default_subscribers(
     return {
         "audit": audit,
         "journal": journal,
-        "metrics": metrics,
         "notifications": notifications,
     }

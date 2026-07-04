@@ -24,13 +24,13 @@ SCHEMA_VERSION = "1.0.0"
 # Base Event
 # ---------------------------------------------------------------------------
 
-@dataclass
+@dataclass(frozen=True)
 class Event:
-    """Base event with timestamp and metadata."""
+    """Base event with timestamp and metadata. Immutable after creation."""
 
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     source: str = ""
-    event_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
+    event_id: str = field(default_factory=lambda: uuid.uuid4().hex)
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize event to a dictionary."""
@@ -58,7 +58,7 @@ class Event:
 # Signal & Risk Events
 # ---------------------------------------------------------------------------
 
-@dataclass
+@dataclass(frozen=True)
 class SignalGenerated(Event):
     """Emitted when a strategy generates a trade signal."""
 
@@ -70,7 +70,7 @@ class SignalGenerated(Event):
     indicators: dict[str, Any] = field(default_factory=dict)
 
 
-@dataclass
+@dataclass(frozen=True)
 class RiskEvaluated(Event):
     """Emitted after risk management evaluates a signal."""
 
@@ -85,7 +85,7 @@ class RiskEvaluated(Event):
 # Order Events
 # ---------------------------------------------------------------------------
 
-@dataclass
+@dataclass(frozen=True)
 class OrderSubmitted(Event):
     """Emitted when an order is sent to the broker."""
 
@@ -97,7 +97,7 @@ class OrderSubmitted(Event):
     order_id: str = ""
 
 
-@dataclass
+@dataclass(frozen=True)
 class OrderAccepted(Event):
     """Emitted when the broker acknowledges an order."""
 
@@ -105,7 +105,7 @@ class OrderAccepted(Event):
     broker_timestamp: Optional[datetime] = None
 
 
-@dataclass
+@dataclass(frozen=True)
 class OrderPartialFill(Event):
     """Emitted on partial order fills."""
 
@@ -115,7 +115,7 @@ class OrderPartialFill(Event):
     fill_price: float = 0.0
 
 
-@dataclass
+@dataclass(frozen=True)
 class OrderFilled(Event):
     """Emitted when an order is fully filled."""
 
@@ -125,7 +125,7 @@ class OrderFilled(Event):
     fees: float = 0.0
 
 
-@dataclass
+@dataclass(frozen=True)
 class OrderRejected(Event):
     """Emitted when an order is rejected by the broker."""
 
@@ -137,7 +137,7 @@ class OrderRejected(Event):
 # Trade Events
 # ---------------------------------------------------------------------------
 
-@dataclass
+@dataclass(frozen=True)
 class TradeOpened(Event):
     """Emitted when a trade position is opened."""
 
@@ -150,7 +150,7 @@ class TradeOpened(Event):
     take_profit: float = 0.0
 
 
-@dataclass
+@dataclass(frozen=True)
 class TradeClosed(Event):
     """Emitted when a trade position is closed."""
 
@@ -166,7 +166,7 @@ class TradeClosed(Event):
 # System Events
 # ---------------------------------------------------------------------------
 
-@dataclass
+@dataclass(frozen=True)
 class RiskHalt(Event):
     """Emitted when risk limits trigger a halt."""
 
@@ -174,7 +174,7 @@ class RiskHalt(Event):
     level: str = "WARNING"  # "WARNING" | "CRITICAL"
 
 
-@dataclass
+@dataclass(frozen=True)
 class SchedulerEvent(Event):
     """Emitted for scheduled job lifecycle."""
 
@@ -182,7 +182,7 @@ class SchedulerEvent(Event):
     status: str = ""  # "started" | "completed" | "failed"
 
 
-@dataclass
+@dataclass(frozen=True)
 class SystemHealth(Event):
     """Emitted for component health checks."""
 
@@ -195,7 +195,7 @@ class SystemHealth(Event):
 # Runtime Switching Events
 # ---------------------------------------------------------------------------
 
-@dataclass
+@dataclass(frozen=True)
 class EnvironmentSwitched(Event):
     """Emitted when trading environment switches between paper and live."""
 
@@ -206,7 +206,7 @@ class EnvironmentSwitched(Event):
     reason: str = ""
 
 
-@dataclass
+@dataclass(frozen=True)
 class BrokerSwitched(Event):
     """Emitted when the broker instance is hot-swapped."""
 
@@ -219,7 +219,7 @@ class BrokerSwitched(Event):
 # ML Runtime Events
 # ---------------------------------------------------------------------------
 
-@dataclass
+@dataclass(frozen=True)
 class ModelSwapped(Event):
     """Emitted when an ML model is hot-swapped in production."""
 
@@ -229,7 +229,7 @@ class ModelSwapped(Event):
     reason: str = ""
 
 
-@dataclass
+@dataclass(frozen=True)
 class ModelTrainingStarted(Event):
     """Emitted when model training pipeline begins."""
 
@@ -238,7 +238,7 @@ class ModelTrainingStarted(Event):
     trigger: str = ""  # "manual" | "scheduled" | "performance_decay"
 
 
-@dataclass
+@dataclass(frozen=True)
 class ModelTrainingCompleted(Event):
     """Emitted when model training pipeline finishes."""
 
@@ -249,7 +249,7 @@ class ModelTrainingCompleted(Event):
     auto_deployed: bool = False
 
 
-@dataclass
+@dataclass(frozen=True)
 class ABTestStarted(Event):
     """Emitted when an A/B test begins."""
 
@@ -259,7 +259,7 @@ class ABTestStarted(Event):
     allocation_pct: float = 0.0
 
 
-@dataclass
+@dataclass(frozen=True)
 class ABTestCompleted(Event):
     """Emitted when an A/B test concludes."""
 
@@ -274,7 +274,7 @@ class ABTestCompleted(Event):
 # Backtest Events
 # ---------------------------------------------------------------------------
 
-@dataclass
+@dataclass(frozen=True)
 class BacktestStarted(Event):
     """Emitted when a backtest run begins."""
 
@@ -284,7 +284,7 @@ class BacktestStarted(Event):
     engine: str = "native"
 
 
-@dataclass
+@dataclass(frozen=True)
 class BacktestCompleted(Event):
     """Emitted when a backtest run finishes."""
 

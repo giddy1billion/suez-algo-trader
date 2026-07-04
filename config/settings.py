@@ -86,6 +86,13 @@ class Settings(BaseSettings):
     ml_retrain_interval_hours: int = 24
     ml_min_confidence: float = 0.65
 
+    # --- Adaptive Intelligence Layer ---
+    intelligence_enabled: bool = True
+    intelligence_min_trade_score: float = 70.0
+    intelligence_drift_window: int = 200
+    intelligence_drift_min_samples: int = 50
+    intelligence_drift_alert_drop: float = 0.12
+
     # --- Notifications ---
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
@@ -231,6 +238,13 @@ class Settings(BaseSettings):
     def validate_leverage(cls, v: float) -> float:
         if v <= 0 or v > 10:
             raise ValueError(f"Leverage must be between 0 and 10, got {v}")
+        return v
+
+    @field_validator("intelligence_min_trade_score")
+    @classmethod
+    def validate_trade_score_threshold(cls, v: float) -> float:
+        if v < 0 or v > 100:
+            raise ValueError(f"Intelligence trade score must be in [0,100], got {v}")
         return v
 
 

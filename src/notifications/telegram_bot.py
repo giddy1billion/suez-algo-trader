@@ -148,9 +148,10 @@ def set_components(broker, engine, risk_manager, strategy, db=None, authorized_c
 
 
 def _is_authorized(message: Message) -> bool:
-    """Check if user is authorized to use the bot."""
+    """Check if user is authorized to use the bot. Deny-by-default."""
     if not _authorized_users:
-        return True  # No restriction if not configured
+        # No authorized users configured — deny all until /start auto-registers first user
+        return False
     return message.from_user.id in _authorized_users
 
 
@@ -243,6 +244,12 @@ async def cmd_help(message: Message):
         "/train [SYMBOLS] [BARS] - Train ML model\n"
         "/modelinfo - ML model metadata\n"
         "/predict [SYMBOL] - ML prediction + confidence\n\n"
+        "<b>Asset Discovery & Market:</b>\n"
+        "/assets [stocks|crypto] [exchange] [page] - Browse assets\n"
+        "/search QUERY [stocks|crypto] - Search by name/symbol\n"
+        "/price SYMBOL [SYMBOL2...] - Live price quotes\n"
+        "/asset SYMBOL - Full asset details\n"
+        "/watchlist - Current symbols + prices\n\n"
         "<b>Advanced Research:</b>\n"
         "/walkforward [SYMBOL] [BARS] - Walk-forward optimization\n"
         "/montecarlo [SYMBOL] [BARS] [SIMS] - Monte Carlo sim\n"
@@ -282,7 +289,7 @@ async def cmd_status(message: Message):
         )
         await message.answer(text, parse_mode=ParseMode.HTML)
     except Exception as e:
-        await message.answer(f"Error: {e}")
+        await message.answer("Operation failed. Check system logs for details.")
 
 
 @router.message(Command("positions"))
@@ -311,7 +318,7 @@ async def cmd_positions(message: Message):
         lines.append(f"\n<b>Total Unrealized: ${total_pnl:+,.2f}</b>")
         await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
     except Exception as e:
-        await message.answer(f"Error: {e}")
+        await message.answer("Operation failed. Check system logs for details.")
 
 
 @router.message(Command("orders"))
@@ -336,7 +343,7 @@ async def cmd_orders(message: Message):
             )
         await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
     except Exception as e:
-        await message.answer(f"Error: {e}")
+        await message.answer("Operation failed. Check system logs for details.")
 
 
 @router.message(Command("pnl"))
@@ -381,7 +388,7 @@ async def cmd_trades(message: Message):
 
         await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
     except Exception as e:
-        await message.answer(f"Error fetching trades: {e}")
+        await message.answer("Operation failed. Check system logs for details.")
 
 
 @router.message(Command("signals"))
@@ -419,7 +426,7 @@ async def cmd_signals(message: Message):
             )
         await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
     except Exception as e:
-        await message.answer(f"Error generating signals: {e}")
+        await message.answer("Operation failed. Check system logs for details.")
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -535,7 +542,7 @@ async def cmd_cancelall(message: Message):
             _broker.cancel_all_orders()
         await message.answer("All pending orders cancelled.")
     except Exception as e:
-        await message.answer(f"Error: {e}")
+        await message.answer("Operation failed. Check system logs for details.")
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -1521,7 +1528,7 @@ async def cmd_modelinfo(message: Message):
 
         await message.answer(text, parse_mode=ParseMode.HTML)
     except Exception as e:
-        await message.answer(f"Error loading model info: {e}")
+        await message.answer("Operation failed. Check system logs for details.")
 
 
 @router.message(Command("predict"))
@@ -2553,6 +2560,353 @@ async def cmd_modelaudit(message: Message):
         await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
     except Exception as e:
         await message.answer(f"Model audit error: {e}")
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Asset Discovery & Market Data
+# ──────────────────────────────────────────────────────────────────────────
+
+
+@router.message(Command("assets"))
+async def cmd_assets(message: Message):
+    """List tradeable assets from Alpaca.
+    Usage: /assets [stocks|crypto] [exchange] [page]
+    Examples:
+        /assets              - First 30 stocks
+        /assets crypto       - All crypto pairs
+        /assets stocks NYSE  - NYSE stocks only
+        /assets stocks 2     - Page 2 of stocks
+    """
+    if not _is_authorized(message):
+        return
+    if not _broker:
+        await message.answer("Broker not connected.")
+        return
+
+    parts = message.text.split()
+    asset_type = "stocks"
+    exchange = None
+    page = 1
+
+    if len(parts) > 1:
+        arg1 = parts[1].lower()
+        if arg1 in ("crypto", "c"):
+            asset_type = "crypto"
+        elif arg1 in ("stocks", "stock", "s"):
+            asset_type = "stocks"
+        else:
+            # Could be exchange or page number
+            if arg1.isdigit():
+                page = int(arg1)
+            else:
+                exchange = arg1.upper()
+
+    if len(parts) > 2:
+        arg2 = parts[2]
+        if arg2.isdigit():
+            page = int(arg2)
+        elif asset_type == "stocks":
+            exchange = arg2.upper()
+
+    if len(parts) > 3 and parts[3].isdigit():
+        page = int(parts[3])
+
+    page_size = 30
+    try:
+        with _broker_lock:
+            if asset_type == "crypto":
+                assets = _broker.get_crypto_assets()
+            else:
+                assets = _broker.get_stock_assets(exchange=exchange)
+
+        total = len(assets)
+        total_pages = max(1, (total + page_size - 1) // page_size)
+        page = max(1, min(page, total_pages))
+        start = (page - 1) * page_size
+        end = start + page_size
+        page_assets = assets[start:end]
+
+        lines = [
+            f"<b>{'🪙 Crypto' if asset_type == 'crypto' else '📈 Stocks'}"
+            f"{f' ({exchange})' if exchange else ''}</b>",
+            f"Total: {total} | Page {page}/{total_pages}\n",
+        ]
+
+        if asset_type == "crypto":
+            for a in page_assets:
+                frac = "🔹" if a.get("fractionable") else "  "
+                lines.append(f"<code>{a['symbol']:12s}</code> {frac} {(a.get('name') or '')[:30]}")
+        else:
+            for a in page_assets:
+                frac = "🔹" if a.get("fractionable") else "  "
+                short = "📉" if a.get("shortable") else "  "
+                lines.append(
+                    f"<code>{a['symbol']:8s}</code> {a.get('exchange', ''):5s} {frac}{short} "
+                    f"{(a.get('name') or '')[:28]}"
+                )
+
+        lines.append(f"\n🔹=fractionable {'📉=shortable' if asset_type == 'stocks' else ''}")
+        if total_pages > 1:
+            lines.append(f"Use: /assets {asset_type}{f' {exchange}' if exchange else ''} {page+1}")
+
+        await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
+    except Exception as e:
+        await message.answer("Operation failed. Check system logs for details.")
+
+
+@router.message(Command("search"))
+async def cmd_search(message: Message):
+    """Search for assets by name or symbol.
+    Usage: /search QUERY [stocks|crypto]
+    Examples:
+        /search apple
+        /search BTC crypto
+        /search nvidia
+        /search ETH
+    """
+    if not _is_authorized(message):
+        return
+    if not _broker:
+        await message.answer("Broker not connected.")
+        return
+
+    parts = message.text.split(maxsplit=2)
+    if len(parts) < 2:
+        await message.answer(
+            "<b>Usage:</b> /search QUERY [stocks|crypto]\n\n"
+            "<b>Examples:</b>\n"
+            "  /search apple\n"
+            "  /search BTC crypto\n"
+            "  /search nvidia\n"
+            "  /search tesla",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    query = parts[1].upper()
+    search_crypto = False
+    search_stocks = True
+
+    if len(parts) > 2:
+        if parts[2].lower() in ("crypto", "c"):
+            search_crypto = True
+            search_stocks = False
+        elif parts[2].lower() in ("both", "all"):
+            search_crypto = True
+            search_stocks = True
+
+    results = []
+    try:
+        with _broker_lock:
+            if search_stocks:
+                stocks = _broker.get_stock_assets()
+                for a in stocks:
+                    if query in a["symbol"] or query in (a.get("name") or "").upper():
+                        results.append({**a, "_type": "stock"})
+            if search_crypto:
+                crypto = _broker.get_crypto_assets()
+                for a in crypto:
+                    if query in a["symbol"] or query in (a.get("name") or "").upper():
+                        results.append({**a, "_type": "crypto"})
+
+        if not results:
+            await message.answer(f"No assets found matching '<code>{query}</code>'.", parse_mode=ParseMode.HTML)
+            return
+
+        # Prioritize exact symbol matches
+        results.sort(key=lambda x: (0 if x["symbol"] == query else 1, x["symbol"]))
+        results = results[:25]
+
+        lines = [f"<b>🔍 Search: '{query}'</b> — {len(results)} result(s)\n"]
+        for a in results:
+            type_icon = "🪙" if a["_type"] == "crypto" else "📈"
+            frac = "🔹" if a.get("fractionable") else ""
+            lines.append(
+                f"{type_icon} <code>{a['symbol']:12s}</code> {frac} "
+                f"{(a.get('name') or '')[:32]}"
+            )
+
+        lines.append("\nUse /price SYMBOL for live quote")
+        lines.append("Use /asset SYMBOL for full details")
+        await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
+    except Exception as e:
+        await message.answer(f"Search error: {e}")
+
+
+@router.message(Command("price"))
+async def cmd_price(message: Message):
+    """Get current price/quote for one or more symbols.
+    Usage: /price SYMBOL [SYMBOL2 ...]
+    Examples:
+        /price AAPL
+        /price BTC/USD ETH/USD
+        /price AAPL MSFT NVDA
+    """
+    if not _is_authorized(message):
+        return
+    if not _broker:
+        await message.answer("Broker not connected.")
+        return
+
+    parts = message.text.split()
+    if len(parts) < 2:
+        await message.answer(
+            "<b>Usage:</b> /price SYMBOL [SYMBOL2 ...]\n\n"
+            "<b>Examples:</b>\n"
+            "  /price AAPL\n"
+            "  /price BTC/USD ETH/USD\n"
+            "  /price AAPL MSFT NVDA TSLA",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    symbols = [s.upper() for s in parts[1:6]]  # Max 5 at once
+
+    lines = [f"<b>💰 Live Prices</b>\n"]
+    for symbol in symbols:
+        try:
+            with _broker_lock:
+                price = _broker.get_latest_price(symbol)
+            is_crypto = "/" in symbol
+            icon = "🪙" if is_crypto else "📈"
+            lines.append(f"{icon} <code>{symbol:12s}</code> ${price:>12,.4f}" if is_crypto
+                        else f"{icon} <code>{symbol:8s}</code> ${price:>10,.2f}")
+        except Exception as e:
+            lines.append(f"⚠️ <code>{symbol:8s}</code> Error: {str(e)[:40]}")
+
+    lines.append(f"\n<i>Updated: {datetime.now().strftime('%H:%M:%S')}</i>")
+    await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+@router.message(Command("asset"))
+async def cmd_asset_detail(message: Message):
+    """Get detailed info about a specific asset.
+    Usage: /asset SYMBOL
+    Examples:
+        /asset AAPL
+        /asset BTC/USD
+    """
+    if not _is_authorized(message):
+        return
+    if not _broker:
+        await message.answer("Broker not connected.")
+        return
+
+    parts = message.text.split()
+    if len(parts) < 2:
+        await message.answer(
+            "<b>Usage:</b> /asset SYMBOL\n\n"
+            "Shows full asset details including exchange, tradability, "
+            "fractionable status, and current price.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    symbol = parts[1].upper()
+    is_crypto = "/" in symbol
+
+    try:
+        # Find the asset
+        asset_info = None
+        with _broker_lock:
+            if is_crypto:
+                assets = _broker.get_crypto_assets()
+            else:
+                assets = _broker.get_stock_assets()
+
+        for a in assets:
+            if a["symbol"] == symbol:
+                asset_info = a
+                break
+
+        if not asset_info:
+            await message.answer(
+                f"Asset '<code>{symbol}</code>' not found.\n"
+                f"Try /search {symbol.split('/')[0] if '/' in symbol else symbol}",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        # Get current price
+        price_str = "N/A (market closed)"
+        try:
+            with _broker_lock:
+                price = _broker.get_latest_price(symbol)
+            price_str = f"${price:,.4f}" if is_crypto else f"${price:,.2f}"
+        except Exception:
+            pass
+
+        icon = "🪙" if is_crypto else "📈"
+        lines = [
+            f"<b>{icon} {asset_info['symbol']}</b>",
+            f"<i>{asset_info.get('name') or 'N/A'}</i>\n",
+            f"Type: {'Crypto' if is_crypto else 'US Equity'}",
+            f"Exchange: {asset_info.get('exchange') or 'N/A'}",
+            f"Tradable: {'✅' if asset_info.get('tradable') else '❌'}",
+            f"Fractionable: {'✅' if asset_info.get('fractionable') else '❌'}",
+        ]
+
+        if is_crypto:
+            if asset_info.get("min_order_size"):
+                lines.append(f"Min order: {asset_info['min_order_size']}")
+            if asset_info.get("min_trade_increment"):
+                lines.append(f"Min increment: {asset_info['min_trade_increment']}")
+        else:
+            lines.append(f"Shortable: {'✅' if asset_info.get('shortable') else '❌'}")
+
+        lines.extend([
+            f"\n<b>Price:</b> {price_str}",
+            f"\n<b>Quick Actions:</b>",
+            f"/price {symbol} — refresh price",
+            f"/buy {symbol} 1 — buy 1 share/unit",
+            f"/backtest {symbol} — run backtest",
+            f"/predict {symbol} — ML prediction",
+        ])
+
+        await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
+    except Exception as e:
+        await message.answer("Operation failed. Check system logs for details.")
+
+
+@router.message(Command("watchlist"))
+async def cmd_watchlist(message: Message):
+    """Show current watchlist with live prices.
+    Usage: /watchlist
+    Shows all configured trading symbols with their current prices.
+    """
+    if not _is_authorized(message):
+        return
+    if not _broker:
+        await message.answer("Broker not connected.")
+        return
+
+    from config.settings import settings
+
+    symbols = [s.strip() for s in settings.trading_symbols.split(",") if s.strip()]
+    if not symbols:
+        await message.answer("No symbols configured. Use /setsymbols to add some.")
+        return
+
+    lines = [f"<b>👁 Watchlist ({len(symbols)} symbols)</b>\n"]
+    for symbol in symbols:
+        try:
+            with _broker_lock:
+                price = _broker.get_latest_price(symbol)
+            is_crypto = "/" in symbol
+            icon = "🪙" if is_crypto else "📈"
+            lines.append(
+                f"{icon} <code>{symbol:12s}</code> ${price:>12,.4f}" if is_crypto
+                else f"{icon} <code>{symbol:8s}</code> ${price:>10,.2f}"
+            )
+        except Exception:
+            lines.append(f"⚠️ <code>{symbol:8s}</code> (unavailable)")
+
+    lines.extend([
+        f"\n<i>Updated: {datetime.now().strftime('%H:%M:%S')}</i>",
+        "\n/setsymbols SYM1,SYM2 — update watchlist",
+        "/search QUERY — find new assets to add",
+    ])
+    await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
 # ──────────────────────────────────────────────────────────────────────────

@@ -177,12 +177,22 @@ class SnapshotManager:
         """
         Load the latest snapshot for recovery.
 
-        Returns dict with 'state' and 'last_event_id', or None if no snapshot exists.
+        Returns dict with 'state' and 'last_event_id', or None if no snapshot exists
+        or if the snapshot fails validation.
         The caller should then replay events with id > last_event_id.
         """
         snapshot = self.store.get_latest_snapshot(session_id)
         if snapshot is None:
             logger.info("snapshot.recovery_none_found")
+            return None
+
+        # Validate snapshot integrity before using it
+        if not self._validate_snapshot(snapshot):
+            logger.error(
+                "snapshot.validation_failed",
+                snapshot_id=snapshot["id"],
+                msg="Corrupt or incomplete snapshot — falling back to full replay",
+            )
             return None
 
         logger.info(
@@ -192,3 +202,23 @@ class SnapshotManager:
             timestamp=snapshot["timestamp"],
         )
         return snapshot
+
+    @staticmethod
+    def _validate_snapshot(snapshot: dict) -> bool:
+        """Validate snapshot has required fields and sane values."""
+        try:
+            # Required top-level keys
+            if not all(k in snapshot for k in ("id", "last_event_id", "state", "timestamp")):
+                return False
+            # last_event_id must be a positive integer
+            if not isinstance(snapshot["last_event_id"], int) or snapshot["last_event_id"] < 0:
+                return False
+            # state must be a dict
+            if not isinstance(snapshot["state"], dict):
+                return False
+            # timestamp must parse
+            if not snapshot.get("timestamp"):
+                return False
+            return True
+        except Exception:
+            return False

@@ -580,8 +580,9 @@ class AlpacaBroker:
 
     @_retry()
     def get_bars_df(self, symbol: str, timeframe: str = "1Hour", limit: int = 200):
-        """Fetch bars and return as a pandas DataFrame."""
+        """Fetch bars and return as a pandas DataFrame with data validation."""
         import pandas as pd
+        import math
 
         try:
             bars = self.get_bars(symbol, timeframe, limit)
@@ -590,21 +591,81 @@ class AlpacaBroker:
                 return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
 
             records = []
+            skipped = 0
             for bar in bars:
+                o, h, l, c, v = float(bar.open), float(bar.high), float(bar.low), float(bar.close), float(bar.volume)
+                # Data validation: reject invalid bars
+                if any(math.isnan(x) or math.isinf(x) for x in (o, h, l, c)):
+                    skipped += 1
+                    continue
+                if c <= 0 or o <= 0 or h <= 0 or l <= 0:
+                    skipped += 1
+                    continue
+                if v < 0:
+                    skipped += 1
+                    continue
+                if h < l:  # High must be >= Low
+                    skipped += 1
+                    continue
                 records.append({
                     "timestamp": bar.timestamp,
-                    "open": float(bar.open),
-                    "high": float(bar.high),
-                    "low": float(bar.low),
-                    "close": float(bar.close),
-                    "volume": float(bar.volume),
+                    "open": o,
+                    "high": h,
+                    "low": l,
+                    "close": c,
+                    "volume": v,
                 })
+
+            if skipped > 0:
+                logger.warning("bars_df.invalid_bars_skipped", symbol=symbol, skipped=skipped, total=len(bars))
+
+            if not records:
+                return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+
             df = pd.DataFrame(records).set_index("timestamp")
             df.index = pd.to_datetime(df.index, utc=True)
+            df.sort_index(inplace=True)
+
+            # Candle gap detection: warn if timestamps have unexpected gaps
+            if len(df) >= 2:
+                self._detect_candle_gaps(df, symbol, timeframe)
+
             return df
         except Exception as exc:
             logger.error("bars_df.get_failed", symbol=symbol, error=str(exc))
             raise
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Data Quality — Gap Detection
+    # ──────────────────────────────────────────────────────────────────────
+
+    _TF_EXPECTED_DELTA = {
+        "1Min": 60, "5Min": 300, "15Min": 900,
+        "1Hour": 3600, "1Day": 86400,
+    }
+
+    def _detect_candle_gaps(self, df, symbol: str, timeframe: str) -> None:
+        """Detect and log missing candle gaps in bar data."""
+        import pandas as pd
+
+        expected_seconds = self._TF_EXPECTED_DELTA.get(timeframe)
+        if expected_seconds is None:
+            return  # Unknown timeframe — skip
+
+        # Allow 2x the expected interval before flagging (accounts for weekends/holidays)
+        threshold = expected_seconds * 3
+        deltas = df.index.to_series().diff().dt.total_seconds().dropna()
+        gaps = deltas[deltas > threshold]
+
+        if len(gaps) > 0:
+            logger.warning(
+                "bars_df.candle_gaps_detected",
+                symbol=symbol,
+                timeframe=timeframe,
+                gap_count=len(gaps),
+                max_gap_hours=round(gaps.max() / 3600, 1),
+                first_gap=str(gaps.index[0]),
+            )
 
     # ──────────────────────────────────────────────────────────────────────
     # Real-time WebSocket Streaming

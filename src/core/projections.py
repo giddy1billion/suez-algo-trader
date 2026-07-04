@@ -222,12 +222,24 @@ class ReadModelManager:
         logger.info("ReadModelManager attached to EventBus")
 
     def _dispatch(self, event: Event) -> None:
-        """Dispatch event to all projections."""
+        """Dispatch event to all projections with isolation.
+
+        Each projection is applied independently. If one projection fails,
+        only that projection is affected — others still receive the event.
+        Failed projections log the error and continue (no state corruption
+        because each projection holds its own lock).
+        """
         for proj in self._projections:
             try:
                 proj.handle_event(event)
             except Exception:
-                logger.exception("Projection error in %s", type(proj).__name__)
+                logger.exception(
+                    "Projection error in %s for event %s (event_id=%s). "
+                    "Projection may be out-of-sync — monitor for drift.",
+                    type(proj).__name__,
+                    type(event).__name__,
+                    getattr(event, "event_id", "?"),
+                )
 
     def get_dashboard(self) -> dict:
         """Get full dashboard data in a single call."""

@@ -120,10 +120,13 @@ class EventStore:
         self._conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_events_timestamp ON events(timestamp)
         """)
+        self._conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_events_event_id ON events(event_id)
+        """)
         self._conn.commit()
 
     def persist(self, event: Event) -> None:
-        """Persist an event to the database."""
+        """Persist an event to the database. Deduplicates by event_id."""
         try:
             data = event.to_dict()
             event_type = data.pop("_type", type(event).__name__)
@@ -131,7 +134,7 @@ class EventStore:
 
             with self._lock:
                 self._conn.execute(
-                    """INSERT INTO events (event_type, event_id, timestamp, source, payload, session_id)
+                    """INSERT OR IGNORE INTO events (event_type, event_id, timestamp, source, payload, session_id)
                        VALUES (?, ?, ?, ?, ?, ?)""",
                     (
                         event_type,

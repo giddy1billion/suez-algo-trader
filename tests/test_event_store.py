@@ -287,7 +287,7 @@ class TestEventRegistry:
     def test_register_custom_event(self):
         from dataclasses import dataclass
 
-        @dataclass
+        @dataclass(frozen=True)
         class CustomEvent(Event):
             custom_field: str = ""
 

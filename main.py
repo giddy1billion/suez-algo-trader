@@ -34,6 +34,7 @@ from src.strategy.mean_reversion import MeanReversionStrategy
 from src.strategy.ml_strategy import MLStrategy
 from src.execution.engine import ExecutionEngine
 from src.data.store import DatabaseManager
+from src.intelligence.orchestrator import AdaptiveIntelligenceOrchestrator
 from src.notifications.alerts import NotificationManager
 from src.monitoring.health import HealthMonitor
 from src.monitoring.metrics import LiveMetrics
@@ -456,6 +457,12 @@ def cmd_run(
         event_bus=event_bus,
         trade_manager=trade_manager,
         execution_simulator=execution_simulator,
+        intelligence_orchestrator=AdaptiveIntelligenceOrchestrator(
+            min_trade_score=settings.intelligence_min_trade_score,
+            drift_window=settings.intelligence_drift_window,
+            drift_min_samples=settings.intelligence_drift_min_samples,
+            drift_alert_drop=settings.intelligence_drift_alert_drop,
+        ) if settings.intelligence_enabled else None,
     )
 
     # Register default event subscribers (audit log, journal, metrics, notifications)
@@ -861,6 +868,24 @@ def cmd_run(
                 logger.error("scheduler.auto_sweep_error", error=str(e))
 
         _scheduler = BackgroundScheduler(executors={'default': _auto_executor})
+
+        # Daily risk reset at market open (09:30 ET)
+        def _daily_risk_reset():
+            """Reset daily risk counters at market open."""
+            try:
+                with _broker_lock:
+                    account = broker.get_account()
+                risk.reset_daily(account['equity'])
+                logger.info("scheduler.daily_risk_reset", equity=account['equity'])
+                _send_telegram("🔄 <b>Daily Risk Reset</b>\nCounters cleared for new trading day.")
+            except Exception as e:
+                logger.error("scheduler.daily_reset_error", error=str(e))
+
+        _scheduler.add_job(
+            _daily_risk_reset,
+            CronTrigger(hour=9, minute=30, timezone="US/Eastern"),
+            id="daily_risk_reset",
+        )
 
         # Daily summary at market close
         _scheduler.add_job(

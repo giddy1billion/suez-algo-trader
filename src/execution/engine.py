@@ -18,6 +18,7 @@ from src.risk.engine import RiskEngine
 from src.risk.models import TradeRequest, RiskDecision
 from src.strategy.base import BaseStrategy, TradeSignal, Signal
 from src.data.store import DatabaseManager
+from src.intelligence.orchestrator import AdaptiveIntelligenceOrchestrator
 from src.utils.logger import get_logger
 
 # Event types — imported at top for reliability
@@ -69,6 +70,7 @@ class ExecutionEngine:
         event_bus=None,
         trade_manager=None,
         execution_simulator=None,
+        intelligence_orchestrator: Optional[AdaptiveIntelligenceOrchestrator] = None,
     ):
         self.broker = broker
         self.risk = risk_manager
@@ -83,6 +85,7 @@ class ExecutionEngine:
         self._event_bus = event_bus
         self._trade_manager = trade_manager
         self._simulator = execution_simulator  # None = no simulation (direct broker)
+        self.intelligence_orchestrator = intelligence_orchestrator
 
     # ──────────────────────────────────────────────────────────────────────
     # Event Publishing Helpers
@@ -94,7 +97,7 @@ class ExecutionEngine:
             try:
                 self._event_bus.publish(event)
             except Exception as e:
-                logger.debug("event_bus.publish_error", error=str(e))
+                logger.warning("event_bus.publish_error", event_type=type(event).__name__, error=str(e))
 
     # ──────────────────────────────────────────────────────────────────────
     # Main Loop
@@ -205,6 +208,27 @@ class ExecutionEngine:
             logger.debug("engine.skip_existing_short", symbol=signal.symbol)
             return None
 
+        intelligence_decision = None
+        if self.intelligence_orchestrator:
+            symbol_df = market_data.get(signal.symbol) if market_data else None
+            portfolio_context = self._build_portfolio_context(positions, portfolio_value, signal.symbol)
+            intelligence_decision = self.intelligence_orchestrator.evaluate_signal(
+                strategy_name=self._current_strategy_name,
+                signal_confidence=signal.confidence,
+                indicators=signal.indicators,
+                df=symbol_df,
+                portfolio_context=portfolio_context,
+            )
+            if not intelligence_decision.accepted:
+                logger.info(
+                    "engine.intelligence_rejected",
+                    symbol=signal.symbol,
+                    score=round(intelligence_decision.final_score, 2),
+                    reason=intelligence_decision.routing.reason,
+                )
+                self._log_signal(signal, executed=False)
+                return None
+
         # Calculate position size
         if signal.stop_loss:
             qty = self.risk.calculate_position_size(
@@ -219,6 +243,13 @@ class ExecutionEngine:
         if qty <= 0:
             return None
 
+        if intelligence_decision:
+            qty *= intelligence_decision.qty_multiplier
+            if qty <= 0:
+                logger.info("engine.intelligence_zero_qty", symbol=signal.symbol)
+                self._log_signal(signal, executed=False)
+                return None
+
         # Build TradeRequest for the new risk engine
         trade_request = TradeRequest(
             symbol=signal.symbol,
@@ -228,7 +259,7 @@ class ExecutionEngine:
             stop_loss=signal.stop_loss,
             take_profit=signal.take_profit,
             strategy=self._current_strategy_name,
-            confidence=signal.confidence,
+            confidence=intelligence_decision.adjusted_confidence if intelligence_decision else signal.confidence,
         )
 
         # Create trade lifecycle if TradeManager available
@@ -237,6 +268,7 @@ class ExecutionEngine:
             trade_lifecycle = self._trade_manager.create_trade(signal.symbol, side)
             if not trade_lifecycle.transition(TradeState.PENDING_RISK, "risk evaluation"):
                 logger.warning("engine.invalid_transition", symbol=signal.symbol, state="PENDING_RISK")
+                return None  # Abort: state machine inconsistency
 
         # Get account cash for risk evaluation
         try:
@@ -256,14 +288,21 @@ class ExecutionEngine:
                     "daily_vol": float(df['close'].pct_change().rolling(20).std().iloc[-1]) if len(df) > 20 else 0,
                 }
 
-        # Evaluate through the multi-layer risk engine
-        decision: RiskDecision = self.risk_engine.evaluate(
-            request=trade_request,
-            portfolio_value=portfolio_value,
-            cash=cash,
-            positions=positions,
-            market_data=risk_market_data,
-        )
+        # Evaluate through the multi-layer risk engine (fail-closed: reject on exception)
+        try:
+            decision: RiskDecision = self.risk_engine.evaluate(
+                request=trade_request,
+                portfolio_value=portfolio_value,
+                cash=cash,
+                positions=positions,
+                market_data=risk_market_data,
+            )
+        except Exception as e:
+            logger.error("engine.risk_evaluation_exception", symbol=signal.symbol, error=str(e))
+            self._log_signal(signal, executed=False)
+            if trade_lifecycle:
+                trade_lifecycle.transition(TradeState.RISK_REJECTED, f"risk_exception: {str(e)[:80]}")
+            return None
 
         # Publish risk evaluation event
         self._publish(RiskEvaluated(
@@ -289,6 +328,15 @@ class ExecutionEngine:
         final_qty = decision.adjusted_qty
 
         # Log signal
+        if intelligence_decision:
+            signal.indicators = signal.indicators or {}
+            signal.indicators["intelligence"] = {
+                "score": round(intelligence_decision.final_score, 2),
+                "regime": intelligence_decision.market_state.overall_regime,
+                "routing_reason": intelligence_decision.routing.reason,
+                "qty_multiplier": round(intelligence_decision.qty_multiplier, 4),
+                "explanation": intelligence_decision.explanation,
+            }
         self._log_signal(signal, executed=True)
 
         # Execute (or dry run)
@@ -344,6 +392,13 @@ class ExecutionEngine:
                        avg_price=sim_result.get('avg_price'),
                        slippage_bps=sim_result.get('slippage_bps', 0),
                        fees=sim_result.get('fees', 0))
+
+            # Respect simulator's actual fill quantity (may be partial)
+            sim_qty = sim_result.get('total_qty', final_qty)
+            if sim_qty < final_qty:
+                logger.info("engine.sim_partial_fill", symbol=signal.symbol,
+                           requested=final_qty, filled=sim_qty)
+                final_qty = sim_qty
 
         # Transition lifecycle: SUBMITTED
         if trade_lifecycle:
@@ -443,6 +498,10 @@ class ExecutionEngine:
                         "prediction": side,
                         "confidence": signal.confidence,
                         "features_snapshot": signal.indicators,
+                        "market_regime": (
+                            intelligence_decision.market_state.overall_regime
+                            if intelligence_decision else None
+                        ),
                     })
                 except Exception as e:
                     logger.debug("journal.log_entry_error", error=str(e))
@@ -466,6 +525,12 @@ class ExecutionEngine:
 
     def _check_exits(self, strategy: BaseStrategy, positions: list[dict], data: dict) -> list[dict]:
         """Check if any open positions should be closed based on strategy logic."""
+        # Risk gate: if trading is halted, do not execute exits either
+        can_trade, halt_reason = self.risk.can_trade()
+        if not can_trade:
+            logger.warning("engine.exits_blocked_by_risk", reason=halt_reason)
+            return []
+
         results = []
         for pos in positions:
             symbol = pos['symbol']
@@ -560,6 +625,25 @@ class ExecutionEngine:
         except Exception as e:
             logger.error("engine.snapshot_error", error=str(e))
 
+    @staticmethod
+    def _build_portfolio_context(positions: list[dict], portfolio_value: float, target_symbol: str) -> dict:
+        """Build simple portfolio context used by the intelligence layer."""
+        if portfolio_value <= 0:
+            return {"correlation_risk": 0.0}
+
+        active = [p for p in positions if p.get("symbol") != target_symbol]
+        if not active:
+            return {"correlation_risk": 0.0}
+
+        notional_sum = sum(abs(float(p.get("market_value", 0.0))) for p in active)
+        exposure = min(notional_sum / portfolio_value, 1.5)
+
+        # Correlation proxy in absence of a full matrix: concentrated books imply
+        # higher hidden co-movement risk.
+        concentration = min(len(active) / 10.0, 1.0)
+        correlation_risk = min((0.6 * exposure) + (0.4 * concentration), 1.0)
+        return {"correlation_risk": correlation_risk}
+
     # ──────────────────────────────────────────────────────────────────────
     # Emergency Controls
     # ──────────────────────────────────────────────────────────────────────
@@ -575,8 +659,22 @@ class ExecutionEngine:
         except Exception:
             positions = []
 
-        # Close all and publish individual TradeClosed events
-        self.broker.close_all_positions()
+        # Close all and verify — only publish events if close succeeds
+        close_succeeded = False
+        try:
+            self.broker.close_all_positions()
+            close_succeeded = True
+        except Exception as e:
+            logger.error("engine.emergency_close_failed", error=str(e))
+
+        if not close_succeeded:
+            # Cannot confirm closure — publish halt but NOT TradeClosed events
+            self._publish(RiskHalt(
+                reason="Emergency liquidation FAILED — positions may still be open",
+                level="CRITICAL",
+                source="engine",
+            ))
+            return
 
         for pos in positions:
             symbol = pos.get('symbol', '?')

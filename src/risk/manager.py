@@ -8,12 +8,23 @@ All trading decisions pass through here before execution.
 """
 
 from dataclasses import dataclass, field
-from datetime import datetime, date
+from datetime import datetime, date, timezone
 from typing import Optional
 
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+
+def _market_date_et() -> date:
+    """Get current date in US/Eastern (market timezone)."""
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("US/Eastern")).date()
+    except ImportError:
+        # Fallback: approximate ET as UTC-5
+        from datetime import timedelta
+        return (datetime.now(timezone.utc) - timedelta(hours=5)).date()
 
 
 @dataclass
@@ -34,7 +45,7 @@ class RiskLimits:
 @dataclass
 class DailyStats:
     """Track daily P&L and trade counts."""
-    date: date = field(default_factory=date.today)
+    date: date = field(default_factory=_market_date_et)
     starting_equity: float = 0.0
     current_equity: float = 0.0
     realized_pnl: float = 0.0
@@ -71,7 +82,7 @@ class RiskManager:
     def reset_daily(self, starting_equity: float):
         """Reset daily tracking (call at market open)."""
         self.daily_stats = DailyStats(
-            date=date.today(),
+            date=_market_date_et(),
             starting_equity=starting_equity,
             current_equity=starting_equity,
         )

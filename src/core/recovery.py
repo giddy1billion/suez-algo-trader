@@ -6,15 +6,26 @@ open positions from the broker, reconstructing trade lifecycles,
 and reconciling internal state.
 """
 
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
 
 from src.utils.logger import get_logger
-from src.core.events import SystemHealth, EventBus
+from src.core.events import SystemHealth, EventBus, Event
 from src.core.state_machine import TradeLifecycle, TradeManager, TradeState
 
 logger = get_logger(__name__)
+
+
+@dataclass(frozen=True)
+class PositionRecovered(Event):
+    """Emitted when a position is recovered from broker state."""
+    trade_id: str = ""
+    symbol: str = ""
+    side: str = ""
+    qty: float = 0.0
+    avg_entry_price: float = 0.0
 
 
 @dataclass
@@ -49,9 +60,15 @@ class RecoveryManager:
         self.event_bus = event_bus
         self.trade_manager = trade_manager
         self.event_store = event_store
+        self._recovery_lock = threading.Lock()
 
     def recover(self) -> RecoveryReport:
-        """Full recovery sequence on startup."""
+        """Full recovery sequence on startup. Thread-safe via recovery lock."""
+        with self._recovery_lock:
+            return self._do_recover()
+
+    def _do_recover(self) -> RecoveryReport:
+        """Internal recovery logic (must be called under _recovery_lock)."""
         report = RecoveryReport()
         logger.info("Starting crash recovery...")
 
@@ -207,6 +224,16 @@ class RecoveryManager:
             lifecycle.metadata["broker_position"] = pos
 
             lifecycles.append(lifecycle)
+
+            # Publish recovery event for audit trail
+            self.event_bus.publish(PositionRecovered(
+                trade_id=trade_id,
+                symbol=symbol,
+                side=side,
+                qty=float(qty) if qty else 0.0,
+                avg_entry_price=float(pos.get("avg_entry_price", 0)),
+                source="RecoveryManager",
+            ))
 
         return lifecycles
 
