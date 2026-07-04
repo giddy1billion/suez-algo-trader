@@ -1339,9 +1339,21 @@ async def cmd_train(message: Message):
             await message.answer("Insufficient data for training. Need 200+ bars per symbol.")
             return
 
-        # Run training in thread executor to avoid blocking the event loop
+        # Run training in thread executor with timeout to prevent blocking indefinitely
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, strategy.train, training_data)
+        _ML_TRAINING_TIMEOUT_SECONDS = 600  # 10 minutes max
+        try:
+            await asyncio.wait_for(
+                loop.run_in_executor(None, strategy.train, training_data),
+                timeout=_ML_TRAINING_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            await message.answer(
+                f"⚠️ <b>Training timed out</b> after {_ML_TRAINING_TIMEOUT_SECONDS}s.\n"
+                f"Consider reducing data size or using fewer symbols.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
 
         # Trigger strategy reload in main loop
         with _runtime_lock:

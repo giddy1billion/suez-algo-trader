@@ -1,13 +1,48 @@
 """
 Structured logging configuration using structlog.
 Outputs JSON in production, colored in dev.
+Includes sanitization to prevent credential leakage in logs.
 """
 
 import logging
+import re
 import sys
 from pathlib import Path
 
 import structlog
+
+
+# Patterns that may contain credentials in exception messages
+_SENSITIVE_PATTERNS = [
+    # API keys / tokens
+    re.compile(r'(api[_-]?key|token|secret|password|authorization|bearer)\s*[=:]\s*\S+', re.IGNORECASE),
+    # URLs with embedded credentials
+    re.compile(r'https?://[^@\s]+:[^@\s]+@', re.IGNORECASE),
+    # Common key formats (alphanumeric strings 20+ chars following a key-like word)
+    re.compile(r'(key|secret|token)\s*[=:]\s*[A-Za-z0-9+/]{20,}', re.IGNORECASE),
+]
+
+_REDACTION = "[REDACTED]"
+
+
+def sanitize_log_value(value: str) -> str:
+    """Remove potential secrets from a log value string."""
+    if not isinstance(value, str):
+        return value
+    result = value
+    for pattern in _SENSITIVE_PATTERNS:
+        result = pattern.sub(_REDACTION, result)
+    return result
+
+
+def _sanitize_processor(logger, method_name, event_dict):
+    """Structlog processor that sanitizes sensitive data from log output."""
+    for key in list(event_dict.keys()):
+        if key in ("error", "exception", "exc_info", "message", "msg"):
+            val = event_dict[key]
+            if isinstance(val, str):
+                event_dict[key] = sanitize_log_value(val)
+    return event_dict
 
 
 def setup_logging(log_level: str = "INFO", log_file: str = "logs/trader.log"):
@@ -37,6 +72,7 @@ def setup_logging(log_level: str = "INFO", log_file: str = "logs/trader.log"):
             structlog.processors.TimeStamper(fmt="iso"),
             structlog.processors.StackInfoRenderer(),
             structlog.processors.format_exc_info,
+            _sanitize_processor,
             structlog.processors.UnicodeDecoder(),
             structlog.dev.ConsoleRenderer() if sys.stdout.isatty() else structlog.processors.JSONRenderer(),
         ],

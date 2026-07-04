@@ -220,11 +220,23 @@ class ExecutionEngine:
         if self.intelligence_orchestrator:
             symbol_df = market_data.get(signal.symbol) if market_data else None
             portfolio_context = self._build_portfolio_context(positions, portfolio_value, signal.symbol)
+            # Build market context from available data
+            market_context = None
+            if symbol_df is not None and len(symbol_df) > 0:
+                market_context = {
+                    "symbol": signal.symbol,
+                    "last_price": signal.price,
+                    "volume": symbol_df["volume"].iloc[-1] if "volume" in symbol_df.columns else 0,
+                    "bar_count": len(symbol_df),
+                }
             intelligence_decision = self.intelligence_orchestrator.evaluate_signal(
                 strategy_name=self._current_strategy_name,
                 signal_confidence=signal.confidence,
+                symbol=signal.symbol,
+                side=side,
                 indicators=signal.indicators,
                 df=symbol_df,
+                market_context=market_context,
                 portfolio_context=portfolio_context,
             )
             if not intelligence_decision.accepted:
@@ -288,8 +300,14 @@ class ExecutionEngine:
         try:
             account = self.broker.get_account()
             cash = account.get('cash', 0.0)
-        except Exception:
-            cash = portfolio_value * 0.5
+        except Exception as e:
+            logger.error(
+                "engine.broker_unavailable",
+                symbol=signal.symbol,
+                error=type(e).__name__,
+            )
+            # Do NOT invent portfolio state — abort this signal and let the caller retry
+            return None
 
         # Build market_data context for risk engine
         # Dynamic sector map: includes signal symbol + all current position symbols
