@@ -128,6 +128,17 @@ class MarketData(Base):
     volume = Column(Float)
 
 
+class SectorCache(Base):
+    """Cached sector classifications for symbols (manual or auto-resolved)."""
+    __tablename__ = 'sector_cache'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    symbol = Column(String(20), nullable=False, unique=True, index=True)
+    sector = Column(String(50), nullable=False)
+    source = Column(String(20), default="manual")  # manual / auto
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # Database Manager
 # ──────────────────────────────────────────────────────────────────────────
@@ -287,3 +298,30 @@ class DatabaseManager:
                 "largest_win": max(pnls) if pnls else 0,
                 "largest_loss": min(pnls) if pnls else 0,
             }
+
+    # --- Sector Cache ---
+
+    def get_cached_sector(self, symbol: str) -> Optional[str]:
+        """Look up a cached sector classification for a symbol."""
+        with self.get_session() as session:
+            entry = session.query(SectorCache).filter_by(symbol=symbol.upper()).first()
+            return entry.sector if entry else None
+
+    def set_cached_sector(self, symbol: str, sector: str, source: str = "manual"):
+        """Insert or update a sector classification for a symbol."""
+        with self.get_session() as session:
+            entry = session.query(SectorCache).filter_by(symbol=symbol.upper()).first()
+            if entry:
+                entry.sector = sector
+                entry.source = source
+                entry.updated_at = datetime.utcnow()
+            else:
+                entry = SectorCache(symbol=symbol.upper(), sector=sector, source=source)
+                session.add(entry)
+            session.commit()
+
+    def get_all_cached_sectors(self) -> dict[str, str]:
+        """Return all cached sector classifications as {symbol: sector}."""
+        with self.get_session() as session:
+            entries = session.query(SectorCache).all()
+            return {e.symbol: e.sector for e in entries}

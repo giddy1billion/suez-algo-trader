@@ -675,6 +675,16 @@ def cmd_run(
             authorized_users=set(chat_ids),
         )
 
+        # Register sector management commands router
+        from src.notifications.telegram_sector_commands import (
+            sector_router, set_sector_components,
+        )
+        telegram_bot.dp.include_router(sector_router)
+        set_sector_components(
+            db=db,
+            authorized_users=set(chat_ids),
+        )
+
         def _run_telegram_bot(bot):
             import asyncio
             loop = asyncio.new_event_loop()
@@ -951,6 +961,9 @@ def cmd_run(
                 with _broker_lock:
                     account = broker.get_account()
                 risk.reset_daily(account['equity'])
+                # Refresh sector cache from DB as a daily backstop
+                from src.execution.sector_lookup import reload_cache as _reload_sector_cache
+                _reload_sector_cache(db)
                 logger.info("scheduler.daily_risk_reset", equity=account['equity'])
                 _send_telegram("🔄 <b>Daily Risk Reset</b>\nCounters cleared for new trading day.")
             except Exception as e:

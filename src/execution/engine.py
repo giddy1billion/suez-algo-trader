@@ -15,6 +15,7 @@ from typing import Optional
 from src.broker.alpaca_client import AlpacaBroker
 from src.risk.manager import RiskManager, RiskLimits
 from src.risk.engine import RiskEngine
+from src.execution.sector_lookup import build_sector_map
 from src.risk.models import TradeRequest, RiskDecision
 from src.strategy.base import BaseStrategy, TradeSignal, Signal
 from src.data.store import DatabaseManager
@@ -29,19 +30,6 @@ from src.core.events import (
 from src.core.state_machine import TradeState
 
 logger = get_logger(__name__)
-
-# Static sector map for known trading symbols. Used by PortfolioRiskLayer
-# for sector concentration checks. Extend as new symbols are added.
-_SECTOR_MAP = {
-    "AAPL": "technology", "MSFT": "technology", "GOOGL": "technology",
-    "AMZN": "technology", "NVDA": "technology", "META": "technology",
-    "TSLA": "consumer_discretionary", "AMD": "technology", "INTC": "technology",
-    "NFLX": "communication_services", "DIS": "communication_services",
-    "JPM": "financials", "BAC": "financials", "GS": "financials",
-    "JNJ": "healthcare", "UNH": "healthcare", "PFE": "healthcare",
-    "XOM": "energy", "CVX": "energy",
-    "WMT": "consumer_staples", "PG": "consumer_staples",
-}
 
 # Lazy-initialized trade journal (double-checked locking)
 _journal = None
@@ -304,7 +292,10 @@ class ExecutionEngine:
             cash = portfolio_value * 0.5
 
         # Build market_data context for risk engine
-        risk_market_data = {"sector_map": _SECTOR_MAP}
+        # Dynamic sector map: includes signal symbol + all current position symbols
+        position_symbols = [p.get('symbol', '') for p in positions] if positions else []
+        all_symbols = list(set([signal.symbol] + position_symbols))
+        risk_market_data = {"sector_map": build_sector_map(all_symbols, db=self.db)}
         if market_data and signal.symbol in market_data:
             df = market_data[signal.symbol]
             if len(df) > 0:

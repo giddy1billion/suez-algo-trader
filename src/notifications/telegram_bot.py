@@ -257,7 +257,10 @@ async def cmd_help(message: Message):
         "/models - List model versions\n"
         "/rollback vXXX - Rollback to model version\n"
         "/journal [SYMBOL] [N] - Trade journal entries\n"
-        "/journalstats - Journal analytics\n"
+        "/journalstats - Journal analytics\n\n"
+        "<b>Sector Management:</b>\n"
+        "/setsector SYMBOL SECTOR - Classify symbol sector\n"
+        "/sectors - List cached sector classifications\n"
     )
     await message.answer(text, parse_mode=ParseMode.HTML)
 
