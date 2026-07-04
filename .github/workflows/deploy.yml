@@ -67,7 +67,7 @@ jobs:
               TELEGRAM_CHAT_ID="${{ secrets.TELEGRAM_CHAT_ID }}" \
             --log-analytics-workspace "${{ secrets.LOG_ANALYTICS_WORKSPACE_ID }}" \
             --log-analytics-workspace-key "${{ secrets.LOG_ANALYTICS_WORKSPACE_KEY }}" \
-            --command-line "python main.py --telegram --interval 60"
+            --command-line "python main.py --interval 60"
 
       - name: Verify deployment
         run: |
