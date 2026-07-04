@@ -597,7 +597,10 @@ def cmd_run(
             import asyncio
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
-            loop.run_until_complete(bot.dp.start_polling(bot.bot))
+            try:
+                loop.run_until_complete(bot.dp.start_polling(bot.bot, handle_signals=False))
+            except Exception as e:
+                logger.error("telegram.polling_crashed", error=str(e))
 
         _telegram_thread = threading.Thread(target=_run_telegram_bot, args=(telegram_bot,), daemon=True)
         _telegram_thread.start()
@@ -612,7 +615,7 @@ def cmd_run(
     if enable_streaming:
         import asyncio as _asyncio
 
-        def _bar_handler(bar):
+        async def _bar_handler(bar):
             """Store incoming bar data from WebSocket."""
             symbol = bar.symbol
             _stream_data[symbol] = {
