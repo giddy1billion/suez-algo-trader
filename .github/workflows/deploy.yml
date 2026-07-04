@@ -77,7 +77,7 @@ jobs:
             --log-analytics-workspace ${{ secrets.LOG_ANALYTICS_WORKSPACE_ID }} \
             --log-analytics-workspace-key ${{ secrets.LOG_ANALYTICS_WORKSPACE_KEY }} \
             --command-line "python main.py --telegram --interval 60"
-n
+
       - name: Wait for container to start
         run: sleep 15
 
