@@ -4,16 +4,23 @@ on:
   push:
     branches: [master]
   workflow_dispatch:
+    inputs:
+      rollback_sha:
+        description: "Git SHA to rollback to (leave empty for latest)"
+        required: false
+        default: ""
 
 env:
   ACR_NAME: ${{ secrets.ACR_NAME }}
-  IMAGE_NAME: algo-trader
+  IMAGE_NAME: suez-algo-trader
   RESOURCE_GROUP: ${{ secrets.AZURE_RESOURCE_GROUP }}
-  CONTAINER_NAME: algo-trader
+  CONTAINER_NAME: suez-algo-trader
 
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
+    outputs:
+      image-tag: ${{ steps.meta.outputs.image_tag }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -26,17 +33,18 @@ jobs:
       - name: Login to ACR
         run: az acr login --name ${{ env.ACR_NAME }}
 
+      - name: Determine image tag
+        id: meta
+        run: |
+          SHA="${{ github.event.inputs.rollback_sha || github.sha }}"
+          echo "image_tag=${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${SHA}" >> "$GITHUB_OUTPUT"
+          echo "image_latest=${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:latest" >> "$GITHUB_OUTPUT"
+
       - name: Build and push image
         run: |
-          IMAGE_TAG=${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ github.sha }}
-          IMAGE_LATEST=${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:latest
-
-          docker build -t $IMAGE_TAG -t $IMAGE_LATEST .
-          docker push $IMAGE_TAG
-          docker push $IMAGE_LATEST
-
-    outputs:
-      image-tag: ${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          docker build -t ${{ steps.meta.outputs.image_tag }} -t ${{ steps.meta.outputs.image_latest }} .
+          docker push ${{ steps.meta.outputs.image_tag }}
+          docker push ${{ steps.meta.outputs.image_latest }}
 
   deploy:
     needs: build-and-push
@@ -52,22 +60,47 @@ jobs:
           az container create \
             --resource-group ${{ env.RESOURCE_GROUP }} \
             --name ${{ env.CONTAINER_NAME }} \
-            --image ${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ github.sha }} \
+            --image ${{ needs.build-and-push.outputs.image-tag }} \
             --registry-login-server ${{ env.ACR_NAME }}.azurecr.io \
             --registry-username ${{ secrets.ACR_USERNAME }} \
             --registry-password ${{ secrets.ACR_PASSWORD }} \
             --cpu 1 --memory 2 \
             --restart-policy Always \
             --secure-environment-variables \
-              ALPACA_API_KEY=${{ secrets.ALPACA_API_KEY }} \
-              ALPACA_SECRET_KEY=${{ secrets.ALPACA_SECRET_KEY }} \
+              TRADING_MODE=${{ secrets.TRADING_MODE }} \
+              ALPACA_PAPER_API_KEY=${{ secrets.ALPACA_PAPER_API_KEY }} \
+              ALPACA_PAPER_SECRET_KEY=${{ secrets.ALPACA_PAPER_SECRET_KEY }} \
+              ALPACA_LIVE_API_KEY=${{ secrets.ALPACA_LIVE_API_KEY }} \
+              ALPACA_LIVE_SECRET_KEY=${{ secrets.ALPACA_LIVE_SECRET_KEY }} \
               TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }} \
+              TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }} \
+            --log-analytics-workspace ${{ secrets.LOG_ANALYTICS_WORKSPACE_ID }} \
+            --log-analytics-workspace-key ${{ secrets.LOG_ANALYTICS_WORKSPACE_KEY }} \
             --command-line "python main.py --telegram --interval 60"
+
+      - name: Wait for container to start
+        run: sleep 15
 
       - name: Verify deployment
         run: |
+          STATE=$(az container show \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --name ${{ env.CONTAINER_NAME }} \
+            --query "instanceView.state" -o tsv)
+
+          echo "Container state: $STATE"
+
+          if [ "$STATE" != "Running" ]; then
+            echo "::error::Container failed to start. State: $STATE"
+            echo "--- Container logs ---"
+            az container logs \
+              --resource-group ${{ env.RESOURCE_GROUP }} \
+              --name ${{ env.CONTAINER_NAME }} || true
+            exit 1
+          fi
+
           az container show \
             --resource-group ${{ env.RESOURCE_GROUP }} \
             --name ${{ env.CONTAINER_NAME }} \
-            --query "{Status:instanceView.state, IP:ipAddress.ip}" \
+            --query "{Status:instanceView.state, Image:containers[0].image, StartTime:containers[0].instanceView.currentState.startTime}" \
             --output table
