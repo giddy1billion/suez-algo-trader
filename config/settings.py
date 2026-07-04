@@ -54,7 +54,7 @@ class Settings(BaseSettings):
 
     # --- Strategy ---
     active_strategy: str = "momentum"
-    trading_symbols: str = "AAPL,MSFT,GOOGL,AMZN,NVDA"
+    trading_symbols: str = "AAPL,MSFT,GOOGL,AMZN,NVDA,BTC/USD,ETH/USD,SOL/USD,AAVE/USD,ADA/USD"
     timeframe: str = "1Hour"
     lookback_bars: int = 200
 
