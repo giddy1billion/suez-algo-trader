@@ -1072,6 +1072,12 @@ def cmd_run(
                 except Exception as e:
                     logger.error("runtime.ml_reload_error", error=str(e))
 
+        # Sync broker reference if runtime_manager switched environments
+        if runtime_manager.broker is not broker:
+            broker = runtime_manager.broker
+            engine._broker = broker
+            logger.info("runtime.broker_synced", paper=broker.paper)
+
         # Auto-retrain ML model if needed (check every 10 cycles)
         if strategy_name == "ml" and cycle_count % 10 == 0:
             if hasattr(strategy, 'needs_retraining') and strategy.needs_retraining():
