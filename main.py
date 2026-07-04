@@ -560,6 +560,18 @@ def cmd_run(
         metrics=live_metrics,
     )
 
+    # --- Runtime Manager (hot-swap, concurrent backtest, training, A/B testing) ---
+    from src.core.runtime import RuntimeManager
+    from src.core.environment import BrokerManager
+
+    broker_manager = BrokerManager(broker)
+    runtime_manager = RuntimeManager(
+        broker_manager=broker_manager,
+        event_bus=event_bus,
+        strategy_factory=create_strategy,
+    )
+    logger.info("runtime_manager.ready", mode=runtime_manager.current_mode)
+
     # Initialize risk manager
     account = broker.get_account()
     risk.reset_daily(account['equity'])
@@ -598,6 +610,16 @@ def cmd_run(
             authorized_users=set(chat_ids),
             runtime_lock=_tg_runtime_lock,
             runtime_changes=_tg_runtime_changes,
+        )
+
+        # Register runtime capabilities commands router
+        from src.notifications.telegram_runtime_commands import (
+            runtime_router, set_runtime_components,
+        )
+        telegram_bot.dp.include_router(runtime_router)
+        set_runtime_components(
+            runtime_manager=runtime_manager,
+            authorized_users=set(chat_ids),
         )
 
         def _run_telegram_bot(bot):
@@ -1135,6 +1157,7 @@ def cmd_run(
 
     # Shutdown
     logger.info("bot.stopped", cycles=cycle_count)
+    runtime_manager.shutdown()
     if _scheduler:
         _scheduler.shutdown(wait=False)
     broker.stop_trade_stream()
