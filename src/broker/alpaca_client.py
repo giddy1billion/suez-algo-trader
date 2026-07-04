@@ -645,27 +645,18 @@ class AlpacaBroker:
     }
 
     def _detect_candle_gaps(self, df, symbol: str, timeframe: str) -> None:
-        """Detect and log missing candle gaps in bar data."""
-        import pandas as pd
+        """Detect and log missing candle gaps in bar data (calendar-aware).
 
-        expected_seconds = self._TF_EXPECTED_DELTA.get(timeframe)
-        if expected_seconds is None:
-            return  # Unknown timeframe — skip
+        Uses the market calendar subsystem to apply the correct gap threshold
+        for each asset class:
+        - Crypto (24/7): flags gaps > 1.5x the timeframe interval
+        - Equities (NYSE): accounts for overnight, weekends, and holidays
+        """
+        from src.market_calendar import classify_symbol, detect_gaps, log_gap_report
 
-        # Allow 2x the expected interval before flagging (accounts for weekends/holidays)
-        threshold = expected_seconds * 3
-        deltas = df.index.to_series().diff().dt.total_seconds().dropna()
-        gaps = deltas[deltas > threshold]
-
-        if len(gaps) > 0:
-            logger.warning(
-                "bars_df.candle_gaps_detected",
-                symbol=symbol,
-                timeframe=timeframe,
-                gap_count=len(gaps),
-                max_gap_hours=round(gaps.max() / 3600, 1),
-                first_gap=str(gaps.index[0]),
-            )
+        instrument = classify_symbol(symbol)
+        gaps = detect_gaps(df, instrument, timeframe)
+        log_gap_report(gaps, instrument, timeframe)
 
     # ──────────────────────────────────────────────────────────────────────
     # Real-time WebSocket Streaming

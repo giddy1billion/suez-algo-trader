@@ -285,11 +285,15 @@ class Backtester:
             dd = (peak - eq) / peak
             max_dd = max(max_dd, dd)
 
-        # Sharpe ratio (annualized, assuming daily)
+        # Sharpe ratio (annualized, calendar-aware)
         if len(equity_curve) > 1:
             returns = pd.Series(equity_curve).pct_change().dropna()
             if returns.std() > 0:
-                sharpe = (returns.mean() / returns.std()) * np.sqrt(252)
+                # Use calendar-aware annualization factor
+                from src.market_calendar import classify_symbol, get_annualization_factor
+                instrument = classify_symbol(symbol)
+                ann_factor = get_annualization_factor(instrument, self.strategy.timeframe)
+                sharpe = (returns.mean() / returns.std()) * ann_factor
             else:
                 sharpe = 0.0
         else:
