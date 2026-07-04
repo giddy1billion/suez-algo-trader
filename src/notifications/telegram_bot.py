@@ -2664,11 +2664,20 @@ class TelegramBotManager:
         logger.info("telegram.bot_stopped")
 
     async def send_alert(self, text: str, chat_id: int = None):
-        """Send an alert message to specified or all authorized chats."""
+        """Send an alert message to specified or all authorized chats.
+        Uses httpx directly to avoid cross-event-loop issues with aiogram's session.
+        """
+        import httpx
         targets = [chat_id] if chat_id else (self.authorized_chat_ids or list(_authorized_users))
+        url = f"https://api.telegram.org/bot{self.token}/sendMessage"
         for cid in targets:
             try:
-                await self.bot.send_message(cid, text, parse_mode=ParseMode.HTML)
+                async with httpx.AsyncClient(timeout=10) as client:
+                    await client.post(url, json={
+                        "chat_id": cid,
+                        "text": text,
+                        "parse_mode": "HTML",
+                    })
             except Exception as e:
                 logger.error("telegram.send_failed", chat_id=cid, error=str(e))
 
