@@ -35,10 +35,23 @@ jobs:
 
       - name: Determine image tag
         id: meta
+        shell: bash
         run: |
-          SHA="${{ github.event.inputs.rollback_sha || github.sha }}"
-          echo "image_tag=${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${SHA}" >> "$GITHUB_OUTPUT"
-          echo "image_latest=${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:latest" >> "$GITHUB_OUTPUT"
+          SHA="${{ github.sha }}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ github.event.inputs.rollback_sha }}" ]; then
+            SHA="${{ github.event.inputs.rollback_sha }}"
+          fi
+
+          IMAGE_TAG="${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${SHA}"
+          IMAGE_LATEST="${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:latest"
+
+          echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "image_latest=${IMAGE_LATEST}" >> "$GITHUB_OUTPUT"
+          echo "Resolved image_tag=${IMAGE_TAG}"
+
+      - name: Validate meta outputs
+        run: |
+          [ -n "${{ steps.meta.outputs.image_tag }}" ] || { echo "::error::meta.image_tag is empty"; exit 1; }
 
       - name: Build and push image
         run: |
