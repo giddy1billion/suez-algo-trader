@@ -36,6 +36,7 @@ from alpaca.data.requests import (
     CryptoBarsRequest,
     CryptoLatestQuoteRequest,
 )
+from alpaca.data.enums import DataFeed
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from alpaca.data.live import StockDataStream, CryptoDataStream
 
@@ -612,10 +613,11 @@ class AlpacaBroker:
     def get_stock_stream(self) -> StockDataStream:
         """Get or create a stock data WebSocket stream."""
         if self._stock_stream is None:
+            feed_enum = DataFeed(self.data_feed) if isinstance(self.data_feed, str) else self.data_feed
             self._stock_stream = StockDataStream(
                 api_key=self.api_key,
                 secret_key=self.secret_key,
-                feed=self.data_feed,
+                feed=feed_enum,
             )
         return self._stock_stream
 
