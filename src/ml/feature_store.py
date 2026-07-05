@@ -506,6 +506,43 @@ class FeatureStore:
         finally:
             conn.close()
 
+    # ─── Predictor Integration ─────────────────────────────────────────
+
+    def snapshot_prediction_features(
+        self,
+        features: np.ndarray,
+        model_version: str = "",
+        prediction_id: int = 0,
+        symbol: str = "unknown",
+    ) -> Optional[str]:
+        """
+        Lightweight snapshot called from ModelPredictor at prediction time.
+
+        Stores the raw feature array for later reproducibility analysis.
+        Returns snapshot_id or None if store is not configured.
+        """
+        try:
+            # Get active feature version or use model version as fallback
+            active = self.get_active_version()
+            version_id = active.version_id if active else f"model_{model_version}"
+
+            # Convert numpy array to dict (use index-based keys if no feature names)
+            if active and active.feature_names and len(active.feature_names) == features.shape[-1]:
+                values = {name: float(features.flat[i]) for i, name in enumerate(active.feature_names)}
+            else:
+                row = features.flatten()[:200]  # Cap at 200 features to avoid bloat
+                values = {f"f{i}": float(v) for i, v in enumerate(row) if not np.isnan(v)}
+
+            return self.snapshot_features(
+                version_id=version_id,
+                symbol=symbol,
+                values=values,
+                prediction_id=f"pred_{prediction_id}",
+            )
+        except Exception as e:
+            logger.debug("feature_store.snapshot_prediction_error", error=str(e))
+            return None
+
     # ─── Private helpers ────────────────────────────────────────────────
 
     def _compute_hash(

@@ -108,6 +108,7 @@ class TrainingPipeline:
         auto_deploy: bool = True,
         min_training_samples: int = 500,
         experience_db=None,
+        dataset_registry=None,
     ):
         self._registry = registry
         self._governance = governance
@@ -115,6 +116,7 @@ class TrainingPipeline:
         self._event_bus = event_bus
         self._auto_deploy = auto_deploy
         self._experience_db = experience_db  # ExperienceDatabase for closed-loop training
+        self._dataset_registry = dataset_registry  # DatasetRegistry for lineage tracking
         self._min_samples = min_training_samples
 
         # Recovery settings (loaded from config when available)
@@ -360,6 +362,22 @@ class TrainingPipeline:
         )
         progress.version = version
         progress.steps_completed = 4
+
+        # Record dataset lineage (links dataset → model version)
+        if self._dataset_registry:
+            try:
+                combined_df = pd.concat(feature_data.values()) if feature_data else pd.DataFrame()
+                self._dataset_registry.register_training_run(
+                    model_version=version,
+                    dataset_df=combined_df,
+                    symbols=symbols,
+                    feature_columns=feature_cols,
+                    pipeline_id=progress.pipeline_id,
+                    metrics=metrics,
+                )
+                logger.info("training_pipeline.dataset_registered", version=version)
+            except Exception as e:
+                logger.warning("training_pipeline.dataset_registry_error", error=str(e))
 
         # Step 5: Governance validation
         progress.status = PipelineStatus.VALIDATING

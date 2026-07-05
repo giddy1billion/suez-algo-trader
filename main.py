@@ -545,7 +545,7 @@ def cmd_run(
     from src.ml.feedback_loop import (
         ExperienceDatabase, PostTradeValidator, ContinuousCalibrationMonitor
     )
-    from src.ml.promotion_engine import ModelPromotionEngine
+    from src.ml.promotion_engine import ModelPromotionEngine, ModelRollbackMonitor
 
     experience_db = ExperienceDatabase()
     post_trade_validator = PostTradeValidator(experience_db)
@@ -554,10 +554,18 @@ def cmd_run(
         min_evaluation_trades=30,
         min_improvement_pct=5.0,
     )
+    rollback_monitor = ModelRollbackMonitor(
+        min_sharpe=-0.5,
+        max_drawdown_pct=15.0,
+        min_win_rate=0.35,
+        max_consecutive_losses=8,
+        evaluation_window=20,
+        cooldown_hours=24.0,
+    )
 
     # Subscribe TradeClosed events to the post-trade validator
     def _on_trade_closed(event):
-        """Record every trade close as a training sample."""
+        """Record every trade close as a training sample with full context."""
         try:
             trade_result = {
                 "trade_id": event.trade_id,
@@ -566,8 +574,33 @@ def cmd_run(
                 "pnl": event.pnl,
                 "pnl_pct": event.pnl_pct,
                 "reason": event.reason,
+                "entry_price": event.entry_price,
+                "side": event.side,
+                "entry_time": event.entry_time,
+                "exit_time": event.exit_time,
+                "model_version": event.model_version,
+                "strategy_name": event.strategy_name,
+                "signal_package_id": event.signal_package_id,
             }
             post_trade_validator.validate_trade(trade_result)
+
+            # Feed rollback monitor and check for auto-rollback
+            rollback_monitor.record_trade(trade_result)
+            rollback_decision = rollback_monitor.check_rollback()
+            if rollback_decision and rollback_decision.get("should_rollback"):
+                rollback_to = rollback_decision.get("rollback_to")
+                reason = rollback_decision.get("reason", "performance degradation")
+                if rollback_to:
+                    try:
+                        runtime_manager.swap_model(rollback_to)
+                        rollback_monitor.acknowledge_rollback()
+                        logger.warning(
+                            "auto_rollback.executed",
+                            reason=reason,
+                            rollback_to=rollback_to,
+                        )
+                    except Exception as re:
+                        logger.error("auto_rollback.failed", error=str(re))
         except Exception as e:
             logger.debug("feedback_loop.score_error", error=str(e))
 
@@ -978,47 +1011,41 @@ def cmd_run(
                 _send_telegram(f"<b>⚠️ Auto-Backtest Failed</b>\n{str(e)[:200]}")
 
         def _auto_train():
-            """Run automated ML training and report to Telegram."""
+            """Run automated ML training through the governed TrainingPipeline."""
             try:
                 _send_telegram("🧠 <b>Auto ML Training Started...</b>")
                 train_symbols = symbols[:10]
-                bars = settings.auto_train_bars
 
-                ml_strategy = MLStrategy(
-                    symbols=train_symbols,
-                    timeframe=timeframe,
-                    lookback=500,
-                    model_path=settings.ml_model_path,
-                    min_confidence=settings.ml_min_confidence,
-                )
-
-                training_data = {}
-                for sym in train_symbols:
+                # Completion callback — runs when pipeline finishes
+                def _on_pipeline_complete(progress):
                     try:
-                        with _broker_lock:
-                            df = broker.get_bars_df(sym, timeframe, limit=bars)
-                        if df is not None and len(df) >= 200:
-                            training_data[sym] = df
-                    except Exception:
-                        continue
+                        if progress.status.value == "completed":
+                            with _runtime_lock:
+                                _runtime_changes["trigger_train"] = True
+                            _send_telegram(
+                                f"✅ <b>ML Model Trained (Governed Pipeline)</b>\n"
+                                f"Symbols: {len(train_symbols)}\n"
+                                f"Model: {progress.version or 'unknown'}\n"
+                                f"CV Accuracy: {progress.metrics.get('cv_accuracy', 0):.3f}\n"
+                                f"Governance: {'✅ passed' if progress.auto_deployed else '⚠️ not deployed'}\n"
+                                f"Duration: {progress.duration_seconds:.0f}s"
+                            )
+                        else:
+                            _send_telegram(
+                                f"⚠️ <b>ML Training Failed</b>\n"
+                                f"Error: {progress.error or 'unknown'}"
+                            )
+                    except Exception as e:
+                        logger.debug("auto_train.callback_error", error=str(e))
 
-                if not training_data:
-                    _send_telegram("⚠️ <b>Auto Training:</b> No sufficient data")
-                    return
-
-                ml_strategy.train(training_data)
-
-                # If current strategy is ML, trigger reload
-                with _runtime_lock:
-                    _runtime_changes["trigger_train"] = True
-
-                _send_telegram(
-                    f"✅ <b>ML Model Retrained</b>\n"
-                    f"Symbols: {len(training_data)}/{len(train_symbols)}\n"
-                    f"Bars/symbol: {bars}\n"
-                    f"Model saved. Active strategy will reload."
+                # Use RuntimeManager's governed TrainingPipeline
+                runtime_manager.train_model(
+                    symbols=train_symbols,
+                    lookback_bars=settings.auto_train_bars,
+                    trigger="scheduled",
+                    callback=_on_pipeline_complete,
                 )
-                logger.info("scheduler.auto_train_complete", symbols=len(training_data))
+                logger.info("scheduler.auto_train_launched", symbols=len(train_symbols))
             except Exception as e:
                 logger.error("scheduler.auto_train_error", error=str(e))
                 _send_telegram(f"<b>⚠️ Auto Training Failed</b>\n{str(e)[:200]}")
@@ -1138,8 +1165,19 @@ def cmd_run(
                         f"⚠️ <b>Model Calibration Drift</b>\n"
                         f"ECE: {report.get('ece', 0):.3f}\n"
                         f"Recommendation: {report['recommendation']}\n"
-                        f"Auto-retraining will trigger on next cycle."
+                        f"Triggering automatic retraining..."
                     )
+                    # Actually trigger retraining through the governed pipeline
+                    try:
+                        if not runtime_manager.is_training():
+                            runtime_manager.train_model(
+                                trigger="calibration_drift",
+                            )
+                            logger.info("calibration.retrain_triggered")
+                        else:
+                            logger.info("calibration.retrain_skipped_already_running")
+                    except Exception as te:
+                        logger.error("calibration.retrain_trigger_error", error=str(te))
                 elif report.get("recommendation") == "needs_recalibration":
                     logger.info("calibration.minor_drift", ece=report.get("ece"))
                 else:

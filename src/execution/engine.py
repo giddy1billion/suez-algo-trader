@@ -110,6 +110,11 @@ class ExecutionEngine:
         self._signal_builder = SignalPackageBuilder(signal_bridge_config)
         self._signal_monitor = ActiveSignalMonitor()
 
+        # Trade context tracking for closed-loop feedback
+        # Maps trade_id → {signal_package_id, model_version, strategy, entry_time, side, entry_price}
+        self._trade_context: dict[str, dict] = {}
+        self._trade_context_lock = threading.Lock()
+
     # ──────────────────────────────────────────────────────────────────────
     # Signal Monitor (public API for main loop)
     # ──────────────────────────────────────────────────────────────────────
@@ -619,6 +624,17 @@ class ExecutionEngine:
                     take_profit=signal.take_profit or 0.0,
                     source="engine",
                 ))
+
+                # Store trade context for closed-loop feedback on exit
+                with self._trade_context_lock:
+                    self._trade_context[trade_id] = {
+                        "signal_package_id": signal_package.signal_id if signal_package else "",
+                        "model_version": getattr(signal, "model_version", ""),
+                        "strategy": self._current_strategy_name,
+                        "entry_time": datetime.now(timezone.utc).isoformat(),
+                        "side": side,
+                        "entry_price": fill_price,
+                    }
             else:
                 # Deferred fill — stay in ACCEPTED, trade stream will confirm
                 if trade_lifecycle:
@@ -722,7 +738,9 @@ class ExecutionEngine:
                                     trade_id = t.trade_id
                                     break
 
-                        # Publish TradeClosed event
+                        # Publish TradeClosed event with full context
+                        with self._trade_context_lock:
+                            ctx = self._trade_context.pop(trade_id, {})
                         self._publish(TradeClosed(
                             trade_id=trade_id,
                             symbol=symbol,
@@ -731,6 +749,13 @@ class ExecutionEngine:
                             pnl_pct=pnl_pct,
                             reason=exit_signal.reason[:50] if exit_signal.reason else "strategy_exit",
                             source="engine",
+                            entry_price=ctx.get("entry_price", entry_price),
+                            side=ctx.get("side", pos.get("side", "")),
+                            entry_time=ctx.get("entry_time", ""),
+                            exit_time=datetime.now(timezone.utc).isoformat(),
+                            model_version=ctx.get("model_version", ""),
+                            strategy_name=ctx.get("strategy", self._current_strategy_name),
+                            signal_package_id=ctx.get("signal_package_id", ""),
                         ))
 
                         # Journal the exit

@@ -518,3 +518,48 @@ class DatasetRegistry:
     def prediction_count(self) -> int:
         result = self._conn.execute("SELECT COUNT(*) FROM prediction_records").fetchone()
         return result[0]
+
+    # --- Convenience Integration API ---
+
+    def register_training_run(
+        self,
+        model_version: str,
+        dataset_df: pd.DataFrame,
+        symbols: list[str],
+        feature_columns: list[str],
+        pipeline_id: str,
+        metrics: Optional[dict] = None,
+        timeframe: str = "1Hour",
+    ) -> str:
+        """
+        Register both dataset and model lineage in one call.
+
+        Called from TrainingPipeline after model is trained and registered.
+        Returns dataset_id.
+        """
+        # Register dataset
+        feature_hash = hashlib.sha256(
+            json.dumps(sorted(feature_columns)).encode()
+        ).hexdigest()[:16]
+        feature_version_id = f"fv_{feature_hash}"
+
+        dataset_id = self.register_dataset(
+            data=dataset_df,
+            symbols=symbols,
+            timeframe=timeframe,
+            feature_version_id=feature_version_id,
+            source="training_pipeline",
+            description=f"Pipeline {pipeline_id}, {len(symbols)} symbols",
+        )
+
+        # Register model lineage
+        self.register_model(
+            model_version=model_version,
+            dataset_id=dataset_id,
+            feature_version_id=feature_version_id,
+            pipeline_id=pipeline_id,
+            hyperparameters=metrics.get("hyperparameters") if metrics else None,
+            training_metrics=metrics,
+        )
+
+        return dataset_id

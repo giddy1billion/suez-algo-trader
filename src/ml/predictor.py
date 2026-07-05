@@ -44,11 +44,13 @@ class ModelPredictor:
         event_bus=None,
         auto_reload: bool = True,
         check_interval_seconds: float = 30.0,
+        feature_store=None,
     ):
         self._registry = registry
         self._event_bus = event_bus
         self._auto_reload = auto_reload
         self._check_interval = check_interval_seconds
+        self._feature_store = feature_store
 
         # Model state (double-buffered for zero-downtime swap)
         self._model = None
@@ -197,6 +199,18 @@ class ModelPredictor:
                 self._prediction_count += 1
                 elapsed_ms = (time.perf_counter() - start_time) * 1000
                 self._total_latency_ms += elapsed_ms
+
+                # Snapshot features for reproducibility (non-blocking)
+                if self._feature_store:
+                    try:
+                        self._feature_store.snapshot_prediction_features(
+                            features=features,
+                            model_version=self._version,
+                            prediction_id=self._prediction_count,
+                        )
+                    except Exception:
+                        pass  # Feature store failures must not block predictions
+
                 return proba
             except Exception as e:
                 self._errors.append({

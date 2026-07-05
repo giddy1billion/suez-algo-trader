@@ -160,6 +160,14 @@ class TradeClosed(Event):
     pnl: float = 0.0
     pnl_pct: float = 0.0
     reason: str = ""
+    # Enriched fields for closed-loop feedback
+    entry_price: float = 0.0
+    side: str = ""  # "buy" or "sell"
+    entry_time: str = ""  # ISO timestamp
+    exit_time: str = ""  # ISO timestamp
+    model_version: str = ""
+    strategy_name: str = ""
+    signal_package_id: str = ""
 
 
 # ---------------------------------------------------------------------------
