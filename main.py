@@ -442,15 +442,50 @@ def cmd_run(
         logger.info("orchestrator.multi_mode", strategies=len(orchestrator), weights=orchestrator.get_weights())
     else:
         # Single-strategy mode (backward compatible)
-        strategy = create_strategy(strategy_name, symbols, timeframe, lookback)
-        orchestrator.add_strategy(
-            name=strategy_name,
-            strategy=strategy,
-            symbols=symbols,
-            timeframe=timeframe,
-            interval=interval,
-            weight=1.0,
-        )
+        # Split: crypto gets its own optimized slot; equities get the primary slot
+        _single_crypto = [s for s in symbols if "/" in s]
+        _single_equity = [s for s in symbols if "/" not in s]
+
+        if _single_crypto and strategy_name == "momentum":
+            # Register equity-only primary (or all symbols if no equities)
+            primary_symbols = _single_equity if _single_equity else symbols
+            strategy = create_strategy(strategy_name, primary_symbols, timeframe, lookback)
+            orchestrator.add_strategy(
+                name=strategy_name,
+                strategy=strategy,
+                symbols=primary_symbols,
+                timeframe=timeframe,
+                interval=interval,
+                weight=1.0,
+            )
+            # Dedicated crypto slot with optimized params (faster EMAs, lower timeframe)
+            crypto_strat = create_strategy("momentum", _single_crypto, settings.crypto_timeframe, lookback)
+            orchestrator.add_strategy(
+                name="crypto_momentum",
+                strategy=crypto_strat,
+                symbols=_single_crypto,
+                timeframe=settings.crypto_timeframe,
+                interval=max(30, interval // 2),
+                weight=0.8,
+            )
+        else:
+            # Non-momentum or no crypto: single strategy handles everything
+            strategy = create_strategy(strategy_name, symbols, timeframe, lookback)
+            orchestrator.add_strategy(
+                name=strategy_name,
+                strategy=strategy,
+                symbols=symbols,
+                timeframe=timeframe,
+                interval=interval,
+                weight=1.0,
+            )
+
+    logger.info(
+        "orchestrator.configured",
+        strategies=len(orchestrator),
+        slots=list(orchestrator.strategy_names) if hasattr(orchestrator, 'strategy_names') else [],
+        weights=orchestrator.get_weights(),
+    )
 
     risk = RiskManager(RiskLimits(
         max_position_size_pct=settings.max_position_size_pct,
@@ -1263,9 +1298,9 @@ def cmd_run(
                               ops_handler=ops_handler,
                               runtime_state=runtime_state)
 
-    # Cache crypto-only strategy to avoid re-creating each cycle
+    # Cache crypto-only strategy (fallback, used by runtime-change handlers)
     crypto_only = [s for s in symbols if "/" in s]
-    crypto_strategy = create_strategy(strategy_name, crypto_only, timeframe, lookback) if crypto_only else None
+    crypto_strategy = create_strategy(strategy_name, crypto_only, settings.crypto_timeframe, lookback) if crypto_only else None
 
     while not _shutdown_event.is_set():
         cycle_count += 1
@@ -1345,7 +1380,7 @@ def cmd_run(
                 strategy_name = new_name
                 # Rebuild crypto strategy too
                 crypto_only = [s for s in strategy.symbols if "/" in s]
-                crypto_strategy = create_strategy(new_name, crypto_only, timeframe, lookback) if crypto_only else None
+                crypto_strategy = create_strategy(new_name, crypto_only, settings.crypto_timeframe, lookback) if crypto_only else None
 
             if changes.get("symbols"):
                 new_symbols = changes["symbols"]
@@ -1353,7 +1388,7 @@ def cmd_run(
                 symbols = new_symbols
                 strategy = create_strategy(strategy_name, symbols, timeframe, lookback)
                 crypto_only = [s for s in symbols if "/" in s]
-                crypto_strategy = create_strategy(strategy_name, crypto_only, timeframe, lookback) if crypto_only else None
+                crypto_strategy = create_strategy(strategy_name, crypto_only, settings.crypto_timeframe, lookback) if crypto_only else None
 
             if changes.get("interval"):
                 interval = changes["interval"]
@@ -1364,21 +1399,21 @@ def cmd_run(
                 logger.info("runtime.timeframe_change", timeframe=timeframe)
                 strategy = create_strategy(strategy_name, symbols, timeframe, lookback)
                 crypto_only = [s for s in symbols if "/" in s]
-                crypto_strategy = create_strategy(strategy_name, crypto_only, timeframe, lookback) if crypto_only else None
+                crypto_strategy = create_strategy(strategy_name, crypto_only, settings.crypto_timeframe, lookback) if crypto_only else None
 
             if changes.get("lookback"):
                 lookback = changes["lookback"]
                 logger.info("runtime.lookback_change", lookback=lookback)
                 strategy = create_strategy(strategy_name, symbols, timeframe, lookback)
                 crypto_only = [s for s in symbols if "/" in s]
-                crypto_strategy = create_strategy(strategy_name, crypto_only, timeframe, lookback) if crypto_only else None
+                crypto_strategy = create_strategy(strategy_name, crypto_only, settings.crypto_timeframe, lookback) if crypto_only else None
 
             if changes.get("config_updates"):
                 # Strategy params changed — rebuild strategy with new settings
                 logger.info("runtime.config_update", params=list(changes["config_updates"].keys()))
                 strategy = create_strategy(strategy_name, symbols, timeframe, lookback)
                 crypto_only = [s for s in symbols if "/" in s]
-                crypto_strategy = create_strategy(strategy_name, crypto_only, timeframe, lookback) if crypto_only else None
+                crypto_strategy = create_strategy(strategy_name, crypto_only, settings.crypto_timeframe, lookback) if crypto_only else None
 
             if changes.get("trigger_train") and strategy_name == "ml":
                 logger.info("runtime.ml_retrain_triggered")
@@ -1448,20 +1483,21 @@ def cmd_run(
             if stock_symbols and not broker.is_market_open():
                 next_open = broker.next_market_open()
                 logger.info("market.closed", next_open=str(next_open))
-                # Only run crypto strategies when stock market closed
-                if strategy_name == "multi":
-                    for slot_name in orchestrator.strategy_names:
-                        slot = orchestrator._slots[slot_name]
-                        has_crypto = any("/" in s for s in slot.symbols)
-                        if not has_crypto:
-                            continue  # skip stock-only strategies
-                    with _broker_lock:
-                        results = orchestrator.run_due_strategies(engine)
-                elif crypto_strategy:
-                    with _broker_lock:
-                        results = engine.run_cycle(crypto_strategy)
-                else:
-                    results = []
+                # Market closed: run crypto strategies via orchestrator (has correct params)
+                # Temporarily disable stock-only slots so only crypto executes
+                _disabled_slots = []
+                for slot_name in list(orchestrator.strategy_names):
+                    slot = orchestrator._slots.get(slot_name)
+                    if slot and slot.enabled and not any("/" in s for s in slot.symbols):
+                        orchestrator.disable_strategy(slot_name)
+                        _disabled_slots.append(slot_name)
+
+                with _broker_lock:
+                    results = orchestrator.run_due_strategies(engine)
+
+                # Re-enable stock slots for next market-open cycle
+                for slot_name in _disabled_slots:
+                    orchestrator.enable_strategy(slot_name)
             else:
                 # Full execution — use orchestrator for all strategies
                 with _broker_lock:
