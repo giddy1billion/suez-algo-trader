@@ -50,6 +50,13 @@ from src.config.typed_config import (
     build_telegram_config,
     build_exchange_config,
 )
+from src.config.backtest_params import (
+    backtest_params,
+    get_backtest_config,
+    get_fee_for_symbol,
+    set_symbol_override,
+    set_asset_class_override,
+)
 
 __all__ = [
     # Core
@@ -99,4 +106,10 @@ __all__ = [
     "build_ml_config",
     "build_telegram_config",
     "build_exchange_config",
+    # Backtest Params (asset-class aware)
+    "backtest_params",
+    "get_backtest_config",
+    "get_fee_for_symbol",
+    "set_symbol_override",
+    "set_asset_class_override",
 ]

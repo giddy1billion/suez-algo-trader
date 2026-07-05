@@ -369,12 +369,20 @@ class BacktestRunner:
         job.started_at = datetime.now(timezone.utc)
 
         try:
-            bt = Backtester(
-                strategy=strategy,
-                initial_capital=capital,
-                commission_pct=self._commission_pct,
-                slippage_pct=self._slippage_pct,
-            )
+            # Use asset-class-aware costs when runner uses default commission/slippage
+            if self._commission_pct == 0.001 and self._slippage_pct == 0.0005:
+                bt = Backtester.for_symbol(
+                    strategy=strategy,
+                    symbol=symbol,
+                    initial_capital=capital,
+                )
+            else:
+                bt = Backtester(
+                    strategy=strategy,
+                    initial_capital=capital,
+                    commission_pct=self._commission_pct,
+                    slippage_pct=self._slippage_pct,
+                )
             result = bt.run(data, symbol=symbol)
             job.result = result
             job.status = BacktestStatus.COMPLETED

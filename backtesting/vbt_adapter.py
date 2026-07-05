@@ -51,6 +51,21 @@ def _safe_profit_factor(wins: list, losses: list) -> float:
     return gross_profit / gross_loss
 
 
+def _compute_atr(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int = 14) -> np.ndarray:
+    """Compute Average True Range over a numpy array of OHLC data."""
+    n = len(close)
+    tr = np.zeros(n)
+    tr[0] = high[0] - low[0]
+    for i in range(1, n):
+        tr[i] = max(high[i] - low[i], abs(high[i] - close[i - 1]), abs(low[i] - close[i - 1]))
+    atr = np.full(n, np.nan)
+    if n >= period:
+        atr[period - 1] = np.mean(tr[:period])
+        for i in range(period, n):
+            atr[i] = (atr[i - 1] * (period - 1) + tr[i]) / period
+    return atr
+
+
 def _numpy_ema_crossover_backtest(
     df: pd.DataFrame,
     fast_ema: int = 12,
@@ -58,11 +73,20 @@ def _numpy_ema_crossover_backtest(
     initial_cash: float = 10000.0,
     fees: float = 0.001,
     risk_per_trade: float = 1.0,
+    atr_stop_multiplier: float = 0.0,
+    cooldown_bars: int = 0,
+    annualization_periods: float = 252.0,
 ) -> dict:
     """Vectorized EMA crossover backtest using pure numpy/pandas.
-    
+
     Args:
-        risk_per_trade: Fraction of equity to risk per trade (1.0 = all-in, 0.02 = 2%)
+        risk_per_trade: Fraction of equity to risk per trade (1.0 = all-in, 0.02 = 2%).
+        atr_stop_multiplier: If > 0, use ATR-based stop-loss (N × ATR below entry).
+            Set to 0 to disable stop-loss (original behavior).
+        cooldown_bars: Minimum bars to wait between exit and next entry.
+            Set to 0 to disable cooldown (original behavior).
+        annualization_periods: Periods per year for Sharpe calculation.
+            Equity default ~252 (trades/year proxy). Adjust for crypto/intraday.
     """
     close = df['close'].values.astype(float)
     n = len(close)
@@ -82,6 +106,18 @@ def _numpy_ema_crossover_backtest(
     fast = pd.Series(close).ewm(span=fast_ema, adjust=False).mean().values
     slow = pd.Series(close).ewm(span=slow_ema, adjust=False).mean().values
 
+    # Compute ATR if stop-loss is enabled
+    has_stops = atr_stop_multiplier > 0
+    atr = None
+    if has_stops:
+        high = df['high'].values.astype(float) if 'high' in df.columns else close
+        low = df['low'].values.astype(float) if 'low' in df.columns else close
+        if np.any(np.isnan(high)):
+            high = pd.Series(high).ffill().bfill().values
+        if np.any(np.isnan(low)):
+            low = pd.Series(low).ffill().bfill().values
+        atr = _compute_atr(high, low, close, period=14)
+
     # Signals: +1 when fast crosses above slow, -1 when below
     fast_above = fast > slow
     entries = np.zeros(n, dtype=bool)
@@ -89,22 +125,51 @@ def _numpy_ema_crossover_backtest(
     entries[1:] = fast_above[1:] & ~fast_above[:-1]  # cross above
     exits[1:] = ~fast_above[1:] & fast_above[:-1]    # cross below
 
-    # Simulate trades
+    # Simulate trades with stop-loss and cooldown
     cash = initial_cash
     position = 0.0
     trades = []
     entry_price = 0.0
+    stop_price = 0.0
+    last_exit_bar = -cooldown_bars - 1  # Allow immediate first entry
 
     for i in range(n):
+        # Check stop-loss on open position
+        if position > 0 and has_stops and stop_price > 0:
+            check_price = df['low'].iloc[i] if 'low' in df.columns else close[i]
+            if check_price <= stop_price:
+                exit_at = stop_price
+                proceeds = position * exit_at * (1 - fees)
+                pnl = proceeds - (position * entry_price)
+                trades.append({
+                    'entry_price': entry_price,
+                    'exit_price': exit_at,
+                    'pnl': pnl,
+                    'return': (exit_at - entry_price) / entry_price,
+                    'exit_reason': 'stop_loss',
+                })
+                cash += proceeds
+                position = 0.0
+                last_exit_bar = i
+                continue
+
         if entries[i] and position == 0:
+            # Enforce cooldown
+            if (i - last_exit_bar) < cooldown_bars:
+                continue
             # Buy — use risk_per_trade fraction of available cash
             invest_amount = cash * min(risk_per_trade, 1.0)
             qty = (invest_amount * (1 - fees)) / close[i]
             position = qty
             entry_price = close[i]
             cash -= invest_amount
+            # Set stop-loss
+            if has_stops and atr is not None and not np.isnan(atr[i]):
+                stop_price = entry_price - (atr[i] * atr_stop_multiplier)
+            else:
+                stop_price = 0.0
         elif exits[i] and position > 0:
-            # Sell
+            # Sell on EMA cross
             proceeds = position * close[i] * (1 - fees)
             pnl = proceeds - (position * entry_price)
             trades.append({
@@ -112,9 +177,11 @@ def _numpy_ema_crossover_backtest(
                 'exit_price': close[i],
                 'pnl': pnl,
                 'return': (close[i] - entry_price) / entry_price,
+                'exit_reason': 'signal',
             })
             cash += proceeds
             position = 0.0
+            last_exit_bar = i
 
     # Final value
     final_value = cash + position * close[-1] * (1 - fees) if position > 0 else cash
@@ -125,11 +192,10 @@ def _numpy_ema_crossover_backtest(
     losses = [t for t in trades if t['pnl'] <= 0]
     win_rate = len(wins) / len(trades) if trades else 0.0
 
-    # Trade Sharpe (not annualized daily Sharpe) — computed from per-trade returns,
-    # scaled by sqrt(252) as a rough annualization proxy.
+    # Trade Sharpe scaled by annualization_periods
     if trades:
         returns = np.array([t['return'] for t in trades])
-        sharpe = (returns.mean() / returns.std() * np.sqrt(252)) if returns.std() > 0 else 0.0
+        sharpe = (returns.mean() / returns.std() * np.sqrt(annualization_periods)) if returns.std() > 0 else 0.0
     else:
         sharpe = 0.0
 
@@ -137,15 +203,34 @@ def _numpy_ema_crossover_backtest(
     equity = np.full(n, initial_cash, dtype=float)
     pos = 0.0
     c = initial_cash
+    ep = 0.0
+    sp = 0.0
+    last_exit_eq = -cooldown_bars - 1
     for i in range(n):
-        if entries[i] and pos == 0:
+        # Stop-loss exit in equity tracking
+        if pos > 0 and has_stops and sp > 0:
+            check_p = df['low'].iloc[i] if 'low' in df.columns else close[i]
+            if check_p <= sp:
+                c += pos * sp * (1 - fees)
+                pos = 0.0
+                last_exit_eq = i
+                equity[i] = c
+                continue
+
+        if entries[i] and pos == 0 and (i - last_exit_eq) >= cooldown_bars:
             invest_amount = c * min(risk_per_trade, 1.0)
             qty = (invest_amount * (1 - fees)) / close[i]
             pos = qty
+            ep = close[i]
             c -= invest_amount
+            if has_stops and atr is not None and not np.isnan(atr[i]):
+                sp = ep - (atr[i] * atr_stop_multiplier)
+            else:
+                sp = 0.0
         elif exits[i] and pos > 0:
             c += pos * close[i] * (1 - fees)
             pos = 0.0
+            last_exit_eq = i
         equity[i] = c + pos * close[i]
 
     running_max = np.maximum.accumulate(equity)
@@ -171,6 +256,10 @@ def _numpy_parameter_sweep(
     slow_range: range = range(20, 56, 2),
     initial_cash: float = 10000.0,
     fees: float = 0.001,
+    risk_per_trade: float = 1.0,
+    atr_stop_multiplier: float = 0.0,
+    cooldown_bars: int = 0,
+    annualization_periods: float = 252.0,
 ) -> pd.DataFrame:
     """Brute-force parameter sweep using numpy fallback.
     Default ranges include (12, 26) for direct comparison with single backtest.
@@ -181,7 +270,13 @@ def _numpy_parameter_sweep(
             if fast_w >= slow_w:
                 continue
             try:
-                metrics = _numpy_ema_crossover_backtest(df, fast_w, slow_w, initial_cash, fees)
+                metrics = _numpy_ema_crossover_backtest(
+                    df, fast_w, slow_w, initial_cash, fees,
+                    risk_per_trade=risk_per_trade,
+                    atr_stop_multiplier=atr_stop_multiplier,
+                    cooldown_bars=cooldown_bars,
+                    annualization_periods=annualization_periods,
+                )
                 results.append({
                     'fast_window': fast_w,
                     'slow_window': slow_w,
@@ -208,6 +303,9 @@ def vectorbt_momentum_backtest(
     initial_cash: float = 10000.0,
     fees: float = 0.001,
     risk_per_trade: float = 1.0,
+    atr_stop_multiplier: float = 0.0,
+    cooldown_bars: int = 0,
+    annualization_periods: float = 252.0,
 ) -> dict:
     """
     Vectorized EMA crossover backtest.
@@ -220,13 +318,21 @@ def vectorbt_momentum_backtest(
         initial_cash: Starting capital
         fees: Trading fees (0.001 = 0.1%)
         risk_per_trade: Fraction of equity to invest per trade (1.0 = all-in)
+        atr_stop_multiplier: ATR-based stop-loss multiplier (0 = disabled)
+        cooldown_bars: Minimum bars between exit and next entry (0 = disabled)
+        annualization_periods: Periods/year for Sharpe ratio annualization
 
     Returns:
         Dict with performance metrics
     """
     if not _VBT_AVAILABLE:
         logger.debug("vbt.using_numpy_fallback")
-        return _numpy_ema_crossover_backtest(df, fast_ema, slow_ema, initial_cash, fees, risk_per_trade)
+        return _numpy_ema_crossover_backtest(
+            df, fast_ema, slow_ema, initial_cash, fees, risk_per_trade,
+            atr_stop_multiplier=atr_stop_multiplier,
+            cooldown_bars=cooldown_bars,
+            annualization_periods=annualization_periods,
+        )
 
     close = df['close']
 
@@ -268,6 +374,10 @@ def vectorbt_parameter_sweep(
     slow_range: range = range(20, 56, 2),
     initial_cash: float = 10000.0,
     fees: float = 0.001,
+    risk_per_trade: float = 1.0,
+    atr_stop_multiplier: float = 0.0,
+    cooldown_bars: int = 0,
+    annualization_periods: float = 252.0,
 ) -> pd.DataFrame:
     """
     Parameter optimization — tests ALL EMA combinations.
@@ -281,7 +391,13 @@ def vectorbt_parameter_sweep(
     """
     if not _VBT_AVAILABLE:
         logger.debug("vbt.sweep_numpy_fallback")
-        return _numpy_parameter_sweep(df, fast_range, slow_range, initial_cash, fees)
+        return _numpy_parameter_sweep(
+            df, fast_range, slow_range, initial_cash, fees,
+            risk_per_trade=risk_per_trade,
+            atr_stop_multiplier=atr_stop_multiplier,
+            cooldown_bars=cooldown_bars,
+            annualization_periods=annualization_periods,
+        )
 
     close = df['close']
 
@@ -341,14 +457,17 @@ def vectorbt_multi_symbol_backtest(
     fast_ema: int = 12,
     slow_ema: int = 26,
     initial_cash: float = 10000.0,
+    use_asset_class_params: bool = False,
 ) -> dict:
     """
     Run the same strategy across multiple symbols and aggregate results.
 
     Args:
         data: Dict of symbol -> OHLCV DataFrame
-        fast_ema: Fast EMA period
-        slow_ema: Slow EMA period
+        fast_ema: Fast EMA period (used when use_asset_class_params=False)
+        slow_ema: Slow EMA period (used when use_asset_class_params=False)
+        initial_cash: Total starting capital (split equally across symbols)
+        use_asset_class_params: If True, resolve per-symbol params via LayeredConfig
 
     Returns:
         Combined performance metrics
@@ -358,10 +477,25 @@ def vectorbt_multi_symbol_backtest(
 
     for symbol, df in data.items():
         try:
-            result = vectorbt_momentum_backtest(
-                df, fast_ema=fast_ema, slow_ema=slow_ema,
-                initial_cash=per_symbol_cash
-            )
+            if use_asset_class_params:
+                from src.config.backtest_params import get_backtest_config
+                params = get_backtest_config(symbol)
+                result = vectorbt_momentum_backtest(
+                    df,
+                    fast_ema=params["fast_ema"],
+                    slow_ema=params["slow_ema"],
+                    initial_cash=per_symbol_cash,
+                    fees=params["fees"],
+                    risk_per_trade=params["risk_per_trade"],
+                    atr_stop_multiplier=params["atr_stop_multiplier"],
+                    cooldown_bars=params["cooldown_bars"],
+                    annualization_periods=params["annualization_periods"],
+                )
+            else:
+                result = vectorbt_momentum_backtest(
+                    df, fast_ema=fast_ema, slow_ema=slow_ema,
+                    initial_cash=per_symbol_cash
+                )
             results[symbol] = {
                 'return': result['total_return'],
                 'sharpe': result['sharpe_ratio'],

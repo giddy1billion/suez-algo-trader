@@ -127,6 +127,31 @@ class Backtester:
         self.commission_pct = commission_pct
         self.slippage_pct = slippage_pct
 
+    @classmethod
+    def for_symbol(
+        cls,
+        strategy: BaseStrategy,
+        symbol: str,
+        initial_capital: float = 10000.0,
+    ) -> "Backtester":
+        """
+        Create a Backtester with asset-class-appropriate costs via InstrumentRegistry.
+
+        Uses the FeeModel-derived costs from LayeredConfig instead of hardcoded
+        flat percentages. Falls back to system defaults if config unavailable.
+        """
+        try:
+            from src.config.backtest_params import get_backtest_config
+            params = get_backtest_config(symbol)
+            return cls(
+                strategy=strategy,
+                initial_capital=initial_capital,
+                commission_pct=params["fees"],
+                slippage_pct=params["fees"],  # Use fee as slippage proxy
+            )
+        except Exception:
+            return cls(strategy=strategy, initial_capital=initial_capital)
+
     def run(self, data: pd.DataFrame, symbol: str = "TEST") -> BacktestResult:
         """
         Run backtest on a single symbol's OHLCV data.

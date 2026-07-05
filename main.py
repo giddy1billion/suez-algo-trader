@@ -875,12 +875,13 @@ def cmd_run(
                 logger.error("scheduler.summary_error", error=str(e))
 
         def _auto_backtest():
-            """Run automated backtests on all symbols and report to Telegram."""
+            """Run automated backtests on all symbols with asset-class-aware params."""
             try:
                 bt_symbols = settings.auto_backtest_symbols.split(",") if settings.auto_backtest_symbols else symbols
                 bt_symbols = [s.strip() for s in bt_symbols if s.strip()]
 
                 from backtesting.vbt_adapter import vectorbt_momentum_backtest
+                from src.config.backtest_params import get_backtest_config
 
                 results_text = [f"<b>🔄 Auto-Backtest Results</b>\n{'=' * 30}\n"]
                 for sym in bt_symbols:
@@ -889,7 +890,19 @@ def cmd_run(
                             df = broker.get_bars_df(sym, timeframe, limit=500)
                         if df is None or len(df) < 50:
                             continue
-                        metrics = vectorbt_momentum_backtest(df, initial_cash=settings.backtest_initial_cash)
+                        # Resolve asset-class-aware parameters via LayeredConfig
+                        params = get_backtest_config(sym)
+                        metrics = vectorbt_momentum_backtest(
+                            df,
+                            fast_ema=params["fast_ema"],
+                            slow_ema=params["slow_ema"],
+                            initial_cash=settings.backtest_initial_cash,
+                            fees=params["fees"],
+                            risk_per_trade=params["risk_per_trade"],
+                            atr_stop_multiplier=params["atr_stop_multiplier"],
+                            cooldown_bars=params["cooldown_bars"],
+                            annualization_periods=params["annualization_periods"],
+                        )
                         emoji = "✅" if metrics['total_return'] > 0 else "❌"
                         results_text.append(
                             f"{emoji} <b>{sym}</b>: {metrics['total_return']:.2%} "
