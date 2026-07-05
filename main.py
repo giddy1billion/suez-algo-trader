@@ -96,6 +96,7 @@ def create_strategy(name: str, symbols: list[str], timeframe: str, lookback: int
         ),
         "mean_reversion": lambda: MeanReversionStrategy(
             symbols=symbols, timeframe=timeframe, lookback=lookback,
+            min_confidence=settings.mean_rev_min_confidence,
         ),
         "ml": lambda: MLStrategy(
             symbols=symbols, timeframe=timeframe, lookback=max(lookback, 500),
@@ -449,9 +450,61 @@ def cmd_run(
             execution_simulator = ExecutionSimulator.realistic()
         logger.info("execution_simulator.enabled", preset=sim_preset)
 
+    # Build RiskEngine explicitly from settings (not defaults) so that
+    # /setrisk or .env changes take effect without code modification.
+    from src.risk.engine import RiskEngine
+    from src.risk.account_risk import AccountRiskLayer
+    from src.risk.portfolio_risk import PortfolioRiskLayer
+    from src.risk.exposure_risk import ExposureRiskLayer
+    from src.risk.execution_risk import ExecutionRiskLayer
+
+    risk_engine = RiskEngine(
+        portfolio_layer=PortfolioRiskLayer(
+            max_positions=settings.risk_max_positions,
+            max_single_stock_pct=settings.risk_max_single_stock_pct,
+            max_sector_exposure_pct=settings.risk_max_sector_exposure_pct,
+            max_correlation=settings.risk_max_correlation,
+            max_gross_exposure_pct=settings.risk_max_gross_exposure_pct,
+            max_net_exposure_pct=settings.risk_max_net_exposure_pct,
+            max_var_pct=settings.risk_max_var_pct,
+            max_portfolio_heat_pct=settings.risk_max_portfolio_heat_pct,
+            enabled=settings.risk_portfolio_layer_enabled,
+        ),
+        account_layer=AccountRiskLayer(
+            max_daily_loss_pct=settings.risk_max_daily_loss_pct,
+            max_weekly_loss_pct=settings.risk_max_weekly_loss_pct,
+            max_drawdown_pct=settings.risk_max_drawdown_pct,
+            min_cash_reserve_pct=settings.risk_min_cash_reserve_pct,
+            pdt_account_threshold=settings.risk_pdt_account_threshold,
+            consecutive_loss_limit=settings.risk_consecutive_loss_limit,
+            daily_trade_limit=settings.risk_daily_trade_limit,
+            enabled=settings.risk_account_layer_enabled,
+        ),
+        exposure_layer=ExposureRiskLayer(
+            require_stop_loss=settings.risk_require_stop_loss,
+            max_adv_pct=settings.risk_max_adv_pct,
+            max_trade_concentration_pct=settings.risk_max_trade_concentration_pct,
+            max_overnight_exposure_pct=settings.risk_max_overnight_exposure_pct,
+            earnings_blackout_days=settings.risk_earnings_blackout_days,
+            high_vol_threshold=settings.risk_high_vol_threshold,
+            high_vol_size_reduction=settings.risk_high_vol_size_reduction,
+            enabled=settings.risk_exposure_layer_enabled,
+        ),
+        execution_layer=ExecutionRiskLayer(
+            max_spread_pct=settings.risk_max_spread_pct,
+            min_volume=settings.risk_min_volume,
+            max_slippage_pct=settings.risk_max_slippage_pct,
+            max_orders_per_minute=settings.risk_max_orders_per_minute,
+            cooldown_after_large_loss_minutes=settings.risk_cooldown_after_loss_minutes,
+            large_loss_threshold_pct=settings.risk_large_loss_threshold_pct,
+            enabled=settings.risk_execution_layer_enabled,
+        ),
+    )
+
     engine = ExecutionEngine(
         broker=broker,
         risk_manager=risk,
+        risk_engine=risk_engine,
         db=db,
         dry_run=dry_run,
         event_bus=event_bus,
@@ -619,6 +672,16 @@ def cmd_run(
         telegram_bot.dp.include_router(runtime_router)
         set_runtime_components(
             runtime_manager=runtime_manager,
+            authorized_users=set(chat_ids),
+        )
+
+        # Register sector management commands router
+        from src.notifications.telegram_sector_commands import (
+            sector_router, set_sector_components,
+        )
+        telegram_bot.dp.include_router(sector_router)
+        set_sector_components(
+            db=db,
             authorized_users=set(chat_ids),
         )
 
@@ -898,6 +961,9 @@ def cmd_run(
                 with _broker_lock:
                     account = broker.get_account()
                 risk.reset_daily(account['equity'])
+                # Refresh sector cache from DB as a daily backstop
+                from src.execution.sector_lookup import reload_cache as _reload_sector_cache
+                _reload_sector_cache(db)
                 logger.info("scheduler.daily_risk_reset", equity=account['equity'])
                 _send_telegram("🔄 <b>Daily Risk Reset</b>\nCounters cleared for new trading day.")
             except Exception as e:
@@ -1104,6 +1170,18 @@ def cmd_run(
                 logger.warning("engine.halted", reason=halt_reason)
                 _shutdown_event.wait(timeout=60)
                 continue
+
+            # Feed account state to multi-layer risk engine every cycle
+            try:
+                account = broker.get_account()
+                engine.risk_engine.update_account_state(
+                    current_equity=account['equity'],
+                    daily_pnl=risk.daily_stats.realized_pnl,
+                    weekly_pnl=risk.weekly_pnl,
+                    cash=account['cash'],
+                )
+            except Exception as e:
+                logger.debug("risk_engine.state_update_error", error=str(e))
 
             # For stocks: check market hours
             stock_symbols = [s for s in symbols if "/" not in s]

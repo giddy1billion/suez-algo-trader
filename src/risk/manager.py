@@ -8,7 +8,7 @@ All trading decisions pass through here before execution.
 """
 
 from dataclasses import dataclass, field
-from datetime import datetime, date, timezone
+from datetime import datetime, date, timezone, timedelta
 from typing import Optional
 
 from src.utils.logger import get_logger
@@ -23,8 +23,13 @@ def _market_date_et() -> date:
         return datetime.now(ZoneInfo("US/Eastern")).date()
     except ImportError:
         # Fallback: approximate ET as UTC-5
-        from datetime import timedelta
         return (datetime.now(timezone.utc) - timedelta(hours=5)).date()
+
+
+def _week_start_et() -> date:
+    """Monday of the current week, in US/Eastern."""
+    d = _market_date_et()
+    return d - timedelta(days=d.weekday())
 
 
 @dataclass
@@ -55,6 +60,8 @@ class DailyStats:
     losses: int = 0
     is_halted: bool = False
     halt_reason: str = ""
+    week_start: date = field(default_factory=_week_start_et)
+    weekly_realized_pnl: float = 0.0
 
     @property
     def daily_return_pct(self) -> float:
@@ -80,17 +87,33 @@ class RiskManager:
         self._trade_log: list[dict] = []
 
     def reset_daily(self, starting_equity: float):
-        """Reset daily tracking (call at market open)."""
+        """Reset daily tracking (call at market open). Weekly P&L persists
+        across days and only resets when a new ISO week begins."""
+        prev_week_start = self.daily_stats.week_start
+        prev_weekly_pnl = self.daily_stats.weekly_realized_pnl
+
+        current_week_start = _week_start_et()
+
+        # Roll over weekly P&L only if we've entered a new week
+        carried_weekly_pnl = 0.0 if current_week_start != prev_week_start else prev_weekly_pnl
+
         self.daily_stats = DailyStats(
             date=_market_date_et(),
             starting_equity=starting_equity,
             current_equity=starting_equity,
+            week_start=current_week_start,
+            weekly_realized_pnl=carried_weekly_pnl,
         )
-        logger.info("risk.daily_reset", equity=starting_equity)
+        logger.info("risk.daily_reset", equity=starting_equity, weekly_pnl=carried_weekly_pnl)
 
     def update_equity(self, current_equity: float):
         """Update current equity for drawdown tracking."""
         self.daily_stats.current_equity = current_equity
+
+    @property
+    def weekly_pnl(self) -> float:
+        """Accumulated realized P&L for the current ISO week."""
+        return self.daily_stats.weekly_realized_pnl
 
     # ──────────────────────────────────────────────────────────────────────
     # Pre-Trade Checks
@@ -219,10 +242,11 @@ class RiskManager:
     # ──────────────────────────────────────────────────────────────────────
 
     def record_trade(self, trade: dict):
-        """Record a completed trade for daily stats."""
+        """Record a completed trade for daily and weekly stats."""
         self.daily_stats.trades_today += 1
         pnl = trade.get("pnl", 0)
         self.daily_stats.realized_pnl += pnl
+        self.daily_stats.weekly_realized_pnl += pnl
         if pnl > 0:
             self.daily_stats.wins += 1
         elif pnl < 0:

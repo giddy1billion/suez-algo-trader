@@ -14,8 +14,14 @@ import time
 import httpx
 import pytest
 
-BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8111011509:AAHsB9DXYaDDDvuHqCvSXtO7p-NcUUQHQWs")
-CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "8606575116")
+BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+
+if not BOT_TOKEN or not CHAT_ID:
+    pytest.skip(
+        "TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID environment variables required",
+        allow_module_level=True,
+    )
 BASE_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 # Time to wait for bot to process and respond (seconds)

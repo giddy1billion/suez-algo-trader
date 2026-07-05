@@ -15,6 +15,7 @@ from typing import Optional
 from src.broker.alpaca_client import AlpacaBroker
 from src.risk.manager import RiskManager, RiskLimits
 from src.risk.engine import RiskEngine
+from src.execution.sector_lookup import build_sector_map
 from src.risk.models import TradeRequest, RiskDecision
 from src.strategy.base import BaseStrategy, TradeSignal, Signal
 from src.data.store import DatabaseManager
@@ -79,6 +80,7 @@ class ExecutionEngine:
         self.risk_engine = risk_engine or RiskEngine()
         self._last_cycle_time: Optional[datetime] = None
         self._current_strategy_name: str = "unknown"
+        self._current_capital_weight: float = 1.0
         self._cycle_count: int = 0
 
         # Event-driven components (optional but recommended)
@@ -103,7 +105,7 @@ class ExecutionEngine:
     # Main Loop
     # ──────────────────────────────────────────────────────────────────────
 
-    def run_cycle(self, strategy: BaseStrategy) -> list[dict]:
+    def run_cycle(self, strategy: BaseStrategy, capital_weight: float = 1.0) -> list[dict]:
         """
         Execute one complete trading cycle:
         1. Fetch data for all symbols
@@ -111,9 +113,15 @@ class ExecutionEngine:
         3. Filter through risk manager
         4. Execute orders
         5. Log everything
+
+        Args:
+            strategy: The strategy to run.
+            capital_weight: Normalized capital allocation weight (0-1). Applied as
+                a multiplier on computed position size.
         """
         self._last_cycle_time = datetime.now()
         self._current_strategy_name = strategy.name
+        self._current_capital_weight = max(0.0, min(1.0, capital_weight))
         results = []
 
         # 1. Check if trading is allowed
@@ -212,11 +220,23 @@ class ExecutionEngine:
         if self.intelligence_orchestrator:
             symbol_df = market_data.get(signal.symbol) if market_data else None
             portfolio_context = self._build_portfolio_context(positions, portfolio_value, signal.symbol)
+            # Build market context from available data
+            market_context = None
+            if symbol_df is not None and len(symbol_df) > 0:
+                market_context = {
+                    "symbol": signal.symbol,
+                    "last_price": signal.price,
+                    "volume": symbol_df["volume"].iloc[-1] if "volume" in symbol_df.columns else 0,
+                    "bar_count": len(symbol_df),
+                }
             intelligence_decision = self.intelligence_orchestrator.evaluate_signal(
                 strategy_name=self._current_strategy_name,
                 signal_confidence=signal.confidence,
+                symbol=signal.symbol,
+                side=side,
                 indicators=signal.indicators,
                 df=symbol_df,
+                market_context=market_context,
                 portfolio_context=portfolio_context,
             )
             if not intelligence_decision.accepted:
@@ -250,6 +270,12 @@ class ExecutionEngine:
                 self._log_signal(signal, executed=False)
                 return None
 
+        # Apply capital allocation weight from orchestrator
+        if self._current_capital_weight < 1.0:
+            qty *= self._current_capital_weight
+            if qty <= 0:
+                return None
+
         # Build TradeRequest for the new risk engine
         trade_request = TradeRequest(
             symbol=signal.symbol,
@@ -274,19 +300,28 @@ class ExecutionEngine:
         try:
             account = self.broker.get_account()
             cash = account.get('cash', 0.0)
-        except Exception:
-            cash = portfolio_value * 0.5
+        except Exception as e:
+            logger.error(
+                "engine.broker_unavailable",
+                symbol=signal.symbol,
+                error=type(e).__name__,
+            )
+            # Do NOT invent portfolio state — abort this signal and let the caller retry
+            return None
 
         # Build market_data context for risk engine
-        risk_market_data = {}
+        # Dynamic sector map: includes signal symbol + all current position symbols
+        position_symbols = [p.get('symbol', '') for p in positions] if positions else []
+        all_symbols = list(set([signal.symbol] + position_symbols))
+        risk_market_data = {"sector_map": build_sector_map(all_symbols, db=self.db)}
         if market_data and signal.symbol in market_data:
             df = market_data[signal.symbol]
             if len(df) > 0:
-                risk_market_data = {
+                risk_market_data.update({
                     "volume": float(df['volume'].iloc[-1]) if 'volume' in df.columns else 0,
                     "adv": float(df['volume'].rolling(20).mean().iloc[-1]) if 'volume' in df.columns else 0,
                     "daily_vol": float(df['close'].pct_change().rolling(20).std().iloc[-1]) if len(df) > 20 else 0,
-                }
+                })
 
         # Evaluate through the multi-layer risk engine (fail-closed: reject on exception)
         try:
@@ -404,6 +439,11 @@ class ExecutionEngine:
         if trade_lifecycle:
             trade_lifecycle.transition(TradeState.SUBMITTED, "order submitted to broker")
 
+        # Generate idempotent client_order_id to prevent duplicate executions
+        import hashlib
+        _idempotency_seed = f"{signal.symbol}:{side}:{final_qty}:{signal.price}:{self._cycle_count}"
+        client_order_id = hashlib.sha256(_idempotency_seed.encode()).hexdigest()[:32]
+
         # Place the order
         try:
             if signal.stop_loss and signal.take_profit:
@@ -419,6 +459,7 @@ class ExecutionEngine:
                     symbol=signal.symbol,
                     qty=final_qty,
                     side=side,
+                    client_order_id=client_order_id,
                 )
 
             # Publish OrderSubmitted event
@@ -543,6 +584,10 @@ class ExecutionEngine:
                         self.broker.close_position(symbol)
                         pnl = pos.get('unrealized_pl', 0)
                         self.risk.record_trade({"symbol": symbol, "pnl": pnl})
+                        self.risk_engine.record_trade_result(
+                            pnl=pnl,
+                            portfolio_value=pos.get('market_value', 0) or 1,
+                        )
                         results.append({"action": "exit", "symbol": symbol, "pnl": pnl})
 
                         # Compute consistent PnL%

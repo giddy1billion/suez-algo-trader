@@ -16,7 +16,14 @@ logger = get_logger(__name__)
 
 
 class NotificationManager:
-    """Send trade alerts and error notifications via multiple channels."""
+    """Send trade alerts and error notifications via multiple channels.
+
+    Implements a bounded internal queue to prevent unbounded memory growth
+    when downstream services (Telegram, Discord) are unavailable.
+    """
+
+    # Maximum pending notifications before dropping oldest
+    MAX_QUEUE_SIZE = 500
 
     def __init__(
         self,
@@ -25,12 +32,15 @@ class NotificationManager:
         discord_webhook: str = "",
         notify_trades: bool = True,
         notify_errors: bool = True,
+        max_queue_size: int = 500,
     ):
         self.telegram_token = telegram_token
         self.telegram_chat_id = telegram_chat_id
         self.discord_webhook = discord_webhook
         self.notify_trades = notify_trades
         self.notify_errors = notify_errors
+        self._max_queue_size = max_queue_size
+        self._dropped_count = 0
 
     def notify_trade(self, trade: dict):
         """Send notification about an executed trade."""
@@ -112,16 +122,40 @@ class NotificationManager:
     # ──────────────────────────────────────────────────────────────────────
 
     def _send(self, message: str):
-        """Send message to all configured channels."""
+        """Send message to all configured channels with backpressure protection.
+
+        If sending fails repeatedly and the internal failure counter exceeds
+        the queue limit, subsequent low-priority messages are dropped with a
+        warning log.
+        """
+        if self._dropped_count > 0 and self._dropped_count % 100 == 0:
+            logger.warning(
+                "notification.backpressure",
+                dropped_total=self._dropped_count,
+            )
+
+        success = False
         if self.telegram_token and self.telegram_chat_id:
-            self._send_telegram(message)
+            success = self._send_telegram(message) or success
         if self.discord_webhook:
-            self._send_discord(message)
+            success = self._send_discord(message) or success
+
+        if not success and (self.telegram_token or self.discord_webhook):
+            self._dropped_count += 1
+            if self._dropped_count > self._max_queue_size:
+                logger.error(
+                    "notification.queue_overflow",
+                    dropped=self._dropped_count,
+                    message_preview=message[:50],
+                )
+        else:
+            self._dropped_count = 0
+
         # Always log
         logger.info("notification", message=message[:100])
 
-    def _send_telegram(self, message: str):
-        """Send via Telegram Bot API using Markdown formatting."""
+    def _send_telegram(self, message: str) -> bool:
+        """Send via Telegram Bot API using Markdown formatting. Returns True on success."""
         url = f"https://api.telegram.org/bot{self.telegram_token}/sendMessage"
         # Telegram Markdown uses *bold* not **bold**
         import re
@@ -136,16 +170,22 @@ class NotificationManager:
                 resp = client.post(url, json=payload)
                 if resp.status_code != 200:
                     logger.error("telegram.send_failed", status=resp.status_code)
+                    return False
+                return True
         except Exception as e:
-            logger.error("telegram.error", error=str(e))
+            logger.error("telegram.error", error=type(e).__name__)
+            return False
 
-    def _send_discord(self, message: str):
-        """Send via Discord webhook."""
+    def _send_discord(self, message: str) -> bool:
+        """Send via Discord webhook. Returns True on success."""
         payload = {"content": message}
         try:
             with httpx.Client(timeout=10) as client:
                 resp = client.post(self.discord_webhook, json=payload)
                 if resp.status_code not in (200, 204):
                     logger.error("discord.send_failed", status=resp.status_code)
+                    return False
+                return True
         except Exception as e:
-            logger.error("discord.error", error=str(e))
+            logger.error("discord.error", error=type(e).__name__)
+            return False
