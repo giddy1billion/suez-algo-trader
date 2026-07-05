@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Optional, Union
 
 if TYPE_CHECKING:
     from src.intelligence.confidence.models import ConfidenceScore
+    from src.intelligence.confidence.decision_contract import DecisionContract
 
 
 class RiskAction(str, Enum):
@@ -36,12 +37,23 @@ class TradeRequest:
     # Rich confidence object (optional — backward-compatible)
     confidence_score: Optional[ConfidenceScore] = None
 
+    # Decision Contract — the authoritative decision object.
+    # When present, this is the single source of truth for the trade.
+    decision_contract: Optional[DecisionContract] = None
+
     @property
     def effective_confidence(self) -> float:
-        """Return the best available confidence value."""
+        """Return the best available confidence value (contract > score > scalar)."""
+        if self.decision_contract is not None:
+            return self.decision_contract.final_confidence
         if self.confidence_score is not None:
             return self.confidence_score.value
         return self.confidence
+
+    @property
+    def has_contract(self) -> bool:
+        """Whether this request carries an authoritative DecisionContract."""
+        return self.decision_contract is not None
 
     @property
     def notional_value(self) -> float:

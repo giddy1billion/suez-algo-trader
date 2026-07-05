@@ -45,12 +45,14 @@ class ModelPredictor:
         auto_reload: bool = True,
         check_interval_seconds: float = 30.0,
         feature_store=None,
+        dataset_registry=None,
     ):
         self._registry = registry
         self._event_bus = event_bus
         self._auto_reload = auto_reload
         self._check_interval = check_interval_seconds
         self._feature_store = feature_store
+        self._dataset_registry = dataset_registry
 
         # Model state (double-buffered for zero-downtime swap)
         self._model = None
@@ -246,6 +248,67 @@ class ModelPredictor:
                 logger.debug("predictor.shadow_failed", error=str(e))
 
         return active_pred, shadow_pred
+
+    def predict_with_lineage(
+        self,
+        features: np.ndarray,
+        symbol: str = "unknown",
+        strategy_name: str = "",
+        bar_timestamp: str = "",
+        market_session: str = "",
+    ) -> tuple:
+        """
+        predict_proba + full lineage recording.
+
+        Returns:
+            (proba_array, lineage_dict) where lineage_dict contains prediction_id
+            and all provenance metadata for downstream consumers.
+        """
+        proba = self.predict_proba(features)
+
+        lineage = {
+            "prediction_id": f"pred_{self._prediction_count}",
+            "model_version": self._version or "",
+            "prediction_timestamp": datetime.now(timezone.utc).isoformat(),
+            "bar_timestamp": bar_timestamp,
+            "market_session": market_session,
+            "symbol": symbol,
+            "strategy": strategy_name,
+            "predicted_direction": "UP" if int(np.argmax(proba[0])) == 2 else ("DOWN" if int(np.argmax(proba[0])) == 0 else "FLAT"),
+            "predicted_confidence": float(np.max(proba[0])),
+            "feature_snapshot_id": "",
+            "git_commit": self._get_git_commit(),
+        }
+
+        # Record in dataset registry
+        if self._dataset_registry:
+            try:
+                self._dataset_registry.record_prediction(
+                    prediction_id=lineage["prediction_id"],
+                    model_version=lineage["model_version"],
+                    feature_version_id=f"fv_{lineage['model_version']}",
+                    feature_snapshot_id=lineage["feature_snapshot_id"],
+                    symbol=symbol,
+                    predicted_direction=lineage["predicted_direction"],
+                    predicted_confidence=lineage["predicted_confidence"],
+                )
+            except Exception:
+                pass  # Lineage failures must not block predictions
+
+        return proba, lineage
+
+    def _get_git_commit(self) -> str:
+        """Get current git commit hash (cached)."""
+        if not hasattr(self, '_cached_git_commit'):
+            try:
+                import subprocess
+                self._cached_git_commit = subprocess.check_output(
+                    ["git", "rev-parse", "--short", "HEAD"],
+                    stderr=subprocess.DEVNULL,
+                ).decode().strip()
+            except Exception:
+                self._cached_git_commit = ""
+        return self._cached_git_commit
 
     # ──────────────────────────────────────────────────────────────────────
     # Model Management

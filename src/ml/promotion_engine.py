@@ -631,7 +631,7 @@ class ModelRollbackMonitor:
         min_sharpe: float = -0.5,
         max_drawdown_pct: float = 15.0,
         min_win_rate: float = 0.35,
-        max_consecutive_losses: int = 8,
+        max_consecutive_losses: int = 12,
         evaluation_window: int = 20,
         cooldown_hours: float = 24.0,
     ):
@@ -665,8 +665,9 @@ class ModelRollbackMonitor:
 
     def check_rollback(self) -> Optional[dict]:
         """
-        Evaluate if rollback is needed.
+        Evaluate if rollback is needed using composite scoring.
         Returns None if OK, or dict with rollback details.
+        Only triggers when multiple degradation signals confirm (score >= 2.0).
         """
         with self._lock:
             if self._in_cooldown():
@@ -675,80 +676,100 @@ class ModelRollbackMonitor:
             if not self._trades:
                 return None
 
-            # Consecutive losses checked regardless of evaluation window
+            # Fast-path: extreme consecutive losses (hard limit)
             consecutive_losses = self._compute_consecutive_losses()
             if consecutive_losses > self._max_consecutive_losses:
-                reason = (
-                    f"Consecutive losses {consecutive_losses} exceed limit "
-                    f"{self._max_consecutive_losses}"
+                return self._build_rollback_result(
+                    f"Extreme consecutive losses: {consecutive_losses}",
+                    consecutive_losses,
                 )
-                result = {
-                    "should_rollback": True,
-                    "reason": reason,
-                    "current_model": self._current_model,
-                    "rollback_to": self._previous_model,
-                    "metrics": {
-                        "rolling_sharpe": self._compute_rolling_sharpe(),
-                        "current_drawdown": self._compute_current_drawdown(),
-                        "recent_win_rate": 0.0,
-                        "consecutive_losses": consecutive_losses,
-                    },
-                }
-                logger.warning(
-                    "rollback_triggered",
-                    reason=reason,
-                    current_model=self._current_model,
-                    rollback_to=self._previous_model,
-                )
-                return result
 
+            # Need minimum sample size for composite evaluation
             if len(self._trades) < self._evaluation_window:
                 return None
 
             recent_trades = self._trades[-self._evaluation_window:]
+
+            # Compute all metrics
             rolling_sharpe = self._compute_rolling_sharpe()
             current_drawdown = self._compute_current_drawdown()
-
-            # Compute recent win rate
-            wins = sum(
-                1 for t in recent_trades
-                if t.get("pnl_pct", t.get("pnl", 0.0)) > 0
-            )
+            wins = sum(1 for t in recent_trades if t.get("pnl_pct", t.get("pnl", 0.0)) > 0)
             recent_win_rate = wins / len(recent_trades) if recent_trades else 0.0
+            calibration_drift = self._compute_calibration_drift(recent_trades)
 
-            # Check triggers
-            reason = None
+            # Composite scoring — each triggered condition adds 1.0
+            composite_score = 0.0
+            triggered_reasons = []
+
             if rolling_sharpe < self._min_sharpe:
-                reason = f"Rolling Sharpe {rolling_sharpe:.3f} below threshold {self._min_sharpe}"
-            elif current_drawdown > self._max_drawdown_pct:
-                reason = f"Drawdown {current_drawdown:.2f}% exceeds max {self._max_drawdown_pct}%"
-            elif recent_win_rate < self._min_win_rate:
-                reason = f"Win rate {recent_win_rate:.3f} below minimum {self._min_win_rate}"
+                composite_score += 1.0
+                triggered_reasons.append(f"Sharpe {rolling_sharpe:.3f} < {self._min_sharpe}")
 
-            if reason is None:
+            if current_drawdown > self._max_drawdown_pct:
+                composite_score += 1.0
+                triggered_reasons.append(f"Drawdown {current_drawdown:.1f}% > {self._max_drawdown_pct}%")
+
+            if recent_win_rate < self._min_win_rate:
+                composite_score += 1.0
+                triggered_reasons.append(f"Win rate {recent_win_rate:.2f} < {self._min_win_rate}")
+
+            if consecutive_losses >= self._max_consecutive_losses - 2:
+                composite_score += 0.5
+                triggered_reasons.append(f"Near max consecutive losses: {consecutive_losses}")
+
+            if calibration_drift > 0.15:
+                composite_score += 1.0
+                triggered_reasons.append(f"Calibration drift: {calibration_drift:.3f}")
+
+            # Only rollback if composite >= 2.0 (multiple signals confirm degradation)
+            if composite_score < 2.0:
                 return None
 
-            result = {
-                "should_rollback": True,
-                "reason": reason,
-                "current_model": self._current_model,
-                "rollback_to": self._previous_model,
-                "metrics": {
-                    "rolling_sharpe": rolling_sharpe,
-                    "current_drawdown": current_drawdown,
-                    "recent_win_rate": recent_win_rate,
-                    "consecutive_losses": consecutive_losses,
-                },
-            }
+            reason = f"Composite degradation ({composite_score:.1f}/5.0): " + "; ".join(triggered_reasons)
+            return self._build_rollback_result(reason, consecutive_losses, rolling_sharpe, current_drawdown, recent_win_rate)
 
-            logger.warning(
-                "rollback_triggered",
-                reason=reason,
-                current_model=self._current_model,
-                rollback_to=self._previous_model,
-            )
+    def _build_rollback_result(self, reason, consecutive_losses=0, rolling_sharpe=0.0, current_drawdown=0.0, recent_win_rate=0.0):
+        result = {
+            "should_rollback": True,
+            "reason": reason,
+            "current_model": self._current_model,
+            "rollback_to": self._previous_model,
+            "metrics": {
+                "rolling_sharpe": rolling_sharpe,
+                "current_drawdown": current_drawdown,
+                "recent_win_rate": recent_win_rate,
+                "consecutive_losses": consecutive_losses,
+            },
+        }
+        logger.warning(
+            "rollback_triggered",
+            reason=reason,
+            current_model=self._current_model,
+            rollback_to=self._previous_model,
+        )
+        return result
 
-            return result
+    def _compute_calibration_drift(self, recent_trades: list) -> float:
+        """Measure gap between predicted confidence and actual outcomes."""
+        trades_with_confidence = [
+            t for t in recent_trades
+            if t.get("predicted_confidence") or t.get("confidence")
+        ]
+        if len(trades_with_confidence) < 5:
+            return 0.0
+
+        predicted = []
+        actual = []
+        for t in trades_with_confidence:
+            conf = t.get("predicted_confidence", t.get("confidence", 0.5))
+            won = 1.0 if t.get("pnl_pct", t.get("pnl", 0.0)) > 0 else 0.0
+            predicted.append(conf)
+            actual.append(won)
+
+        # Expected Calibration Error: mean |predicted - actual|
+        mean_predicted = np.mean(predicted)
+        mean_actual = np.mean(actual)
+        return abs(mean_predicted - mean_actual)
 
     def _compute_rolling_sharpe(self) -> float:
         """Compute Sharpe ratio over evaluation window."""

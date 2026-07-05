@@ -35,6 +35,7 @@ from src.intelligence.confidence.decision_contract import (
     Decision,
     VetoAuthority,
 )
+from src.intelligence.confidence.contract_store import ContractStore
 
 __all__ = [
     # Legacy (still used by gate internals)
@@ -55,4 +56,6 @@ __all__ = [
     "StageSeverity",
     "Decision",
     "VetoAuthority",
+    # Persistence
+    "ContractStore",
 ]

@@ -75,13 +75,6 @@ class RuntimeManager:
         from src.ml.feature_store import FeatureStore
         self._feature_store = FeatureStore()
 
-        self._predictor = ModelPredictor(
-            registry=self._registry,
-            event_bus=event_bus,
-            auto_reload=True,
-            feature_store=self._feature_store,
-        )
-
         # Closed-loop feedback components
         from src.ml.feedback_loop import ExperienceDatabase
         from src.ml.promotion_engine import ModelPromotionEngine
@@ -92,6 +85,14 @@ class RuntimeManager:
             min_improvement_pct=5.0,
         )
         self._dataset_registry = DatasetRegistry()
+
+        self._predictor = ModelPredictor(
+            registry=self._registry,
+            event_bus=event_bus,
+            auto_reload=True,
+            feature_store=self._feature_store,
+            dataset_registry=self._dataset_registry,
+        )
 
         self._training_pipeline = TrainingPipeline(
             registry=self._registry,

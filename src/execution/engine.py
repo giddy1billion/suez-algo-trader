@@ -19,8 +19,10 @@ from src.risk.models import TradeRequest, RiskDecision
 from src.strategy.base import BaseStrategy, TradeSignal, Signal
 from src.data.store import DatabaseManager
 from src.intelligence.orchestrator import AdaptiveIntelligenceOrchestrator
-from src.intelligence.confidence.gate import ConfidenceGate, SignalContext
+from src.intelligence.confidence.gate import ConfidenceGate, ConfidenceGateConfig, SignalContext
 from src.intelligence.confidence.models import ConfidenceScore, SignalIntegrity
+from src.intelligence.confidence.orchestrator import DecisionOrchestrator
+from src.intelligence.confidence.decision_contract import DecisionContract, Decision
 from src.utils.logger import get_logger
 from src.core.runtime_state import RuntimeState
 
@@ -86,6 +88,8 @@ class ExecutionEngine:
         signal_gate: Optional[SignalValidationGate] = None,
         signal_bridge_config: Optional[SignalBridgeConfig] = None,
         confidence_gate: Optional[ConfidenceGate] = None,
+        decision_orchestrator: Optional[DecisionOrchestrator] = None,
+        contract_store=None,
     ):
         self.broker = broker
         self.risk = risk_manager
@@ -105,6 +109,12 @@ class ExecutionEngine:
         self.intelligence_orchestrator = intelligence_orchestrator
         self._circuit_breaker = circuit_breaker
         self._confidence_gate = confidence_gate
+        
+        # Decision Contract infrastructure — the new central governance path.
+        # When decision_orchestrator is provided, every signal produces an
+        # immutable DecisionContract that flows through the entire pipeline.
+        self._decision_orchestrator = decision_orchestrator
+        self._contract_store = contract_store  # ContractStore for DuckDB persistence
         
         # Runtime state — allows pause/resume to suppress signals
         self._runtime_state = runtime_state or RuntimeState()
@@ -389,11 +399,77 @@ class ExecutionEngine:
 
         # Build TradeRequest for the new risk engine
         confidence_score = None
+        decision_contract = None
         effective_confidence = intelligence_decision.adjusted_confidence if intelligence_decision else signal.confidence
 
-        # If confidence gate is available, produce rich ConfidenceScore
-        if self._confidence_gate:
-            import numpy as np
+        # ── Decision Contract Path (preferred) ─────────────────────────────
+        # The DecisionOrchestrator produces an immutable DecisionContract that
+        # carries the full multi-stage assessment. This is the authoritative
+        # decision object — it flows through Risk → Sizing → Execution → DB.
+        if self._decision_orchestrator:
+            signal_ctx = SignalContext(
+                symbol=signal.symbol,
+                strategy=self._current_strategy_name,
+                raw_confidence=effective_confidence,
+                signal_integrity=SignalIntegrity.REAL,
+                signal_generated_at=datetime.now(timezone.utc),
+                bars_available=len(market_data.get(signal.symbol, [])) if market_data else 0,
+                spread_available=True,
+                model_version=getattr(signal, 'model_version', ''),
+                current_trend=getattr(intelligence_decision, 'market_trend', '') if intelligence_decision else '',
+                current_volatility=getattr(intelligence_decision, 'market_volatility', '') if intelligence_decision else '',
+                current_stress=getattr(intelligence_decision, 'market_stress', '') if intelligence_decision else '',
+                fingerprint_confidence=getattr(intelligence_decision, 'fingerprint_confidence', 1.0) if intelligence_decision else 1.0,
+            )
+            decision_contract = self._decision_orchestrator.evaluate(
+                context=signal_ctx,
+                provenance_kwargs={
+                    "model_version": getattr(signal, 'model_version', ''),
+                    "backtest_id": getattr(signal, 'backtest_id', ''),
+                },
+                position_pct=qty / portfolio_value * 100.0 if portfolio_value > 0 else 0.0,
+                kelly_fraction=getattr(signal, 'kelly_fraction', 0.0),
+                risk_grade=getattr(signal, 'risk_grade', ''),
+            )
+            effective_confidence = decision_contract.final_confidence
+
+            # Store contract in DuckDB for audit trail (executed or not)
+            if self._contract_store:
+                try:
+                    self._contract_store.store(decision_contract)
+                except Exception as e:
+                    logger.warning("engine.contract_store_error", error=str(e))
+
+            # If contract says REJECT or is vetoed, stop immediately
+            if not decision_contract.is_executable and decision_contract.decision == Decision.REJECT:
+                logger.info(
+                    "engine.contract_rejected",
+                    contract_id=decision_contract.contract_id,
+                    symbol=signal.symbol,
+                    decision=decision_contract.decision.value,
+                    reason=decision_contract.recommendation,
+                    vetoed=decision_contract.vetoed,
+                )
+                self._log_signal(signal, executed=False)
+                return None
+
+            # If contract says REDUCE, scale down position
+            if decision_contract.decision == Decision.REDUCE:
+                # Use contract's recommended position or reduce by 50%
+                if decision_contract.recommended_position_pct > 0:
+                    reduced_value = portfolio_value * (decision_contract.recommended_position_pct / 100.0)
+                    qty = min(qty, reduced_value / signal.price) if signal.price > 0 else qty * 0.5
+                else:
+                    qty *= 0.5
+                logger.info(
+                    "engine.contract_reduced",
+                    contract_id=decision_contract.contract_id,
+                    symbol=signal.symbol,
+                    new_qty=qty,
+                )
+
+        elif self._confidence_gate:
+            # Fallback: Legacy confidence gate path (produces ConfidenceScore)
             signal_ctx = SignalContext(
                 symbol=signal.symbol,
                 strategy=self._current_strategy_name,
@@ -421,6 +497,7 @@ class ExecutionEngine:
             strategy=self._current_strategy_name,
             confidence=effective_confidence,
             confidence_score=confidence_score,
+            decision_contract=decision_contract,
         )
 
         # Create trade lifecycle if TradeManager available
@@ -620,6 +697,13 @@ class ExecutionEngine:
                 trade_lifecycle.metadata['symbol'] = signal.symbol
                 trade_lifecycle.metadata['total_qty'] = final_qty
 
+            # Mark contract as executed in the store
+            if decision_contract and self._contract_store:
+                try:
+                    self._contract_store.mark_executed(decision_contract.contract_id, trade_id)
+                except Exception as e:
+                    logger.warning("engine.contract_mark_executed_error", error=str(e))
+
             # Determine fill mode: immediate (simulation or no trade stream) vs deferred
             use_immediate_fill = bool(sim_result) or not self._has_trade_stream()
 
@@ -662,6 +746,7 @@ class ExecutionEngine:
                         "entry_time": datetime.now(timezone.utc).isoformat(),
                         "side": side,
                         "entry_price": fill_price,
+                        "contract_id": decision_contract.contract_id if decision_contract else "",
                     }
             else:
                 # Deferred fill — stay in ACCEPTED, trade stream will confirm
@@ -685,6 +770,9 @@ class ExecutionEngine:
                 "take_profit": signal.take_profit,
                 "sim_slippage_bps": sim_result.get("slippage_bps") if sim_result else None,
                 "sim_fees": fill_fees if sim_result else None,
+                "contract_id": decision_contract.contract_id if decision_contract else None,
+                "contract_confidence": decision_contract.final_confidence if decision_contract else None,
+                "contract_decision": decision_contract.decision.value if decision_contract else None,
             })
 
             # Journal trade entry for analysis
@@ -785,6 +873,24 @@ class ExecutionEngine:
                             strategy_name=ctx.get("strategy", self._current_strategy_name),
                             signal_package_id=ctx.get("signal_package_id", ""),
                         ))
+
+                        # Record contract outcome for audit trail
+                        contract_id = ctx.get("contract_id", "")
+                        if contract_id and self._contract_store:
+                            try:
+                                self._contract_store.record_outcome(
+                                    contract_id=contract_id,
+                                    trade_id=trade_id,
+                                    symbol=symbol,
+                                    side=ctx.get("side", pos.get("side", "")),
+                                    entry_price=ctx.get("entry_price", entry_price),
+                                    exit_price=current_price,
+                                    pnl=pnl,
+                                    pnl_pct=pnl_pct,
+                                    exit_reason=exit_signal.reason[:50] if exit_signal.reason else "strategy_exit",
+                                )
+                            except Exception as e:
+                                logger.warning("engine.contract_outcome_error", error=str(e))
 
                         # Journal the exit
                         journal = _get_journal(self.db)

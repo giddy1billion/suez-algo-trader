@@ -37,6 +37,7 @@ from src.execution.engine import ExecutionEngine
 from src.core.runtime_state import RuntimeState
 from src.data.store import DatabaseManager
 from src.intelligence.orchestrator import AdaptiveIntelligenceOrchestrator
+from src.intelligence.confidence.gate import ConfidenceGate, ConfidenceGateConfig
 from src.notifications.alerts import NotificationManager
 from src.monitoring.health import HealthMonitor
 from src.monitoring.metrics import LiveMetrics
@@ -563,6 +564,10 @@ def cmd_run(
         cooldown_hours=24.0,
     )
 
+    # Online learning loop: reward attribution + hard example mining
+    from src.ml.online_learning import OnlineLearningLoop
+    online_learning = OnlineLearningLoop(experience_db=experience_db)
+
     # Subscribe TradeClosed events to the post-trade validator
     def _on_trade_closed(event):
         """Record every trade close as a training sample with full context."""
@@ -583,6 +588,9 @@ def cmd_run(
                 "signal_package_id": event.signal_package_id,
             }
             post_trade_validator.validate_trade(trade_result)
+
+            # Online learning: reward attribution + hard example mining
+            online_learning.process_trade_outcome(trade_result)
 
             # Feed rollback monitor and check for auto-rollback
             rollback_monitor.record_trade(trade_result)
@@ -607,6 +615,8 @@ def cmd_run(
     from src.core.events import TradeClosed as _TradeClosed
     event_bus.subscribe(_TradeClosed, _on_trade_closed)
 
+    confidence_gate = ConfidenceGate(ConfidenceGateConfig())
+
     engine = ExecutionEngine(
         broker=broker,
         risk_manager=risk,
@@ -619,6 +629,7 @@ def cmd_run(
         runtime_state=runtime_state,
         signal_gate=signal_gate,
         signal_bridge_config=SignalBridgeConfig(),
+        confidence_gate=confidence_gate,
         intelligence_orchestrator=AdaptiveIntelligenceOrchestrator(
             min_trade_score=settings.intelligence_min_trade_score,
             drift_window=settings.intelligence_drift_window,

@@ -98,11 +98,25 @@ class RiskEngine:
         reasons: list[str] = []
 
         # Pre-check: reject signals with insufficient confidence.
-        # If a ConfidenceScore object is attached, it has already been evaluated
-        # by the full confidence gate pipeline (data quality, model health,
-        # calibration, decay, regime adjustment). Trust its verdict.
-        # Otherwise, fall back to the legacy scalar confidence floor.
-        if request.confidence_score is not None:
+        # Priority: DecisionContract > ConfidenceScore > scalar confidence.
+        #
+        # DecisionContract is the authoritative decision object. If present,
+        # it has already been through the full multi-stage confidence pipeline
+        # (data quality, model health, calibration, decay, regime, execution
+        # feasibility) and carries veto authority. Trust its verdict.
+        if request.decision_contract is not None:
+            contract = request.decision_contract
+            if not contract.is_executable:
+                reject_reason = contract.veto_reason if contract.vetoed else contract.recommendation
+                return self._build_decision(
+                    approved=False,
+                    adjusted_qty=0.0,
+                    reasons=[f"Decision contract rejected: {reject_reason}"],
+                    layer_decisions=layer_decisions,
+                    request=request,
+                )
+            effective_confidence = contract.final_confidence
+        elif request.confidence_score is not None:
             if not request.confidence_score.approved:
                 return self._build_decision(
                     approved=False,

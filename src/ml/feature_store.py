@@ -514,6 +514,8 @@ class FeatureStore:
         model_version: str = "",
         prediction_id: int = 0,
         symbol: str = "unknown",
+        bar_timestamp: str = "",
+        market_session: str = "",
     ) -> Optional[str]:
         """
         Lightweight snapshot called from ModelPredictor at prediction time.
@@ -532,6 +534,16 @@ class FeatureStore:
             else:
                 row = features.flatten()[:200]  # Cap at 200 features to avoid bloat
                 values = {f"f{i}": float(v) for i, v in enumerate(row) if not np.isnan(v)}
+
+            # Add temporal metadata
+            values["_meta_prediction_ts"] = datetime.now(timezone.utc).isoformat()
+            values["_meta_bar_ts"] = bar_timestamp
+            values["_meta_model_version"] = model_version
+            values["_meta_market_session"] = market_session
+            values["_meta_feature_hash"] = (
+                hashlib.sha256(json.dumps(sorted(active.feature_names)).encode()).hexdigest()[:16]
+                if active and active.feature_names else ""
+            )
 
             return self.snapshot_features(
                 version_id=version_id,

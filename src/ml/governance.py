@@ -274,6 +274,24 @@ class ModelGovernance:
             target["is_deployed"] = True
             target["deployed_at"] = datetime.now(timezone.utc).isoformat()
             target["deployment_reason"] = reason
+            target["deployment_record"] = {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "reason": reason,
+                "previous_model": next(
+                    (e.get("version") for e in all_lineage if e.get("retired_at") == target.get("deployed_at")),
+                    None,
+                ),
+                "promoter": "governance_system",
+                "governance_decision": "auto_deploy" if "Auto-deploy" in reason else "manual",
+                "validation_metrics": target.get("metrics", {}),
+                "gates_passed": target.get("validation_issues", []) == [],
+                "rollback_model": next(
+                    (e.get("version") for e in reversed(all_lineage) if e.get("is_deployed") and e["version"] != version),
+                    None,
+                ),
+                "git_commit": target.get("git_commit", ""),
+                "feature_schema_version": target.get("feature_hash", ""),
+            }
 
             self._save_all_lineage(all_lineage)
             logger.info("governance.deployed", version=version, reason=reason)
@@ -574,7 +592,7 @@ class ModelGovernance:
         """Compute hash of record content excluding deployment fields."""
         # Exclude mutable deployment fields and the integrity_hash itself
         excluded = {"deployed_at", "retired_at", "is_deployed", "deployment_reason",
-                    "retirement_reason", "integrity_hash"}
+                    "retirement_reason", "integrity_hash", "deployment_record"}
         content = {k: v for k, v in record.items() if k not in excluded}
         json_str = json.dumps(content, sort_keys=True, default=str)
         return hashlib.sha256(json_str.encode()).hexdigest()[:16]
