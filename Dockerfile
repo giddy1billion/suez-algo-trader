@@ -27,6 +27,10 @@ USER trader
 ENV TRADING_MODE=paper
 ENV ACTIVE_STRATEGY=momentum
 
+# Numba cache — non-root user cannot write to site-packages;
+# redirect JIT cache to a writable directory.
+ENV NUMBA_CACHE_DIR=/app/data_cache/.numba_cache
+
 # Health check — verify process is alive and responsive
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
     CMD python -c "import os, signal; os.kill(1, signal.SIG_DFL) or True" || exit 1

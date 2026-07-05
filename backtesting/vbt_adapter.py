@@ -6,6 +6,9 @@ Falls back to a pure numpy/pandas vectorized engine if vectorbt/numba
 can't be imported (common on Python 3.13 where numba DLLs may fail).
 """
 
+import os
+import tempfile
+
 import numpy as np
 import pandas as pd
 from typing import Optional
@@ -14,16 +17,20 @@ from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+# ──────────────────────────────────────────────────────────────────────────
+# Numba cache fix — must be set BEFORE numba is imported (vectorbt triggers it).
+# In containerized environments the non-root user cannot write .nbi/.nbc cache
+# files into site-packages. Redirect to a writable directory.
+# ──────────────────────────────────────────────────────────────────────────
+if "NUMBA_CACHE_DIR" not in os.environ:
+    _numba_cache = os.path.join(tempfile.gettempdir(), ".numba_cache")
+    os.makedirs(_numba_cache, exist_ok=True)
+    os.environ["NUMBA_CACHE_DIR"] = _numba_cache
+
 # Check if vectorbt is usable
 _VBT_AVAILABLE = False
 try:
     import vectorbt as vbt
-    # Disable numba caching to prevent "no locator available for file" errors
-    # in Docker/overlay filesystems where numba can't reliably stat module files.
-    try:
-        vbt.settings.caching['disable_machinery'] = True
-    except (AttributeError, KeyError, TypeError):
-        pass
     _VBT_AVAILABLE = True
 except (ImportError, OSError):
     logger.debug("vbt.unavailable", msg="Using pure numpy fallback")
