@@ -28,6 +28,12 @@ from src.core.events import (
     OrderRejected, TradeOpened, TradeClosed, RiskHalt,
 )
 from src.core.state_machine import TradeState
+from src.strategy.signal_bridge import (
+    SignalPackageBuilder,
+    SignalBridgeConfig,
+    ActiveSignalMonitor,
+)
+from src.strategy.signal_package import SignalValidationGate, SignalStatus
 
 logger = get_logger(__name__)
 
@@ -75,6 +81,8 @@ class ExecutionEngine:
         min_signal_confidence: float = 0.55,
         circuit_breaker=None,
         runtime_state: Optional[RuntimeState] = None,
+        signal_gate: Optional[SignalValidationGate] = None,
+        signal_bridge_config: Optional[SignalBridgeConfig] = None,
     ):
         self.broker = broker
         self.risk = risk_manager
@@ -96,6 +104,33 @@ class ExecutionEngine:
         
         # Runtime state — allows pause/resume to suppress signals
         self._runtime_state = runtime_state or RuntimeState()
+
+        # Signal package integration — professional-grade signal validation
+        self._signal_gate = signal_gate
+        self._signal_builder = SignalPackageBuilder(signal_bridge_config)
+        self._signal_monitor = ActiveSignalMonitor()
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Signal Monitor (public API for main loop)
+    # ──────────────────────────────────────────────────────────────────────
+
+    @property
+    def signal_monitor(self) -> ActiveSignalMonitor:
+        """Access the active signal monitor for expiry/decay checks."""
+        return self._signal_monitor
+
+    def check_signal_expiry(self) -> int:
+        """Check active signals for expiry/decay. Returns count invalidated."""
+        invalidated = self._signal_monitor.check_all()
+        for pkg in invalidated:
+            self._publish(OrderRejected(
+                symbol=pkg.symbol,
+                side=pkg.side,
+                qty=0,
+                reason=f"signal_expired: {pkg.signal_id}",
+                source="signal_monitor",
+            ))
+        return len(invalidated)
 
     # ──────────────────────────────────────────────────────────────────────
     # Event Publishing Helpers
@@ -277,6 +312,50 @@ class ExecutionEngine:
                 )
                 self._log_signal(signal, executed=False)
                 return None
+
+        # ── Signal Package Gate ────────────────────────────────────────────
+        # Enrich basic TradeSignal into professional-grade TradeSignalPackage
+        # and validate through the gate before proceeding to execution.
+        signal_package = None
+        if self._signal_gate:
+            symbol_df = market_data.get(signal.symbol) if market_data else None
+            signal_package = self._signal_builder.build(
+                signal=signal,
+                strategy_name=self._current_strategy_name,
+                market_data=symbol_df,
+                intelligence_decision=intelligence_decision,
+                portfolio_value=portfolio_value,
+                position_size_pct=0.0,  # Calculated below
+            )
+
+            approved, gate_errors = self._signal_gate.evaluate(signal_package)
+            if not approved:
+                logger.info(
+                    "engine.signal_gate_rejected",
+                    signal_id=signal_package.signal_id,
+                    symbol=signal.symbol,
+                    errors=gate_errors,
+                )
+                self._publish(SignalGenerated(
+                    symbol=signal.symbol,
+                    direction=side,
+                    confidence=signal.confidence,
+                    reason=f"gate_rejected: {'; '.join(gate_errors[:3])}",
+                    source="engine",
+                ))
+                self._log_signal(signal, executed=False)
+                return None
+
+            # Register for runtime monitoring (expiry/decay)
+            self._signal_monitor.register(signal_package)
+            logger.info(
+                "engine.signal_package_approved",
+                signal_id=signal_package.signal_id,
+                symbol=signal.symbol,
+                confidence=signal.confidence,
+                risk_reward=signal_package.expected_risk_reward,
+                regime=signal_package.market_regime.value,
+            )
 
         # Calculate position size
         if signal.stop_loss:

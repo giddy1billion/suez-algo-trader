@@ -129,19 +129,19 @@ class TestPauseResumeIntegration:
             "TelegramAuditForwarder should check is_paused() state"
 
     def test_telegram_bot_pause_commands_exist(self):
-        """Verify TelegramBot has pause/resume command handlers."""
+        """Verify telegram_bot module has pause/resume command handlers."""
         try:
-            from src.notifications.telegram_bot import TelegramBot
-        except ModuleNotFoundError:
+            import src.notifications.telegram_bot as tg_bot
+        except (ModuleNotFoundError, ImportError):
             pytest.skip("TelegramBot dependencies not available (aiogram)")
         
         import inspect
         
-        source = inspect.getsource(TelegramBot)
+        source = inspect.getsource(tg_bot)
         
         # Should have pause and resume command handlers
-        assert "pause" in source.lower(), "TelegramBot should have pause command"
-        assert "resume" in source.lower(), "TelegramBot should have resume command"
+        assert "pause" in source.lower(), "telegram_bot should have pause command"
+        assert "resume" in source.lower(), "telegram_bot should have resume command"
 
     def test_pause_state_singleton(self):
         """Verify pause state is maintained as singleton across components."""

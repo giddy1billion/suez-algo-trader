@@ -254,6 +254,9 @@ class TradeSignalPackage:
     # --- Status ---
     status: SignalStatus = SignalStatus.PENDING_VALIDATION
 
+    # --- Validation flags ---
+    require_model_provenance: bool = True  # Set False for rule-based strategies
+
     # ──────────────────────────────────────────────────────────────────────
     # Derived Properties
     # ──────────────────────────────────────────────────────────────────────
@@ -357,11 +360,12 @@ class TradeSignalPackage:
                     elif self.is_sell and tp.price >= mid:
                         errors.append(f"TP{i+1} must be below entry for SELL")
 
-        # Model provenance
-        if self.model_info is None:
-            errors.append("Missing model information")
-        elif not self.model_info.is_complete():
-            errors.append("Incomplete model provenance (requires version, training_run, dataset, backtest, walk_forward)")
+        # Model provenance (skipped for rule-based strategies)
+        if self.require_model_provenance:
+            if self.model_info is None:
+                errors.append("Missing model information")
+            elif not self.model_info.is_complete():
+                errors.append("Incomplete model provenance (requires version, training_run, dataset, backtest, walk_forward)")
 
         # Strategy contributors
         if not self.strategy_contributors:

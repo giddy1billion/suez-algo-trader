@@ -507,6 +507,16 @@ def cmd_run(
     # Create shared RuntimeState for pause/resume state management
     runtime_state = RuntimeState()
 
+    # Signal validation gate — enforces professional-grade signal completeness
+    from src.strategy.signal_package import SignalValidationGate
+    from src.strategy.signal_bridge import SignalBridgeConfig
+    signal_gate = SignalValidationGate(
+        require_model_provenance=False,  # Relaxed: allow rule-based strategies
+        min_confidence=settings.min_signal_confidence if hasattr(settings, 'min_signal_confidence') else 0.55,
+        max_position_size_pct=25.0,
+        min_risk_reward=1.0,
+    )
+
     engine = ExecutionEngine(
         broker=broker,
         risk_manager=risk,
@@ -517,6 +527,8 @@ def cmd_run(
         trade_manager=trade_manager,
         execution_simulator=execution_simulator,
         runtime_state=runtime_state,
+        signal_gate=signal_gate,
+        signal_bridge_config=SignalBridgeConfig(),
         intelligence_orchestrator=AdaptiveIntelligenceOrchestrator(
             min_trade_score=settings.intelligence_min_trade_score,
             drift_window=settings.intelligence_drift_window,
@@ -525,26 +537,12 @@ def cmd_run(
         ) if settings.intelligence_enabled else None,
     )
 
-    # Register default event subscribers (audit log, journal, metrics, notifications)
-    _send_fn = notifier._send_telegram if notifier.telegram_token else None
-
-    def _notification_sender(message: str):
-        """Send notification via Telegram/Discord if available."""
-        if _send_fn:
-            try:
-                _send_fn(message)
-            except Exception:
-                pass
-
-    subscribers = setup_default_subscribers(
-        bus=event_bus,
-        notification_send_func=_notification_sender if notifier.telegram_token else None,
-    )
-
     # --- Full Telegram Audit Forwarding (ALL events + WARNING+ logs) ---
-    # Nothing held back: every audit event, system alert, and log warning
-    # is sent to Telegram in real-time.
+    # The TelegramAuditForwarder provides rich HTML-formatted messages with
+    # timestamps, source attribution, and pause-state awareness. It is the
+    # single authoritative Telegram notification path.
     telegram_audit_components = {}
+    _telegram_audit_active = False
     if notifier.telegram_token:
         from src.notifications.telegram_audit_forwarder import setup_telegram_full_audit
 
@@ -569,7 +567,31 @@ def cmd_run(
             runtime_state=runtime_state,
             attach_log_handler=True,
         )
+        _telegram_audit_active = True
         logger.info("telegram_audit.full_forwarding_enabled")
+
+    # Register default event subscribers (audit log, journal, metrics, notifications)
+    # NOTE: When TelegramAuditForwarder is active, NotificationSubscriber's Telegram
+    # sending is disabled to prevent duplicate messages. The audit forwarder already
+    # handles all events with superior formatting and pause-state awareness.
+    _notification_send_func = None
+    if not _telegram_audit_active and notifier.telegram_token:
+        # Fallback: only use NotificationSubscriber if audit forwarder is NOT active
+        _send_fn = notifier._send_telegram
+
+        def _notification_sender(message: str):
+            """Send notification via Telegram (fallback when audit forwarder unavailable)."""
+            try:
+                _send_fn(message)
+            except Exception:
+                pass
+
+        _notification_send_func = _notification_sender
+
+    subscribers = setup_default_subscribers(
+        bus=event_bus,
+        notification_send_func=_notification_send_func,
+    )
 
     # --- Event Persistence (durable event log for replay & auditing) ---
     from src.core.event_store import EventStore, EventPersistenceSubscriber
@@ -1063,6 +1085,11 @@ def cmd_run(
             reaped = trade_manager.reap_stale_trades(timeout_seconds=300.0)
             if reaped > 0:
                 logger.warning("trade_manager.stale_reaped", count=reaped, cycle=cycle_count)
+
+        # Check signal package expiry/confidence decay (every cycle)
+        expired_count = engine.check_signal_expiry()
+        if expired_count > 0:
+            logger.info("signal_monitor.expired", count=expired_count, cycle=cycle_count)
 
         # Periodic portfolio reconciliation (every 5 minutes / ~5 cycles at 60s interval)
         if reconciler and cycle_count % 5 == 0:
