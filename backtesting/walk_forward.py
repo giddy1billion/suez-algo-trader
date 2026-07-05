@@ -229,11 +229,12 @@ class WalkForwardOptimizer:
 
 
 def _ema_crossover_strategy(df: pd.DataFrame, params: Dict[str, Any]) -> List[Dict]:
-    """EMA crossover strategy compatible with WalkForwardOptimizer.
+    """EMA crossover strategy with ATR stops and cooldown, compatible with WalkForwardOptimizer.
 
     Args:
-        df: DataFrame with 'close' column.
-        params: Dict with 'fast_ema', 'slow_ema', and optionally 'fees'.
+        df: DataFrame with 'close' column (and optionally 'high'/'low' for ATR stops).
+        params: Dict with 'fast_ema', 'slow_ema', and optionally 'fees',
+                'cooldown_bars', 'atr_stop_multiplier'.
 
     Returns:
         List of trade dicts.
@@ -241,6 +242,8 @@ def _ema_crossover_strategy(df: pd.DataFrame, params: Dict[str, Any]) -> List[Di
     fast_ema = params.get("fast_ema", 12)
     slow_ema = params.get("slow_ema", 26)
     fees = params.get("fees", 0.001)
+    cooldown = params.get("cooldown_bars", 0)
+    atr_mult = params.get("atr_stop_multiplier", 0.0)
 
     if fast_ema >= slow_ema:
         return []
@@ -255,6 +258,21 @@ def _ema_crossover_strategy(df: pd.DataFrame, params: Dict[str, Any]) -> List[Di
     fast = pd.Series(close).ewm(span=fast_ema, adjust=False).mean().values
     slow_arr = pd.Series(close).ewm(span=slow_ema, adjust=False).mean().values
 
+    # Compute ATR if stops enabled
+    atr = None
+    if atr_mult > 0 and "high" in df.columns and "low" in df.columns:
+        high = df["high"].values.astype(float)
+        low = df["low"].values.astype(float)
+        tr = np.zeros(n)
+        tr[0] = high[0] - low[0]
+        for i in range(1, n):
+            tr[i] = max(high[i] - low[i], abs(high[i] - close[i - 1]), abs(low[i] - close[i - 1]))
+        atr = np.full(n, np.nan)
+        if n >= 14:
+            atr[13] = np.mean(tr[:14])
+            for i in range(14, n):
+                atr[i] = (atr[i - 1] * 13 + tr[i]) / 14
+
     # Crossover signals
     fast_above = fast > slow_arr
     entries = np.zeros(n, dtype=bool)
@@ -266,23 +284,47 @@ def _ema_crossover_strategy(df: pd.DataFrame, params: Dict[str, Any]) -> List[Di
     trades: List[Dict] = []
     position = False
     entry_price = 0.0
+    stop_price = 0.0
+    last_exit_bar = -cooldown - 1
 
     for i in range(n):
+        # Check stop-loss
+        if position and atr_mult > 0 and stop_price > 0:
+            check_price = df["low"].iloc[i] if "low" in df.columns else close[i]
+            if check_price <= stop_price:
+                gross_return = (stop_price - entry_price) / entry_price
+                net_return = gross_return - 2 * fees
+                trades.append({
+                    "entry_price": entry_price,
+                    "exit_price": stop_price,
+                    "pnl": entry_price * net_return,
+                    "return": net_return,
+                })
+                position = False
+                last_exit_bar = i
+                continue
+
         if entries[i] and not position:
+            if (i - last_exit_bar) < cooldown:
+                continue
             entry_price = close[i]
             position = True
+            if atr is not None and not np.isnan(atr[i]):
+                stop_price = entry_price - (atr[i] * atr_mult)
+            else:
+                stop_price = 0.0
         elif exits[i] and position:
             exit_price = close[i]
             gross_return = (exit_price - entry_price) / entry_price
-            net_return = gross_return - 2 * fees  # entry + exit fee
-            pnl = entry_price * net_return  # pnl per unit
+            net_return = gross_return - 2 * fees
             trades.append({
                 "entry_price": entry_price,
                 "exit_price": exit_price,
-                "pnl": pnl,
+                "pnl": entry_price * net_return,
                 "return": net_return,
             })
             position = False
+            last_exit_bar = i
 
     return trades
 
@@ -294,6 +336,8 @@ def walk_forward_ema_backtest(
     step: int = 100,
     initial_cash: float = 10000.0,
     fees: float = 0.001,
+    cooldown_bars: int = 0,
+    atr_stop_multiplier: float = 0.0,
 ) -> dict:
     """Walk-forward optimization using EMA crossover strategy.
 
@@ -307,6 +351,8 @@ def walk_forward_ema_backtest(
         step: Step size to advance between windows.
         initial_cash: Starting capital (used for context/logging).
         fees: Trading fee fraction (applied on entry and exit).
+        cooldown_bars: Minimum bars between exit and next entry (0 = disabled).
+        atr_stop_multiplier: ATR-based stop-loss multiplier (0 = disabled).
 
     Returns:
         Dict with walk-forward results including OOS metrics.
@@ -315,6 +361,8 @@ def walk_forward_ema_backtest(
         "fast_ema": list(range(8, 30, 2)),
         "slow_ema": list(range(20, 56, 2)),
         "fees": [fees],
+        "cooldown_bars": [cooldown_bars],
+        "atr_stop_multiplier": [atr_stop_multiplier],
     }
 
     optimizer = WalkForwardOptimizer(

@@ -25,7 +25,6 @@ Usage:
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-import numpy as np
 import pandas as pd
 
 from backtesting.walk_forward import WalkForwardOptimizer
@@ -112,99 +111,9 @@ class ValidationResult:
 
 
 def _ema_strategy_with_stops(df: pd.DataFrame, params: Dict[str, Any]) -> List[Dict]:
-    """
-    EMA crossover strategy with ATR stops and cooldown for walk-forward.
-
-    Compatible with WalkForwardOptimizer's strategy_fn interface.
-    """
-    fast_ema = params.get("fast_ema", 12)
-    slow_ema = params.get("slow_ema", 26)
-    fees = params.get("fees", 0.001)
-    cooldown = params.get("cooldown_bars", 0)
-    atr_mult = params.get("atr_stop_multiplier", 0.0)
-
-    if fast_ema >= slow_ema:
-        return []
-
-    close = df["close"].values.astype(float)
-    n = len(close)
-
-    if n < slow_ema + 2:
-        return []
-
-    # Calculate EMAs
-    fast = pd.Series(close).ewm(span=fast_ema, adjust=False).mean().values
-    slow_arr = pd.Series(close).ewm(span=slow_ema, adjust=False).mean().values
-
-    # Compute ATR if stops enabled
-    atr = None
-    if atr_mult > 0 and "high" in df.columns and "low" in df.columns:
-        high = df["high"].values.astype(float)
-        low = df["low"].values.astype(float)
-        tr = np.zeros(n)
-        tr[0] = high[0] - low[0]
-        for i in range(1, n):
-            tr[i] = max(high[i] - low[i], abs(high[i] - close[i - 1]), abs(low[i] - close[i - 1]))
-        atr = np.full(n, np.nan)
-        if n >= 14:
-            atr[13] = np.mean(tr[:14])
-            for i in range(14, n):
-                atr[i] = (atr[i - 1] * 13 + tr[i]) / 14
-
-    # Crossover signals
-    fast_above = fast > slow_arr
-    entries = np.zeros(n, dtype=bool)
-    exits = np.zeros(n, dtype=bool)
-    entries[1:] = fast_above[1:] & ~fast_above[:-1]
-    exits[1:] = ~fast_above[1:] & fast_above[:-1]
-
-    # Simulate trades
-    trades: List[Dict] = []
-    position = False
-    entry_price = 0.0
-    stop_price = 0.0
-    last_exit_bar = -cooldown - 1
-
-    for i in range(n):
-        # Check stop-loss
-        if position and atr_mult > 0 and stop_price > 0:
-            check_price = df["low"].iloc[i] if "low" in df.columns else close[i]
-            if check_price <= stop_price:
-                gross_return = (stop_price - entry_price) / entry_price
-                net_return = gross_return - 2 * fees
-                trades.append({
-                    "entry_price": entry_price,
-                    "exit_price": stop_price,
-                    "pnl": entry_price * net_return,
-                    "return": net_return,
-                })
-                position = False
-                last_exit_bar = i
-                continue
-
-        if entries[i] and not position:
-            if (i - last_exit_bar) < cooldown:
-                continue
-            entry_price = close[i]
-            position = True
-            if atr is not None and not np.isnan(atr[i]):
-                stop_price = entry_price - (atr[i] * atr_mult)
-            else:
-                stop_price = 0.0
-        elif exits[i] and position:
-            exit_price = close[i]
-            gross_return = (exit_price - entry_price) / entry_price
-            net_return = gross_return - 2 * fees
-            trades.append({
-                "entry_price": entry_price,
-                "exit_price": exit_price,
-                "pnl": entry_price * net_return,
-                "return": net_return,
-            })
-            position = False
-            last_exit_bar = i
-
-    return trades
+    """Delegate to walk_forward's enhanced strategy (single source of truth)."""
+    from backtesting.walk_forward import _ema_crossover_strategy
+    return _ema_crossover_strategy(df, params)
 
 
 def validate_params(

@@ -247,6 +247,7 @@ def _numpy_ema_crossover_backtest(
         'total_trades': len(trades),
         'profit_factor': _safe_profit_factor(wins, losses),
         'final_value': final_value,
+        'trades': trades,
     }
 
 
@@ -457,7 +458,7 @@ def vectorbt_multi_symbol_backtest(
     fast_ema: int = 12,
     slow_ema: int = 26,
     initial_cash: float = 10000.0,
-    use_asset_class_params: bool = False,
+    use_asset_class_params: bool = True,
 ) -> dict:
     """
     Run the same strategy across multiple symbols and aggregate results.
@@ -467,7 +468,7 @@ def vectorbt_multi_symbol_backtest(
         fast_ema: Fast EMA period (used when use_asset_class_params=False)
         slow_ema: Slow EMA period (used when use_asset_class_params=False)
         initial_cash: Total starting capital (split equally across symbols)
-        use_asset_class_params: If True, resolve per-symbol params via LayeredConfig
+        use_asset_class_params: If True (default), resolve per-symbol params via LayeredConfig
 
     Returns:
         Combined performance metrics

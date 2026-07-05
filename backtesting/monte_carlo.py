@@ -176,21 +176,26 @@ def monte_carlo_from_backtest(
     slow_ema: int = 26,
     initial_cash: float = 10000.0,
     fees: float = 0.001,
+    risk_per_trade: float = 1.0,
+    atr_stop_multiplier: float = 0.0,
+    cooldown_bars: int = 0,
     n_simulations: int = 1000,
     seed: Optional[int] = 42,
 ) -> Dict[str, Any]:
     """Run EMA crossover backtest then Monte Carlo on the resulting trades.
 
-    Uses the numpy EMA crossover backtest logic (same as
-    vbt_adapter._numpy_ema_crossover_backtest) to generate trades,
-    then runs Monte Carlo simulation on those trades.
+    Delegates to vbt_adapter._numpy_ema_crossover_backtest for trade generation,
+    ensuring stops, cooldown, and position sizing are consistent with production.
 
     Args:
-        df: DataFrame with 'close' column.
+        df: DataFrame with 'close' column (and optionally 'high'/'low' for ATR).
         fast_ema: Fast EMA period.
         slow_ema: Slow EMA period.
         initial_cash: Starting capital.
         fees: Trading fee fraction.
+        risk_per_trade: Fraction of equity to risk per trade (1.0 = all-in).
+        atr_stop_multiplier: ATR-based stop-loss multiplier (0 = disabled).
+        cooldown_bars: Minimum bars between exit and next entry (0 = disabled).
         n_simulations: Number of Monte Carlo shuffles.
         seed: RNG seed for reproducibility (default: 42). Pass None for non-deterministic.
 
@@ -201,52 +206,20 @@ def monte_carlo_from_backtest(
         logger.error("DataFrame must have a 'close' column")
         return _empty_mc_result(n_simulations, [5, 25, 50, 75, 95])
 
-    close = df["close"].values.astype(float)
-    n = len(close)
+    from backtesting.vbt_adapter import _numpy_ema_crossover_backtest
 
-    if n < slow_ema + 2:
-        logger.warning(
-            "Insufficient data for EMA backtest: need at least %d bars, got %d",
-            slow_ema + 2,
-            n,
-        )
-        return _empty_mc_result(n_simulations, [5, 25, 50, 75, 95])
+    bt_result = _numpy_ema_crossover_backtest(
+        df,
+        fast_ema=fast_ema,
+        slow_ema=slow_ema,
+        initial_cash=initial_cash,
+        fees=fees,
+        risk_per_trade=risk_per_trade,
+        atr_stop_multiplier=atr_stop_multiplier,
+        cooldown_bars=cooldown_bars,
+    )
 
-    # Calculate EMAs
-    fast = pd.Series(close).ewm(span=fast_ema, adjust=False).mean().values
-    slow_arr = pd.Series(close).ewm(span=slow_ema, adjust=False).mean().values
-
-    # Crossover signals
-    fast_above = fast > slow_arr
-    entries = np.zeros(n, dtype=bool)
-    exits = np.zeros(n, dtype=bool)
-    entries[1:] = fast_above[1:] & ~fast_above[:-1]
-    exits[1:] = ~fast_above[1:] & fast_above[:-1]
-
-    # Simulate trades
-    trades: List[Dict[str, Any]] = []
-    cash = initial_cash
-    position = 0.0
-    entry_price = 0.0
-
-    for i in range(n):
-        if entries[i] and position == 0:
-            invest_amount = cash
-            qty = (invest_amount * (1 - fees)) / close[i]
-            position = qty
-            entry_price = close[i]
-            cash -= invest_amount
-        elif exits[i] and position > 0:
-            proceeds = position * close[i] * (1 - fees)
-            pnl = proceeds - (position * entry_price)
-            trades.append({
-                "entry_price": entry_price,
-                "exit_price": close[i],
-                "pnl": pnl,
-                "return": (close[i] - entry_price) / entry_price,
-            })
-            cash += proceeds
-            position = 0.0
+    trades = bt_result.get("trades", [])
 
     if not trades:
         logger.warning("EMA backtest produced no trades")
@@ -271,6 +244,9 @@ def monte_carlo_from_backtest(
         "fast_ema": fast_ema,
         "slow_ema": slow_ema,
         "fees": fees,
+        "risk_per_trade": risk_per_trade,
+        "atr_stop_multiplier": atr_stop_multiplier,
+        "cooldown_bars": cooldown_bars,
     }
     result["backtest_n_trades"] = len(trades)
     result["backtest_total_pnl"] = float(sum(t["pnl"] for t in trades))

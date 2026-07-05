@@ -1346,7 +1346,7 @@ async def cmd_backtest(message: Message):
                 await message.answer("Backtrader not available and no strategy loaded for fallback.")
                 return
 
-            bt = Backtester(_strategy, initial_capital=10000.0)
+            bt = Backtester.for_symbol(_strategy, symbol, initial_capital=10000.0)
             result = bt.run(df, symbol=symbol)
             text = (
                 f"<b>Backtest Results: {symbol}</b>\n"
@@ -1470,18 +1470,33 @@ async def cmd_backtest_vbt(message: Message):
 
         try:
             from backtesting.vbt_adapter import vectorbt_momentum_backtest, vectorbt_parameter_sweep
+            from src.config.backtest_params import get_backtest_config
             from config.settings import settings
             import asyncio
 
+            # Resolve asset-class-aware parameters
+            params = get_backtest_config(symbol)
+
             loop = asyncio.get_event_loop()
             metrics = await loop.run_in_executor(
-                None, lambda: vectorbt_momentum_backtest(df, initial_cash=settings.backtest_initial_cash)
+                None, lambda: vectorbt_momentum_backtest(
+                    df,
+                    fast_ema=params["fast_ema"],
+                    slow_ema=params["slow_ema"],
+                    initial_cash=settings.backtest_initial_cash,
+                    fees=params["fees"],
+                    risk_per_trade=params["risk_per_trade"],
+                    atr_stop_multiplier=params["atr_stop_multiplier"],
+                    cooldown_bars=params["cooldown_bars"],
+                    annualization_periods=params["annualization_periods"],
+                )
             )
             text = (
                 f"<b>VectorBT Results: {symbol}</b>\n"
                 f"{'=' * 30}\n"
-                f"EMA:          12/26 (default)\n"
-                f"Fees:         0.1%\n"
+                f"EMA:          {params['fast_ema']}/{params['slow_ema']}\n"
+                f"Fees:         {params['fees']*100:.2f}%\n"
+                f"Risk/Trade:   {params['risk_per_trade']*100:.0f}%\n"
                 f"Bars:         {len(df)}\n"
                 f"{'─' * 30}\n"
                 f"Return:       {metrics['total_return']:.2%}\n"
@@ -1491,9 +1506,19 @@ async def cmd_backtest_vbt(message: Message):
                 f"Max DD:       {metrics['max_drawdown']:.2%}\n"
             )
 
-            # Quick parameter sweep (top 3)
+            # Quick parameter sweep (top 3) with asset-class params
             try:
-                sweep_df = await loop.run_in_executor(None, vectorbt_parameter_sweep, df)
+                sweep_df = await loop.run_in_executor(
+                    None, lambda: vectorbt_parameter_sweep(
+                        df,
+                        initial_cash=settings.backtest_initial_cash,
+                        fees=params["fees"],
+                        risk_per_trade=params["risk_per_trade"],
+                        atr_stop_multiplier=params["atr_stop_multiplier"],
+                        cooldown_bars=params["cooldown_bars"],
+                        annualization_periods=params["annualization_periods"],
+                    )
+                )
                 if sweep_df is not None and len(sweep_df) > 0:
                     top = sweep_df.sort_values('total_return', ascending=False).head(3)
                     text += f"\n<b>Top 3 Param Combos:</b>\n"
@@ -1535,9 +1560,23 @@ async def cmd_sweep(message: Message):
             return
 
         from backtesting.vbt_adapter import vectorbt_parameter_sweep
+        from src.config.backtest_params import get_backtest_config
         import asyncio
+
+        # Resolve asset-class-aware parameters
+        params = get_backtest_config(symbol)
+
         loop = asyncio.get_event_loop()
-        sweep_df = await loop.run_in_executor(None, vectorbt_parameter_sweep, df)
+        sweep_df = await loop.run_in_executor(
+            None, lambda: vectorbt_parameter_sweep(
+                df,
+                fees=params["fees"],
+                risk_per_trade=params["risk_per_trade"],
+                atr_stop_multiplier=params["atr_stop_multiplier"],
+                cooldown_bars=params["cooldown_bars"],
+                annualization_periods=params["annualization_periods"],
+            )
+        )
 
         if sweep_df is None or len(sweep_df) == 0:
             await message.answer("Sweep produced no results.")
@@ -1802,6 +1841,8 @@ async def cmd_walkforward(message: Message):
 
         def _run_wf():
             from backtesting.walk_forward import walk_forward_ema_backtest
+            from src.config.backtest_params import get_backtest_config
+            params = get_backtest_config(symbol)
             with _broker_lock:
                 df = _broker.get_bars_df(symbol, settings.timeframe, bars)
             return walk_forward_ema_backtest(
@@ -1809,6 +1850,9 @@ async def cmd_walkforward(message: Message):
                 test_window=min(100, bars // 6),
                 step=min(100, bars // 6),
                 initial_cash=settings.backtest_initial_cash,
+                fees=params["fees"],
+                cooldown_bars=params["cooldown_bars"],
+                atr_stop_multiplier=params["atr_stop_multiplier"],
             )
 
         result = await loop.run_in_executor(None, _run_wf)
@@ -1881,10 +1925,19 @@ async def cmd_montecarlo(message: Message):
 
         def _run_mc():
             from backtesting.monte_carlo import monte_carlo_from_backtest
+            from src.config.backtest_params import get_backtest_config
+            params = get_backtest_config(symbol)
             with _broker_lock:
                 df = _broker.get_bars_df(symbol, settings.timeframe, bars)
             return monte_carlo_from_backtest(
-                df, initial_cash=settings.backtest_initial_cash,
+                df,
+                fast_ema=params["fast_ema"],
+                slow_ema=params["slow_ema"],
+                initial_cash=settings.backtest_initial_cash,
+                fees=params["fees"],
+                risk_per_trade=params["risk_per_trade"],
+                atr_stop_multiplier=params["atr_stop_multiplier"],
+                cooldown_bars=params["cooldown_bars"],
                 n_simulations=n_sims,
             )
 
@@ -1944,6 +1997,7 @@ async def cmd_portfolio_backtest(message: Message):
 
         def _run_portfolio():
             from backtesting.portfolio_backtest import portfolio_backtest
+            from src.config.backtest_params import get_backtest_config
             data = {}
             with _broker_lock:
                 for sym in symbols:
@@ -1955,9 +2009,11 @@ async def cmd_portfolio_backtest(message: Message):
                         continue
             if not data:
                 return None
+            # Use the maximum fee across symbols (conservative estimate)
+            fees = max(get_backtest_config(sym)["fees"] for sym in data.keys())
             return portfolio_backtest(
                 data, initial_cash=settings.backtest_initial_cash,
-                fees=0.001,
+                fees=fees,
             )
 
         result = await loop.run_in_executor(None, _run_portfolio)
