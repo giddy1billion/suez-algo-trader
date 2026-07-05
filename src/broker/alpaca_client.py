@@ -202,21 +202,6 @@ class AlpacaBroker:
     def name(self) -> str:
         return "alpaca"
 
-    @property
-    def capabilities(self):
-        """Alpaca broker capabilities."""
-        from src.broker.base import BrokerCapabilities
-        return BrokerCapabilities(
-            supports_fractional=True,
-            supports_shorting=True,
-            supports_options=False,
-            supports_crypto=True,
-            supports_extended_hours=True,
-            supports_bracket_orders=True,
-            supports_notional_orders=True,
-            supports_stop_limit=True,
-        )
-
     @staticmethod
     def _normalize_symbol_for_position(symbol: str) -> str:
         """Normalize crypto symbols for position API calls (BTC/USD → BTCUSD)."""
@@ -311,9 +296,8 @@ class AlpacaBroker:
     # ──────────────────────────────────────────────────────────────────────
 
     @_retry()
-    def market_order(self, symbol: str, qty: float, side: str, time_in_force: str = "day",
-                     client_order_id: Optional[str] = None) -> dict:
-        """Place a market order with optional idempotency key."""
+    def market_order(self, symbol: str, qty: float, side: str, time_in_force: str = "day") -> dict:
+        """Place a market order."""
         try:
             order_side = OrderSide.BUY if side.lower() == "buy" else OrderSide.SELL
             tif = self._parse_time_in_force(time_in_force)
@@ -323,7 +307,6 @@ class AlpacaBroker:
                 qty=qty,
                 side=order_side,
                 time_in_force=tif,
-                client_order_id=client_order_id,
             )
             order = self._call(self.trading_client.submit_order, request)
             logger.info("order.submitted", symbol=symbol, side=side, qty=qty, type="market", order_id=str(order.id))
@@ -662,18 +645,27 @@ class AlpacaBroker:
     }
 
     def _detect_candle_gaps(self, df, symbol: str, timeframe: str) -> None:
-        """Detect and log missing candle gaps in bar data (calendar-aware).
+        """Detect and log missing candle gaps in bar data."""
+        import pandas as pd
 
-        Uses the market calendar subsystem to apply the correct gap threshold
-        for each asset class:
-        - Crypto (24/7): flags gaps > 1.5x the timeframe interval
-        - Equities (NYSE): accounts for overnight, weekends, and holidays
-        """
-        from src.market_calendar import classify_symbol, detect_gaps, log_gap_report
+        expected_seconds = self._TF_EXPECTED_DELTA.get(timeframe)
+        if expected_seconds is None:
+            return  # Unknown timeframe — skip
 
-        instrument = classify_symbol(symbol)
-        gaps = detect_gaps(df, instrument, timeframe)
-        log_gap_report(gaps, instrument, timeframe)
+        # Allow 2x the expected interval before flagging (accounts for weekends/holidays)
+        threshold = expected_seconds * 3
+        deltas = df.index.to_series().diff().dt.total_seconds().dropna()
+        gaps = deltas[deltas > threshold]
+
+        if len(gaps) > 0:
+            logger.warning(
+                "bars_df.candle_gaps_detected",
+                symbol=symbol,
+                timeframe=timeframe,
+                gap_count=len(gaps),
+                max_gap_hours=round(gaps.max() / 3600, 1),
+                first_gap=str(gaps.index[0]),
+            )
 
     # ──────────────────────────────────────────────────────────────────────
     # Real-time WebSocket Streaming
