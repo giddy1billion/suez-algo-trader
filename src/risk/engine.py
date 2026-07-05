@@ -326,10 +326,10 @@ class RiskEngine:
                 score += 15
 
         # Confidence adjustment (low confidence = higher risk)
-        if request.confidence < 0.5:
-            score += 10
-        elif request.confidence < 0.3:
+        if request.confidence < 0.3:
             score += 20
+        elif request.confidence < 0.5:
+            score += 10
 
         # Stop loss presence
         if request.stop_loss is None:

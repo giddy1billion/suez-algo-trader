@@ -38,7 +38,7 @@ class TradeSignal:
 
     @property
     def is_actionable(self) -> bool:
-        return self.signal != Signal.HOLD and self.confidence >= 0.5
+        return self.signal != Signal.HOLD and self.confidence > 0.5
 
 
 class BaseStrategy(ABC):
