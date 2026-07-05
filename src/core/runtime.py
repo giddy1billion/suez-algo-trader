@@ -10,6 +10,7 @@ capabilities into a single coherent API that can be used from:
 
 Capabilities:
 - switch_environment(paper/live) — hot-swap trading mode
+- switch_operational_mode(research/paper/live) — three-mode operation
 - run_backtest(strategies, symbols) — concurrent multi-strategy backtesting
 - train_model(symbols) — end-to-end training pipeline
 - swap_model(version) — transparent model hot-swap
@@ -23,8 +24,9 @@ from typing import Any, Callable, Optional
 
 import pandas as pd
 
-from config.settings import TradingMode, settings
+from config.settings import OperationalMode, TradingMode, settings
 from src.core.environment import BrokerManager, EnvironmentManager, create_broker_for_mode
+from src.core.events import OperationalModeChanged
 from src.ml.model_registry import ModelRegistry
 from src.ml.governance import ModelGovernance
 from src.ml.predictor import ModelPredictor
@@ -51,10 +53,12 @@ class RuntimeManager:
         registry: Optional[ModelRegistry] = None,
         governance: Optional[ModelGovernance] = None,
         strategy_factory: Optional[Callable] = None,
+        operational_mode: Optional[OperationalMode] = None,
     ):
         self._broker_manager = broker_manager
         self._event_bus = event_bus
         self._strategy_factory = strategy_factory
+        self._operational_mode = operational_mode or settings.operational_mode
 
         # Environment switching
         self._env_manager = EnvironmentManager(
@@ -357,6 +361,95 @@ class RuntimeManager:
         return self._ab_manager.list_tests(limit)
 
     # ──────────────────────────────────────────────────────────────────────
+    # Operational Modes (Research / Paper / Live)
+    # ──────────────────────────────────────────────────────────────────────
+
+    def switch_operational_mode(
+        self, mode: str, reason: str = "manual"
+    ) -> dict:
+        """
+        Switch operational mode (research/paper/live).
+
+        - Research: data ingestion, backtests, training, no execution
+        - Paper: full pipeline with simulated execution
+        - Live: real orders with all safeguards
+
+        Args:
+            mode: "research", "paper", or "live"
+            reason: Why the mode is being changed
+
+        Returns:
+            Dict with old/new mode and status
+        """
+        try:
+            new_mode = OperationalMode(mode.lower())
+        except ValueError:
+            raise ValueError(f"Invalid operational mode: {mode}. Must be research/paper/live")
+
+        old_mode = self._operational_mode
+
+        if new_mode == old_mode:
+            return {"status": "unchanged", "mode": old_mode.value}
+
+        # Transition validation
+        if new_mode == OperationalMode.LIVE and old_mode == OperationalMode.RESEARCH:
+            raise RuntimeError(
+                "Cannot transition directly from research to live. "
+                "Must go through paper mode first."
+            )
+
+        # If transitioning to paper/live, sync the broker environment
+        if new_mode in (OperationalMode.PAPER, OperationalMode.LIVE):
+            target_trading = (
+                TradingMode.LIVE if new_mode == OperationalMode.LIVE
+                else TradingMode.PAPER
+            )
+            try:
+                self._env_manager.switch_environment(target_trading, reason=reason)
+            except Exception as e:
+                logger.error("runtime.mode_switch.env_failed", error=str(e))
+                raise
+
+        self._operational_mode = new_mode
+
+        # Publish event
+        if self._event_bus:
+            self._event_bus.publish(OperationalModeChanged(
+                old_mode=old_mode.value,
+                new_mode=new_mode.value,
+                reason=reason,
+                source="runtime_manager",
+            ))
+
+        logger.info(
+            "runtime.operational_mode_changed",
+            old=old_mode.value,
+            new=new_mode.value,
+            reason=reason,
+        )
+
+        return {
+            "status": "switched",
+            "old_mode": old_mode.value,
+            "new_mode": new_mode.value,
+            "reason": reason,
+        }
+
+    @property
+    def operational_mode(self) -> OperationalMode:
+        """Current operational mode."""
+        return self._operational_mode
+
+    @property
+    def is_research_mode(self) -> bool:
+        return self._operational_mode == OperationalMode.RESEARCH
+
+    @property
+    def can_execute_trades(self) -> bool:
+        """Whether the current mode allows trade execution."""
+        return self._operational_mode != OperationalMode.RESEARCH
+
+    # ──────────────────────────────────────────────────────────────────────
     # System Status
     # ──────────────────────────────────────────────────────────────────────
 
@@ -369,6 +462,7 @@ class RuntimeManager:
         return {
             "environment": {
                 "mode": self._env_manager.current_mode.value,
+                "operational_mode": self._operational_mode.value,
                 "state": self._env_manager.state.value,
                 "broker": self._broker_manager.get_status(),
             },

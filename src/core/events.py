@@ -297,6 +297,92 @@ class BacktestCompleted(Event):
 
 
 # ---------------------------------------------------------------------------
+# Data & Scheduler Events
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class DataIngested(Event):
+    """Emitted when new market data is ingested."""
+
+    asset_class: str = ""  # "equity" | "crypto"
+    symbol: str = ""
+    bar_count: int = 0
+
+
+@dataclass(frozen=True)
+class BacktestTriggered(Event):
+    """Emitted when a backtest is triggered by the scheduler."""
+
+    reason: str = ""
+    symbols: list[str] = field(default_factory=list)
+    trigger_source: str = ""  # "data_accumulation" | "drift" | "parameter_change" | "model_retrained" | "scheduled"
+
+
+@dataclass(frozen=True)
+class PredictionRegistered(Event):
+    """Emitted when a new prediction is registered."""
+
+    prediction_id: str = ""
+    asset: str = ""
+    direction: str = ""  # "long" | "short"
+    confidence: float = 0.0
+    horizon: str = ""
+
+
+@dataclass(frozen=True)
+class PredictionOutcomeRecorded(Event):
+    """Emitted when a prediction outcome is recorded."""
+
+    prediction_id: str = ""
+    actual_return: float = 0.0
+    quality_grade: str = ""  # "excellent" | "good" | "fair" | "poor"
+
+
+@dataclass(frozen=True)
+class RetrainingTriggered(Event):
+    """Emitted when model retraining is triggered by evidence."""
+
+    reason: str = ""
+    evidence_summary: str = ""
+
+
+@dataclass(frozen=True)
+class ShadowDeploymentStarted(Event):
+    """Emitted when a model enters shadow deployment."""
+
+    model_version: str = ""
+    baseline_version: str = ""
+
+
+@dataclass(frozen=True)
+class ShadowDeploymentCompleted(Event):
+    """Emitted when shadow deployment evaluation completes."""
+
+    model_version: str = ""
+    result: str = ""  # "promoted" | "rejected"
+    promoted: bool = False
+
+
+@dataclass(frozen=True)
+class CorrelationFilterApplied(Event):
+    """Emitted when the correlation filter processes signals."""
+
+    signals_received: int = 0
+    signals_passed: int = 0
+    signals_reduced: int = 0
+    signals_skipped: int = 0
+
+
+@dataclass(frozen=True)
+class OperationalModeChanged(Event):
+    """Emitted when the system operational mode changes."""
+
+    old_mode: str = ""  # "research" | "paper" | "live"
+    new_mode: str = ""
+    reason: str = ""
+
+
+# ---------------------------------------------------------------------------
 # Event Bus
 # ---------------------------------------------------------------------------
 
