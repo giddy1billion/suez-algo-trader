@@ -508,8 +508,13 @@ class TrainingPipeline:
 
         try:
             # Fast pre-check: skip entirely if no trades recorded yet
-            if hasattr(self._experience_db, 'total_trades') and self._experience_db.total_trades() == 0:
-                return feature_data
+            if hasattr(self._experience_db, 'total_trades'):
+                _trade_count = self._experience_db.total_trades
+                # Handle both property and method access
+                if callable(_trade_count):
+                    _trade_count = _trade_count()
+                if _trade_count == 0:
+                    return feature_data
 
             experience_df = self._experience_db.get_training_samples(min_trades=20)
             if experience_df is None or experience_df.empty:
