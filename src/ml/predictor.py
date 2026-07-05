@@ -18,6 +18,7 @@ from typing import Any, Optional
 import numpy as np
 
 from src.ml.model_registry import ModelRegistry
+from src.ml.label_encoder import DirectionEncoder
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -274,7 +275,7 @@ class ModelPredictor:
             "market_session": market_session,
             "symbol": symbol,
             "strategy": strategy_name,
-            "predicted_direction": "UP" if int(np.argmax(proba[0])) == 2 else ("DOWN" if int(np.argmax(proba[0])) == 0 else "FLAT"),
+            "predicted_direction": DirectionEncoder.class_name(int(np.argmax(proba[0]))),
             "predicted_confidence": float(np.max(proba[0])),
             "feature_snapshot_id": "",
             "git_commit": self._get_git_commit(),

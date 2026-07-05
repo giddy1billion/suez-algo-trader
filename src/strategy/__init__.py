@@ -1,4 +1,4 @@
-from src.strategy.base import BaseStrategy, Signal, TradeSignal  # noqa: F401
+from src.strategy.base import BaseStrategy, Signal, Side, TradeSignal, LegacyTradeSignal  # noqa: F401
 from src.strategy.signal_package import (  # noqa: F401
     TradeSignalPackage,
     SignalValidationGate,

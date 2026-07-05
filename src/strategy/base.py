@@ -1,18 +1,38 @@
 """
 Base Strategy — Abstract class that all trading strategies must implement.
 Defines the interface for signal generation, entry/exit logic.
+
+Architecture:
+    TradeSignal is intentionally MINIMAL — it is a strategy PROPOSAL only.
+    It does NOT contain position sizing, risk allocation, confidence after
+    calibration, or execution approval. Those belong to the DecisionContract.
+
+    Pipeline: Strategy → TradeSignal → DecisionOrchestrator → DecisionContract
 """
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from enum import Enum
-from typing import Optional
+from typing import Any, Optional
+import uuid
 
 import pandas as pd
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Enums
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class Side(str, Enum):
+    """Trade direction — intentionally binary. Strength is signal_strength."""
+    BUY = "BUY"
+    SELL = "SELL"
+
+
 class Signal(Enum):
-    """Trading signal types."""
+    """Legacy trading signal types. Retained for backward compatibility."""
     STRONG_BUY = 2
     BUY = 1
     HOLD = 0
@@ -21,9 +41,109 @@ class Signal(Enum):
     NO_SIGNAL = -99
 
 
-@dataclass
+# ──────────────────────────────────────────────────────────────────────────────
+# TradeSignal — The Clean Architecture signal (frozen, minimal, proposal-only)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
 class TradeSignal:
-    """A concrete trade signal with metadata."""
+    """
+    Lightweight strategy proposal — contains ONLY what the strategy knows.
+
+    This is NOT an execution instruction. It is a proposal that says:
+    "I think we should trade."
+
+    Does NOT contain:
+        - Position size
+        - Risk percentage
+        - Confidence after calibration
+        - Kelly fraction
+        - Portfolio exposure
+        - Execution approval
+        - Broker information
+        - Stop loss / take profit chosen by the risk engine
+        - Order type
+
+    Those belong to the DecisionContract (produced by DecisionOrchestrator).
+    """
+
+    # ── Identity ──
+    signal_id: str = field(default_factory=lambda: f"SIG-{uuid.uuid4().hex[:8]}")
+    strategy_id: str = ""
+    strategy_version: str = "1.0.0"
+
+    # ── Market ──
+    symbol: str = ""
+    timeframe: str = ""
+    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+    # ── Proposal ──
+    side: Side = Side.BUY
+    signal_strength: float = 0.0        # 0.0-1.0, raw strategy output
+    expected_direction: int = 1          # +1 (bullish) or -1 (bearish)
+
+    # ── Strategy Metadata ──
+    tags: tuple[str, ...] = field(default_factory=tuple)
+    reason: str = ""
+
+    # ── Strategy Evidence Only ──
+    features: dict[str, Any] = field(default_factory=dict)
+    indicators: dict[str, float] = field(default_factory=dict)
+
+    @property
+    def is_actionable(self) -> bool:
+        """A signal is actionable if it has meaningful strength."""
+        return self.signal_strength > 0.0 and self.symbol != ""
+
+    @property
+    def is_buy(self) -> bool:
+        return self.side == Side.BUY
+
+    @property
+    def is_sell(self) -> bool:
+        return self.side == Side.SELL
+
+    def to_event_payload(self) -> dict[str, Any]:
+        """Serialize to structured event bus payload."""
+        return {
+            "signal_id": self.signal_id,
+            "strategy": {
+                "id": self.strategy_id,
+                "version": self.strategy_version,
+            },
+            "market": {
+                "symbol": self.symbol,
+                "timeframe": self.timeframe,
+                "timestamp": self.timestamp.isoformat(),
+            },
+            "signal": {
+                "side": self.side.value,
+                "strength": self.signal_strength,
+                "expected_direction": self.expected_direction,
+            },
+            "metadata": {
+                "tags": list(self.tags),
+                "reason": self.reason,
+            },
+            "evidence": {
+                "features": self.features,
+                "indicators": self.indicators,
+            },
+        }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# LegacyTradeSignal — Old mutable format (for backward compatibility)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@dataclass
+class LegacyTradeSignal:
+    """
+    DEPRECATED: Old trade signal format. Retained for strategies not yet migrated.
+    Use TradeSignal (frozen) for new code.
+    """
     symbol: str
     signal: Signal
     confidence: float  # 0.0 to 1.0
@@ -45,8 +165,16 @@ class TradeSignal:
 class BaseStrategy(ABC):
     """
     Abstract base class for all trading strategies.
-    Subclass and implement generate_signals() for your strategy logic.
+
+    Strategies produce TradeSignal objects — lightweight proposals.
+    The DecisionOrchestrator downstream decides whether to execute.
+
+    Strategies that haven't migrated yet can return LegacyTradeSignal;
+    the signal adapter in the ExecutionEngine handles conversion.
     """
+
+    # Override in subclass for versioning
+    version: str = "1.0.0"
 
     def __init__(self, name: str, symbols: list[str], timeframe: str = "1Hour", lookback: int = 200):
         self.name = name
@@ -56,7 +184,7 @@ class BaseStrategy(ABC):
         self._is_active = True
 
     @abstractmethod
-    def generate_signals(self, data: dict[str, pd.DataFrame]) -> list[TradeSignal]:
+    def generate_signals(self, data: dict[str, pd.DataFrame]) -> list:
         """
         Analyze market data and generate trading signals.
 
@@ -64,7 +192,8 @@ class BaseStrategy(ABC):
             data: Dict mapping symbol -> DataFrame with OHLCV columns
 
         Returns:
-            List of TradeSignal objects (one per symbol with a signal)
+            List of TradeSignal or LegacyTradeSignal objects.
+            Prefer returning TradeSignal (frozen) for new strategies.
         """
         pass
 

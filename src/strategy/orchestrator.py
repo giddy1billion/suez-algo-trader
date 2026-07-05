@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
 
-from src.strategy.base import BaseStrategy, TradeSignal
+from src.strategy.base import BaseStrategy, LegacyTradeSignal
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)

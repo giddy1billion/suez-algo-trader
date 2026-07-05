@@ -34,7 +34,7 @@ from src.core.circuit_breaker import (
 from src.core.audit_log import TradeAuditTrail
 from src.ml.governance import ModelGovernance, ModelLineage, ModelStatus, ValidationResult
 from src.predictions.registry import PredictionRecord, PredictionRegistry
-from src.strategy.base import Signal, TradeSignal
+from src.strategy.base import Signal, LegacyTradeSignal
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -163,7 +163,7 @@ class TestNoSignalSentinel:
         assert Signal.NO_SIGNAL.value == -99
 
     def test_no_signal_not_actionable(self):
-        sig = TradeSignal(
+        sig = LegacyTradeSignal(
             symbol="AAPL",
             signal=Signal.NO_SIGNAL,
             confidence=0.0,
@@ -173,7 +173,7 @@ class TestNoSignalSentinel:
         assert sig.is_actionable is False
 
     def test_hold_not_actionable(self):
-        sig = TradeSignal(
+        sig = LegacyTradeSignal(
             symbol="AAPL",
             signal=Signal.HOLD,
             confidence=0.8,
@@ -182,7 +182,7 @@ class TestNoSignalSentinel:
         assert sig.is_actionable is False
 
     def test_buy_is_actionable(self):
-        sig = TradeSignal(
+        sig = LegacyTradeSignal(
             symbol="AAPL",
             signal=Signal.BUY,
             confidence=0.8,

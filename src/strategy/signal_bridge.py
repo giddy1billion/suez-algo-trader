@@ -21,7 +21,7 @@ from typing import Any, Optional
 
 import numpy as np
 
-from src.strategy.base import TradeSignal, Signal
+from src.strategy.base import LegacyTradeSignal, Signal
 from src.strategy.signal_package import (
     TradeSignalPackage,
     EntryZone,
@@ -125,7 +125,7 @@ class SignalPackageBuilder:
 
     def build(
         self,
-        signal: TradeSignal,
+        signal: LegacyTradeSignal,
         strategy_name: str = "unknown",
         market_data=None,
         intelligence_decision=None,
@@ -233,7 +233,7 @@ class SignalPackageBuilder:
     # Private builders
     # ──────────────────────────────────────────────────────────────────────
 
-    def _build_entry_zone(self, signal: TradeSignal, market_data) -> EntryZone:
+    def _build_entry_zone(self, signal: LegacyTradeSignal, market_data) -> EntryZone:
         """Build entry zone from signal price and ATR-based spread."""
         price = signal.price
         spread_pct = self.config.entry_zone_spread_pct
@@ -312,7 +312,7 @@ class SignalPackageBuilder:
     def _build_contributors(
         self,
         strategy_name: str,
-        signal: TradeSignal,
+        signal: LegacyTradeSignal,
         intelligence_decision,
         additional_contributors: Optional[list[dict]],
     ) -> list[StrategyContributor]:
@@ -341,7 +341,7 @@ class SignalPackageBuilder:
         return contributors
 
     def _build_tp_levels(
-        self, signal: TradeSignal, market_data
+        self, signal: LegacyTradeSignal, market_data
     ) -> list[TakeProfitLevel]:
         """Build multi-level take profit targets."""
         if not signal.stop_loss or not signal.price:
@@ -402,7 +402,7 @@ class SignalPackageBuilder:
         )
 
     def _build_reasons(
-        self, signal: TradeSignal, intelligence_decision
+        self, signal: LegacyTradeSignal, intelligence_decision
     ) -> list[str]:
         """Build reasons list from signal and intelligence."""
         reasons = []
@@ -436,7 +436,7 @@ class SignalPackageBuilder:
         return reasons
 
     def _calculate_risk_reward(
-        self, signal: TradeSignal, tp_levels: list[TakeProfitLevel]
+        self, signal: LegacyTradeSignal, tp_levels: list[TakeProfitLevel]
     ) -> float:
         """Calculate expected risk/reward ratio."""
         if not signal.stop_loss or not signal.price or not tp_levels:
@@ -461,7 +461,7 @@ class SignalPackageBuilder:
         return round(avg_reward / risk, 2)
 
     def _estimate_win_probability(
-        self, signal: TradeSignal, intelligence_decision
+        self, signal: LegacyTradeSignal, intelligence_decision
     ) -> float:
         """Estimate win probability from confidence and intelligence score."""
         base_prob = signal.confidence
@@ -474,7 +474,7 @@ class SignalPackageBuilder:
         return min(max(round(base_prob, 3), 0.01), 0.99)
 
     def _estimate_return(
-        self, signal: TradeSignal, tp_levels: list[TakeProfitLevel]
+        self, signal: LegacyTradeSignal, tp_levels: list[TakeProfitLevel]
     ) -> float:
         """Estimate expected return percentage."""
         if not signal.price or not tp_levels:
@@ -488,14 +488,14 @@ class SignalPackageBuilder:
 
         return round(total, 2)
 
-    def _estimate_max_drawdown(self, signal: TradeSignal) -> float:
+    def _estimate_max_drawdown(self, signal: LegacyTradeSignal) -> float:
         """Estimate max drawdown from stop loss."""
         if not signal.stop_loss or not signal.price:
             return 5.0  # Default conservative estimate
         return round(abs(signal.price - signal.stop_loss) / signal.price * 100, 2)
 
     def _estimate_position_size(
-        self, signal: TradeSignal, portfolio_value: float
+        self, signal: LegacyTradeSignal, portfolio_value: float
     ) -> float:
         """Estimate position size as % of portfolio from risk parameters."""
         if not signal.stop_loss or signal.price <= 0:

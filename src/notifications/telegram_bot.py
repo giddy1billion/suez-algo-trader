@@ -1725,14 +1725,19 @@ async def cmd_predict(message: Message):
         # Predict
         import numpy as np
         import asyncio
+        from src.ml.label_encoder import DirectionEncoder
         loop = asyncio.get_event_loop()
         proba = await loop.run_in_executor(None, ml_strat.model.predict_proba, features)
         proba = proba[0]
         pred_class = np.argmax(proba)
         confidence = proba[pred_class]
 
-        direction_map = {0: "SELL 📉", 1: "HOLD ➡️", 2: "BUY 📈"}
-        direction = direction_map[pred_class]
+        direction_map = {
+            DirectionEncoder.DOWN_CLASS: "SELL 📉",
+            DirectionEncoder.FLAT_CLASS: "HOLD ➡️",
+            DirectionEncoder.UP_CLASS: "BUY 📈",
+        }
+        direction = direction_map.get(pred_class, "HOLD ➡️")
 
         price = float(latest['close'].iloc[0])
 
@@ -1760,9 +1765,9 @@ async def cmd_predict(message: Message):
             f"Confidence: {confidence:.0%} ({strength})\n"
             f"Price:      ${price:,.2f}\n"
             f"\n<b>Probabilities:</b>\n"
-            f"  📉 Sell:  {proba[0]:.0%}\n"
-            f"  ➡️ Hold:  {proba[1]:.0%}\n"
-            f"  📈 Buy:   {proba[2]:.0%}\n"
+            f"  📉 Sell:  {proba[DirectionEncoder.DOWN_CLASS]:.0%}\n"
+            f"  ➡️ Hold:  {proba[DirectionEncoder.FLAT_CLASS]:.0%}\n"
+            f"  📈 Buy:   {proba[DirectionEncoder.UP_CLASS]:.0%}\n"
         )
 
         if key_features:

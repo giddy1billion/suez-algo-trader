@@ -23,6 +23,7 @@ import pandas as pd
 
 from src.ml.model_registry import ModelRegistry
 from src.ml.governance import ModelGovernance
+from src.ml.label_encoder import DirectionEncoder
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -629,9 +630,8 @@ class TrainingPipeline:
         X = valid[feature_cols].values
         y = valid['target'].values
 
-        # Remap labels: -1→0 (sell/down), 0→1 (hold/flat), 1→2 (buy/up)
-        # XGBClassifier requires contiguous classes starting from 0
-        y = (y + 1).astype(int)
+        # Encode trading labels [-1,0,1] → model classes [0,1,2]
+        y = DirectionEncoder.encode(y)
 
         # Time-series cross-validation
         tscv = TimeSeriesSplit(n_splits=5)
@@ -686,9 +686,9 @@ class TrainingPipeline:
             "n_features": len(feature_cols),
             "n_symbols": len(feature_data),
             "class_distribution": {
-                "up": int((y == 1).sum()),
-                "flat": int((y == 0).sum()),
-                "down": int((y == -1).sum()),
+                "up": int((y == DirectionEncoder.UP_CLASS).sum()),
+                "flat": int((y == DirectionEncoder.FLAT_CLASS).sum()),
+                "down": int((y == DirectionEncoder.DOWN_CLASS).sum()),
             },
             "hyperparameters": {
                 "n_estimators": 200,

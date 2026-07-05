@@ -12,7 +12,8 @@ import numpy as np
 import pandas as pd
 import joblib
 
-from src.strategy.base import BaseStrategy, TradeSignal, Signal
+from src.strategy.base import BaseStrategy, LegacyTradeSignal, Signal
+from src.ml.label_encoder import DirectionEncoder
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -131,7 +132,7 @@ class MLStrategy(BaseStrategy):
                 logger.error("ml.fallback_creation_failed", error=str(e))
         return self._fallback_strategy
 
-    def _fallback_signals(self, data: dict[str, pd.DataFrame]) -> list[TradeSignal]:
+    def _fallback_signals(self, data: dict[str, pd.DataFrame]) -> list:
         """Generate signals using fallback strategy when ML model unavailable."""
         logger.warning("ml.using_fallback", reason="no trained model available")
         fallback = self._get_fallback_strategy()
@@ -147,7 +148,7 @@ class MLStrategy(BaseStrategy):
 
         # Last resort: return NO_SIGNAL
         return [
-            TradeSignal(
+            LegacyTradeSignal(
                 symbol=symbol,
                 signal=Signal.NO_SIGNAL,
                 confidence=0.0,
@@ -276,7 +277,7 @@ class MLStrategy(BaseStrategy):
     # Prediction / Signal Generation
     # ──────────────────────────────────────────────────────────────────────
 
-    def generate_signals(self, data: dict[str, pd.DataFrame]) -> list[TradeSignal]:
+    def generate_signals(self, data: dict[str, pd.DataFrame]) -> list:
         """Generate ML-based signals. Falls back to momentum if no model. Thread-safe."""
         if self.model is None:
             return self._fallback_signals(data)
@@ -315,11 +316,11 @@ class MLStrategy(BaseStrategy):
             price = float(latest['close'].iloc[0])
             atr = float(latest['atr_14'].iloc[0]) if 'atr_14' in latest.columns and not pd.isna(latest['atr_14'].iloc[0]) else price * 0.02
 
-            if pred_class == 2 and confidence >= self.min_confidence:  # UP
+            if pred_class == DirectionEncoder.UP_CLASS and confidence >= self.min_confidence:
                 signal = Signal.STRONG_BUY if confidence >= 0.8 else Signal.BUY
                 stop_loss = price - (atr * 2)
                 take_profit = price + (atr * 3)
-            elif pred_class == 0 and confidence >= self.min_confidence:  # DOWN
+            elif pred_class == DirectionEncoder.DOWN_CLASS and confidence >= self.min_confidence:
                 signal = Signal.STRONG_SELL if confidence >= 0.8 else Signal.SELL
                 stop_loss = price + (atr * 2)
                 take_profit = price - (atr * 3)
@@ -328,18 +329,18 @@ class MLStrategy(BaseStrategy):
                 stop_loss = None
                 take_profit = None
 
-            signals.append(TradeSignal(
+            signals.append(LegacyTradeSignal(
                 symbol=symbol,
                 signal=signal,
                 confidence=confidence,
                 price=price,
                 stop_loss=stop_loss,
                 take_profit=take_profit,
-                reason=f"ML pred: {'UP' if pred_class == 2 else 'DOWN' if pred_class == 0 else 'FLAT'} ({confidence:.1%})",
+                reason=f"ML pred: {DirectionEncoder.class_name(pred_class)} ({confidence:.1%})",
                 indicators={
-                    "prob_down": round(proba[0], 3),
-                    "prob_flat": round(proba[1], 3),
-                    "prob_up": round(proba[2], 3),
+                    "prob_down": round(proba[DirectionEncoder.DOWN_CLASS], 3),
+                    "prob_flat": round(proba[DirectionEncoder.FLAT_CLASS], 3),
+                    "prob_up": round(proba[DirectionEncoder.UP_CLASS], 3),
                     "atr": round(atr, 4),
                 },
             ))

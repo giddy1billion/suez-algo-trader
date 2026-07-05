@@ -33,9 +33,10 @@ class Trade(Base):
     pnl_pct = Column(Float)
     fees = Column(Float, default=0.0)
     notes = Column(Text)
-    # Audit trail: links trade → prediction → model
+    # Audit trail: links trade → prediction → model → contract
     prediction_id = Column(String(64), index=True)
     model_version = Column(String(64))
+    contract_id = Column(String(64), index=True)  # Links to DecisionContract
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
     filled_at = Column(DateTime)
     closed_at = Column(DateTime)
@@ -95,6 +96,9 @@ class JournalEntry(Base):
     prediction = Column(String(20))  # BUY/SELL/HOLD
     confidence = Column(Float)
     features_snapshot = Column(Text)  # JSON: all feature values at entry time
+
+    # Decision Contract audit trail
+    contract_id = Column(String(64), index=True)  # Links to DecisionContract
 
     # Exit context
     exit_price = Column(Float)

@@ -62,6 +62,11 @@ class TradeScorecard:
     # Feature snapshot (for retraining)
     feature_vector: dict = field(default_factory=dict)
 
+    # Decision Contract linkage (for governance feedback loop)
+    contract_id: str = ""  # Links to DecisionContract that approved this trade
+    contract_decision: str = ""  # "execute" | "reduce" — what the contract decided
+    contract_confidence: float = 0.0  # Contract's final confidence at decision time
+
     # Execution quality
     slippage_pct: float = 0.0
     fees: float = 0.0
@@ -103,6 +108,7 @@ class ExperienceDatabase:
         market_regime TEXT,
         volatility_level TEXT,
         feature_hash TEXT,
+        contract_id TEXT,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
 
@@ -121,6 +127,9 @@ class ExperienceDatabase:
         max_adverse_excursion DOUBLE,
         slippage_pct DOUBLE,
         fees DOUBLE,
+        contract_id TEXT,
+        contract_decision TEXT,
+        contract_confidence DOUBLE,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
 
@@ -136,6 +145,7 @@ class ExperienceDatabase:
         model_version TEXT,
         strategy_name TEXT,
         market_regime TEXT,
+        contract_id TEXT,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
 
@@ -162,7 +172,7 @@ class ExperienceDatabase:
         self._conn.execute(self._CREATE_TABLES_SQL)
 
     def _check_legacy_migration(self) -> None:
-        """Warn if legacy JSONL file exists."""
+        """Warn if legacy JSONL file exists and migrate schema if needed."""
         legacy_path = self._storage_path / "scorecards.jsonl"
         if legacy_path.exists():
             logger.warning(
@@ -171,6 +181,25 @@ class ExperienceDatabase:
                 message="Legacy JSONL file found. Consider migrating with "
                 "ExperienceDatabase.migrate_from_jsonl().",
             )
+        # Schema migration: add contract_id columns if missing
+        self._migrate_contract_columns()
+
+    def _migrate_contract_columns(self) -> None:
+        """Add contract_id columns to existing tables (idempotent)."""
+        migrations = [
+            ("predictions", "contract_id", "TEXT"),
+            ("outcomes", "contract_id", "TEXT"),
+            ("outcomes", "contract_decision", "TEXT"),
+            ("outcomes", "contract_confidence", "DOUBLE"),
+            ("scorecards", "contract_id", "TEXT"),
+        ]
+        for table, column, dtype in migrations:
+            try:
+                self._conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {column} {dtype}"
+                )
+            except Exception:
+                pass  # Column already exists
 
     def migrate_from_jsonl(self) -> int:
         """Migrate legacy JSONL data into DuckDB. Returns count of migrated records."""
@@ -254,8 +283,8 @@ class ExperienceDatabase:
                     strategy_name, predicted_direction, predicted_confidence,
                     predicted_win_probability, predicted_return_pct,
                     predicted_duration_minutes, predicted_risk_reward,
-                    market_regime, volatility_level, feature_hash
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    market_regime, volatility_level, feature_hash, contract_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     prediction_id, scorecard.trade_id, scorecard.symbol, ts,
@@ -264,6 +293,7 @@ class ExperienceDatabase:
                     scorecard.predicted_win_probability, scorecard.predicted_return_pct,
                     scorecard.predicted_duration_minutes, scorecard.predicted_risk_reward,
                     scorecard.market_regime, scorecard.volatility_level, feature_hash,
+                    scorecard.contract_id,
                 ],
             )
 
@@ -275,8 +305,9 @@ class ExperienceDatabase:
                     actual_duration_minutes, actual_risk_reward, entry_price,
                     exit_price, stop_loss_price, stop_loss_hit,
                     max_favorable_excursion, max_adverse_excursion,
-                    slippage_pct, fees
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    slippage_pct, fees, contract_id, contract_decision,
+                    contract_confidence
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     scorecard.trade_id, scorecard.symbol,
@@ -286,6 +317,8 @@ class ExperienceDatabase:
                     scorecard.stop_loss_price, scorecard.stop_loss_hit,
                     scorecard.max_favorable_excursion, scorecard.max_adverse_excursion,
                     scorecard.slippage_pct, scorecard.fees,
+                    scorecard.contract_id, scorecard.contract_decision,
+                    scorecard.contract_confidence,
                 ],
             )
 
@@ -295,8 +328,9 @@ class ExperienceDatabase:
                 INSERT OR REPLACE INTO scorecards (
                     trade_id, symbol, timestamp, direction_score,
                     confidence_calibration_error, timing_score, exit_efficiency,
-                    overall_score, model_version, strategy_name, market_regime
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    overall_score, model_version, strategy_name, market_regime,
+                    contract_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     scorecard.trade_id, scorecard.symbol, ts,
@@ -304,6 +338,7 @@ class ExperienceDatabase:
                     scorecard.timing_score, scorecard.exit_efficiency,
                     scorecard.overall_score, scorecard.model_version,
                     scorecard.strategy_name, scorecard.market_regime,
+                    scorecard.contract_id,
                 ],
             )
 

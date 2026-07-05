@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Optional, Union
 if TYPE_CHECKING:
     from src.intelligence.confidence.models import ConfidenceScore
     from src.intelligence.confidence.decision_contract import DecisionContract
+    from src.strategy.base import TradeSignal
 
 
 class RiskAction(str, Enum):
@@ -23,7 +24,18 @@ class RiskAction(str, Enum):
 
 @dataclass
 class TradeRequest:
-    """Incoming trade request to be evaluated by the risk engine."""
+    """
+    Incoming trade request to be evaluated by the risk engine.
+
+    Clean Architecture:
+        The TradeRequest carries both the strategy's PROPOSAL (TradeSignal)
+        and the system's DECISION (DecisionContract). The risk engine reads
+        from the contract for execution parameters (SL, TP, position size),
+        NOT from the signal.
+
+    Flow:
+        TradeSignal → DecisionOrchestrator → DecisionContract → TradeRequest → RiskEngine
+    """
     symbol: str
     side: str  # "buy" or "sell"
     qty: float
@@ -41,6 +53,9 @@ class TradeRequest:
     # When present, this is the single source of truth for the trade.
     decision_contract: Optional[DecisionContract] = None
 
+    # Source signal — the strategy's original proposal (audit trail)
+    trade_signal: Optional[TradeSignal] = None
+
     @property
     def effective_confidence(self) -> float:
         """Return the best available confidence value (contract > score > scalar)."""
@@ -54,6 +69,25 @@ class TradeRequest:
     def has_contract(self) -> bool:
         """Whether this request carries an authoritative DecisionContract."""
         return self.decision_contract is not None
+
+    @property
+    def has_signal(self) -> bool:
+        """Whether this request carries the source TradeSignal."""
+        return self.trade_signal is not None
+
+    @property
+    def signal_id(self) -> str:
+        """Get signal_id from the attached trade signal, or empty string."""
+        if self.trade_signal is not None:
+            return self.trade_signal.signal_id
+        return ""
+
+    @property
+    def contract_id(self) -> str:
+        """Get contract_id from the attached decision contract, or empty string."""
+        if self.decision_contract is not None:
+            return self.decision_contract.contract_id
+        return ""
 
     @property
     def notional_value(self) -> float:

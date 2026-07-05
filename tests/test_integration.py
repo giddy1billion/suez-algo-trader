@@ -21,7 +21,7 @@ from src.execution.simulator import ExecutionSimulator
 from src.execution.engine import ExecutionEngine
 from src.risk.manager import RiskManager, RiskLimits
 from src.risk.engine import RiskEngine
-from src.strategy.base import BaseStrategy, TradeSignal, Signal
+from src.strategy.base import BaseStrategy, LegacyTradeSignal, Signal
 
 
 # ---------------------------------------------------------------------------
@@ -117,7 +117,7 @@ class SimpleStrategy(BaseStrategy):
         signals = []
         for symbol, df in data.items():
             price = float(df["close"].iloc[-1])
-            signals.append(TradeSignal(
+            signals.append(LegacyTradeSignal(
                 symbol=symbol,
                 signal=self._signal_type,
                 confidence=self._confidence,

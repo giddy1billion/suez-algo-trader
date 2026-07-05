@@ -7,7 +7,7 @@ import pandas as pd
 import numpy as np
 from typing import Optional
 
-from src.strategy.base import BaseStrategy, TradeSignal, Signal
+from src.strategy.base import BaseStrategy, LegacyTradeSignal, Signal
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -78,7 +78,7 @@ class MeanReversionStrategy(BaseStrategy):
 
         return df
 
-    def generate_signals(self, data: dict[str, pd.DataFrame]) -> list[TradeSignal]:
+    def generate_signals(self, data: dict[str, pd.DataFrame]) -> list:
         """Generate mean reversion signals."""
         signals = []
 
@@ -98,7 +98,7 @@ class MeanReversionStrategy(BaseStrategy):
 
         return signals
 
-    def _evaluate_symbol(self, symbol: str, df: pd.DataFrame) -> Optional[TradeSignal]:
+    def _evaluate_symbol(self, symbol: str, df: pd.DataFrame) -> Optional[LegacyTradeSignal]:
         """Evaluate mean reversion opportunity for one symbol."""
         if len(df) < 2:
             return None
@@ -137,19 +137,19 @@ class MeanReversionStrategy(BaseStrategy):
             take_profit = min(latest['sma'], price * 0.999)
 
         else:
-            return TradeSignal(
+            return LegacyTradeSignal(
                 symbol=symbol, signal=Signal.HOLD, confidence=0.0,
                 price=price, reason="No mean reversion setup"
             )
 
         # Gate on min_confidence — reject marginal setups
         if confidence < self.min_confidence:
-            return TradeSignal(
+            return LegacyTradeSignal(
                 symbol=symbol, signal=Signal.HOLD, confidence=confidence,
                 price=price, reason=f"Confidence {confidence:.2f} below min {self.min_confidence:.2f}"
             )
 
-        return TradeSignal(
+        return LegacyTradeSignal(
             symbol=symbol,
             signal=signal,
             confidence=confidence,

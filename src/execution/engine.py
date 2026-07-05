@@ -16,7 +16,8 @@ from src.broker.alpaca_client import AlpacaBroker
 from src.risk.manager import RiskManager, RiskLimits
 from src.risk.engine import RiskEngine
 from src.risk.models import TradeRequest, RiskDecision
-from src.strategy.base import BaseStrategy, TradeSignal, Signal
+from src.strategy.base import BaseStrategy, TradeSignal, LegacyTradeSignal, Signal, Side
+from src.strategy.signal_adapter import adapt_signal, is_legacy_signal, is_actionable
 from src.data.store import DatabaseManager
 from src.intelligence.orchestrator import AdaptiveIntelligenceOrchestrator
 from src.intelligence.confidence.gate import ConfidenceGate, ConfidenceGateConfig, SignalContext
@@ -28,7 +29,7 @@ from src.core.runtime_state import RuntimeState
 
 # Event types — imported at top for reliability
 from src.core.events import (
-    SignalGenerated, RiskEvaluated, OrderSubmitted, OrderFilled,
+    SignalGenerated, DecisionContractCreated, RiskEvaluated, OrderSubmitted, OrderFilled,
     OrderRejected, TradeOpened, TradeClosed, RiskHalt,
 )
 from src.core.state_machine import TradeState
@@ -218,37 +219,52 @@ class ExecutionEngine:
             logger.info("engine.no_data")
             return []
 
-        # 3. Generate signals
-        signals = strategy.generate_signals(data)
-        actionable_count = len([s for s in signals if s.is_actionable])
-        logger.info("engine.signals", count=len(signals), actionable=actionable_count)
+        # 3. Generate signals and adapt to clean format
+        raw_signals = strategy.generate_signals(data)
+        
+        # Adapt all signals to new TradeSignal format (frozen, minimal)
+        adapted_signals: list[TradeSignal] = []
+        for raw_sig in raw_signals:
+            if is_actionable(raw_sig):
+                adapted = adapt_signal(raw_sig, strategy)
+                adapted_signals.append(adapted)
+        
+        logger.info("engine.signals", count=len(raw_signals), actionable=len(adapted_signals))
 
         # Publish signal events (respecting pause state and operating mode)
-        for sig in signals:
-            if sig.is_actionable:
-                # Skip signal publishing if bot is paused or mode prohibits entries
-                if self._runtime_state.is_paused():
-                    logger.info("engine.signal_suppressed_paused", symbol=sig.symbol, signal=sig.signal.name)
-                    continue
-                if not self._runtime_state.can_open_positions:
-                    logger.info(
-                        "engine.signal_suppressed_mode",
-                        symbol=sig.symbol,
-                        mode=self._runtime_state.operating_mode.value,
-                    )
-                    continue
-                
-                self._publish(SignalGenerated(
+        for sig in adapted_signals:
+            # Skip signal publishing if bot is paused or mode prohibits entries
+            if self._runtime_state.is_paused():
+                logger.info("engine.signal_suppressed_paused", symbol=sig.symbol, signal=sig.side.value)
+                continue
+            if not self._runtime_state.can_open_positions:
+                logger.info(
+                    "engine.signal_suppressed_mode",
                     symbol=sig.symbol,
-                    signal=sig.signal.name,
-                    confidence=sig.confidence,
-                    strategy=self._current_strategy_name,
-                    price=sig.price,
-                    indicators=sig.indicators or {},
-                    source="engine",
-                ))
+                    mode=self._runtime_state.operating_mode.value,
+                )
+                continue
+            
+            self._publish(SignalGenerated(
+                signal_id=sig.signal_id,
+                strategy=sig.strategy_id,
+                strategy_version=sig.strategy_version,
+                symbol=sig.symbol,
+                timeframe=sig.timeframe,
+                signal=sig.side.value,
+                side=sig.side.value,
+                signal_strength=sig.signal_strength,
+                expected_direction=sig.expected_direction,
+                confidence=sig.signal_strength,  # backward compat
+                price=sig.features.get("observed_price", 0.0),
+                reason=sig.reason,
+                tags=sig.tags,
+                indicators=sig.indicators,
+                features=sig.features,
+                source="engine",
+            ))
 
-        # 4. Process each signal
+        # 4. Process each signal through the decision pipeline
         account = self.broker.get_account()
         positions = self.broker.get_positions()
         portfolio_value = account['portfolio_value']
@@ -263,10 +279,7 @@ class ExecutionEngine:
         # alternatives for those that ARE taken — institutional audit trail)
         self._cycle_alternatives: list[dict] = []
 
-        for signal in signals:
-            if not signal.is_actionable:
-                continue
-
+        for signal in adapted_signals:
             result = self._process_signal(signal, effective_portfolio, positions, data)
             if result:
                 results.append(result)
@@ -274,10 +287,11 @@ class ExecutionEngine:
                 # Signal was rejected — record as alternative for future signals this cycle
                 self._cycle_alternatives.append({
                     "symbol": signal.symbol,
-                    "direction": signal.signal.name if hasattr(signal.signal, 'name') else str(signal.signal),
-                    "raw_confidence": signal.confidence,
-                    "rejection_reason": "Rejected by risk/contract evaluation",
+                    "direction": signal.side.value,
+                    "raw_signal_strength": signal.signal_strength,
+                    "rejection_reason": "Rejected by decision/risk pipeline",
                     "rejected_by_stage": "execution_engine",
+                    "signal_id": signal.signal_id,
                 })
 
         # Clear cycle alternatives after processing
@@ -301,29 +315,37 @@ class ExecutionEngine:
 
     def _process_signal(self, signal: TradeSignal, portfolio_value: float,
                         positions: list[dict], market_data: dict = None) -> Optional[dict]:
-        """Process a single trade signal through risk engine and execution."""
+        """
+        Process a single trade signal through the clean decision pipeline.
 
-        # Hard confidence gate — reject signals below minimum threshold.
-        # This prevents placeholder/fallback signals (e.g., default 0.5 confidence)
-        # from reaching the risk engine or generating orders.
-        if signal.confidence < self.min_signal_confidence:
+        Pipeline:
+            TradeSignal (proposal)
+                → Signal strength gate
+                → Position check
+                → Intelligence layer (optional)
+                → Signal package gate (optional)
+                → DecisionOrchestrator → DecisionContract
+                → Publish DecisionContractCreated event
+                → Build TradeRequest(signal, contract)
+                → Risk Engine evaluation
+                → Broker execution
+        """
+
+        # Hard signal strength gate — reject signals below minimum threshold.
+        if signal.signal_strength < self.min_signal_confidence:
             logger.info(
-                "engine.low_confidence_rejected",
+                "engine.low_strength_rejected",
                 symbol=signal.symbol,
-                confidence=round(signal.confidence, 3),
+                signal_strength=round(signal.signal_strength, 3),
                 threshold=self.min_signal_confidence,
-                strategy=self._current_strategy_name,
+                strategy=signal.strategy_id,
+                signal_id=signal.signal_id,
             )
-            self._log_signal(signal, executed=False)
+            self._log_signal_v2(signal, executed=False)
             return None
 
-        # Determine side
-        if signal.signal in (Signal.BUY, Signal.STRONG_BUY):
-            side = "buy"
-        elif signal.signal in (Signal.SELL, Signal.STRONG_SELL):
-            side = "sell"
-        else:
-            return None
+        # Determine side for broker (lowercase)
+        side = signal.side.value.lower()
 
         # Check if we already have a position in this symbol
         existing = next((p for p in positions if p['symbol'] == signal.symbol), None)
@@ -334,13 +356,14 @@ class ExecutionEngine:
             logger.debug("engine.skip_existing_short", symbol=signal.symbol)
             return None
 
+        # ── Intelligence Layer (optional, adaptive) ─────────────────────────
         intelligence_decision = None
         if self.intelligence_orchestrator:
             symbol_df = market_data.get(signal.symbol) if market_data else None
             portfolio_context = self._build_portfolio_context(positions, portfolio_value, signal.symbol)
             intelligence_decision = self.intelligence_orchestrator.evaluate_signal(
-                strategy_name=self._current_strategy_name,
-                signal_confidence=signal.confidence,
+                strategy_name=signal.strategy_id,
+                signal_confidence=signal.signal_strength,
                 indicators=signal.indicators,
                 df=symbol_df,
                 portfolio_context=portfolio_context,
@@ -351,64 +374,69 @@ class ExecutionEngine:
                     symbol=signal.symbol,
                     score=round(intelligence_decision.final_score, 2),
                     reason=intelligence_decision.routing.reason,
+                    signal_id=signal.signal_id,
                 )
-                self._log_signal(signal, executed=False)
+                self._log_signal_v2(signal, executed=False)
                 return None
 
-        # ── Signal Package Gate ────────────────────────────────────────────
-        # Enrich basic TradeSignal into professional-grade TradeSignalPackage
-        # and validate through the gate before proceeding to execution.
+        # ── Signal Package Gate (optional) ──────────────────────────────────
         signal_package = None
         if self._signal_gate:
             symbol_df = market_data.get(signal.symbol) if market_data else None
+            # Build legacy-compat signal for signal_bridge (which expects old format)
+            legacy_compat = LegacyTradeSignal(
+                symbol=signal.symbol,
+                signal=Signal.BUY if signal.side == Side.BUY else Signal.SELL,
+                confidence=signal.signal_strength,
+                price=signal.features.get("observed_price", 0.0),
+                stop_loss=signal.features.get("strategy_proposed_stop_loss"),
+                take_profit=signal.features.get("strategy_proposed_take_profit"),
+                reason=signal.reason,
+                indicators=dict(signal.indicators),
+            )
             signal_package = self._signal_builder.build(
-                signal=signal,
-                strategy_name=self._current_strategy_name,
+                signal=legacy_compat,
+                strategy_name=signal.strategy_id,
                 market_data=symbol_df,
                 intelligence_decision=intelligence_decision,
                 portfolio_value=portfolio_value,
-                position_size_pct=0.0,  # Calculated below
+                position_size_pct=0.0,
             )
 
             approved, gate_errors = self._signal_gate.evaluate(signal_package)
             if not approved:
                 logger.info(
                     "engine.signal_gate_rejected",
-                    signal_id=signal_package.signal_id,
+                    signal_id=signal.signal_id,
                     symbol=signal.symbol,
                     errors=gate_errors,
                 )
-                self._publish(SignalGenerated(
-                    symbol=signal.symbol,
-                    direction=side,
-                    confidence=signal.confidence,
-                    reason=f"gate_rejected: {'; '.join(gate_errors[:3])}",
-                    source="engine",
-                ))
-                self._log_signal(signal, executed=False)
+                self._log_signal_v2(signal, executed=False)
                 return None
 
-            # Register for runtime monitoring (expiry/decay)
             self._signal_monitor.register(signal_package)
             logger.info(
                 "engine.signal_package_approved",
-                signal_id=signal_package.signal_id,
+                signal_id=signal.signal_id,
                 symbol=signal.symbol,
-                confidence=signal.confidence,
+                signal_strength=signal.signal_strength,
                 risk_reward=signal_package.expected_risk_reward,
                 regime=signal_package.market_regime.value,
             )
 
-        # Calculate position size
-        if signal.stop_loss:
+        # ── Position Sizing (preliminary, may be overridden by contract) ────
+        observed_price = signal.features.get("observed_price", 0.0)
+        strategy_sl = signal.features.get("strategy_proposed_stop_loss")
+        
+        if strategy_sl and observed_price > 0:
             qty = self.risk.calculate_position_size(
-                price=signal.price,
-                stop_loss_price=signal.stop_loss,
+                price=observed_price,
+                stop_loss_price=strategy_sl,
                 portfolio_value=portfolio_value,
             )
         else:
             max_value = portfolio_value * self.risk.limits.max_single_stock_pct
-            qty = max_value / signal.price
+            qty = max_value / observed_price if observed_price > 0 else 0
 
         if qty <= 0:
             return None
@@ -417,7 +445,7 @@ class ExecutionEngine:
             qty *= intelligence_decision.qty_multiplier
             if qty <= 0:
                 logger.info("engine.intelligence_zero_qty", symbol=signal.symbol)
-                self._log_signal(signal, executed=False)
+                self._log_signal_v2(signal, executed=False)
                 return None
 
         # Apply operating mode size reduction
@@ -432,25 +460,21 @@ class ExecutionEngine:
                 )
                 return None
 
-        # Build TradeRequest for the new risk engine
+        # ── Decision Contract (authoritative decision) ──────────────────────
         confidence_score = None
         decision_contract = None
-        effective_confidence = intelligence_decision.adjusted_confidence if intelligence_decision else signal.confidence
+        effective_confidence = intelligence_decision.adjusted_confidence if intelligence_decision else signal.signal_strength
 
-        # ── Decision Contract Path (preferred) ─────────────────────────────
-        # The DecisionOrchestrator produces an immutable DecisionContract that
-        # carries the full multi-stage assessment. This is the authoritative
-        # decision object — it flows through Risk → Sizing → Execution → DB.
         if self._decision_orchestrator:
             signal_ctx = SignalContext(
                 symbol=signal.symbol,
-                strategy=self._current_strategy_name,
+                strategy=signal.strategy_id,
                 raw_confidence=effective_confidence,
                 signal_integrity=SignalIntegrity.REAL,
-                signal_generated_at=datetime.now(timezone.utc),
+                signal_generated_at=signal.timestamp,
                 bars_available=len(market_data.get(signal.symbol, [])) if market_data else 0,
                 spread_available=True,
-                model_version=getattr(signal, 'model_version', ''),
+                model_version=signal.strategy_version,
                 current_trend=getattr(intelligence_decision, 'market_trend', '') if intelligence_decision else '',
                 current_volatility=getattr(intelligence_decision, 'market_volatility', '') if intelligence_decision else '',
                 current_stress=getattr(intelligence_decision, 'market_stress', '') if intelligence_decision else '',
@@ -459,24 +483,43 @@ class ExecutionEngine:
             decision_contract = self._decision_orchestrator.evaluate(
                 context=signal_ctx,
                 provenance_kwargs={
-                    "model_version": getattr(signal, 'model_version', ''),
-                    "backtest_id": getattr(signal, 'backtest_id', ''),
+                    "model_version": signal.strategy_version,
+                    "signal_id": signal.signal_id,
                 },
                 position_pct=qty / portfolio_value * 100.0 if portfolio_value > 0 else 0.0,
-                kelly_fraction=getattr(signal, 'kelly_fraction', 0.0),
-                risk_grade=getattr(signal, 'risk_grade', ''),
-                strategy_name=self._current_strategy_name,
-                signal_type=getattr(signal, 'signal_type', ''),
+                kelly_fraction=0.0,
+                risk_grade="",
+                strategy_name=signal.strategy_id,
+                signal_type=signal.side.value,
                 alternatives=getattr(self, '_cycle_alternatives', None),
             )
             effective_confidence = decision_contract.final_confidence
 
-            # Store contract in DuckDB for audit trail (executed or not)
+            # Store contract for audit trail
             if self._contract_store:
                 try:
                     self._contract_store.store(decision_contract)
                 except Exception as e:
                     logger.warning("engine.contract_store_error", error=str(e))
+
+            # ── Publish DecisionContractCreated event ──
+            self._publish(DecisionContractCreated(
+                contract_id=decision_contract.contract_id,
+                signal_id=signal.signal_id,
+                decision=decision_contract.decision.value,
+                final_confidence=decision_contract.final_confidence,
+                symbol=signal.symbol,
+                side=signal.side.value,
+                recommended_position_pct=decision_contract.recommended_position_pct,
+                recommended_stop_loss=decision_contract.recommended_stop_loss,
+                recommended_take_profit=decision_contract.recommended_take_profit,
+                risk_grade=decision_contract.risk_grade,
+                stage_scores=decision_contract.stage_scores,
+                vetoed=decision_contract.vetoed,
+                veto_reason=decision_contract.veto_reason,
+                expires_at=decision_contract.valid_until.isoformat(),
+                source="decision_orchestrator",
+            ))
 
             # If contract says REJECT or is vetoed, stop immediately
             if not decision_contract.is_executable and decision_contract.decision == Decision.REJECT:
@@ -487,16 +530,16 @@ class ExecutionEngine:
                     decision=decision_contract.decision.value,
                     reason=decision_contract.recommendation,
                     vetoed=decision_contract.vetoed,
+                    signal_id=signal.signal_id,
                 )
-                self._log_signal(signal, executed=False)
+                self._log_signal_v2(signal, executed=False)
                 return None
 
             # If contract says REDUCE, scale down position
             if decision_contract.decision == Decision.REDUCE:
-                # Use contract's recommended position or reduce by 50%
                 if decision_contract.recommended_position_pct > 0:
                     reduced_value = portfolio_value * (decision_contract.recommended_position_pct / 100.0)
-                    qty = min(qty, reduced_value / signal.price) if signal.price > 0 else qty * 0.5
+                    qty = min(qty, reduced_value / observed_price) if observed_price > 0 else qty * 0.5
                 else:
                     qty *= 0.5
                 logger.info(
@@ -510,13 +553,13 @@ class ExecutionEngine:
             # Fallback: Legacy confidence gate path (produces ConfidenceScore)
             signal_ctx = SignalContext(
                 symbol=signal.symbol,
-                strategy=self._current_strategy_name,
+                strategy=signal.strategy_id,
                 raw_confidence=effective_confidence,
                 signal_integrity=SignalIntegrity.REAL,
-                signal_generated_at=datetime.now(timezone.utc),
+                signal_generated_at=signal.timestamp,
                 bars_available=len(market_data.get(signal.symbol, [])) if market_data else 0,
                 spread_available=True,
-                model_version=getattr(signal, 'model_version', ''),
+                model_version=signal.strategy_version,
                 current_trend=getattr(intelligence_decision, 'market_trend', '') if intelligence_decision else '',
                 current_volatility=getattr(intelligence_decision, 'market_volatility', '') if intelligence_decision else '',
                 current_stress=getattr(intelligence_decision, 'market_stress', '') if intelligence_decision else '',
@@ -525,17 +568,32 @@ class ExecutionEngine:
             confidence_score = self._confidence_gate.evaluate(signal_ctx)
             effective_confidence = confidence_score.value
 
+        # ── Build TradeRequest (signal + contract) ──────────────────────────
+        # Use contract's recommended SL/TP if available, else strategy hints
+        final_stop_loss = None
+        final_take_profit = None
+        if decision_contract:
+            if decision_contract.recommended_stop_loss > 0:
+                final_stop_loss = decision_contract.recommended_stop_loss
+            if decision_contract.recommended_take_profit > 0:
+                final_take_profit = decision_contract.recommended_take_profit
+        if final_stop_loss is None:
+            final_stop_loss = signal.features.get("strategy_proposed_stop_loss")
+        if final_take_profit is None:
+            final_take_profit = signal.features.get("strategy_proposed_take_profit")
+
         trade_request = TradeRequest(
             symbol=signal.symbol,
             side=side,
             qty=qty,
-            price=signal.price,
-            stop_loss=signal.stop_loss,
-            take_profit=signal.take_profit,
-            strategy=self._current_strategy_name,
+            price=observed_price,
+            stop_loss=final_stop_loss,
+            take_profit=final_take_profit,
+            strategy=signal.strategy_id,
             confidence=effective_confidence,
             confidence_score=confidence_score,
             decision_contract=decision_contract,
+            trade_signal=signal,
         )
 
         # Create trade lifecycle if TradeManager available
@@ -575,7 +633,7 @@ class ExecutionEngine:
             )
         except Exception as e:
             logger.error("engine.risk_evaluation_exception", symbol=signal.symbol, error=str(e))
-            self._log_signal(signal, executed=False)
+            self._log_signal_v2(signal, executed=False)
             if trade_lifecycle:
                 trade_lifecycle.transition(TradeState.RISK_REJECTED, f"risk_exception: {str(e)[:80]}")
             return None
@@ -592,7 +650,7 @@ class ExecutionEngine:
 
         if not decision.approved:
             logger.info("engine.trade_rejected", symbol=signal.symbol, reasons=decision.reasons)
-            self._log_signal(signal, executed=False)
+            self._log_signal_v2(signal, executed=False)
             if trade_lifecycle:
                 trade_lifecycle.transition(TradeState.RISK_REJECTED, "; ".join(decision.reasons))
             return None
@@ -604,26 +662,19 @@ class ExecutionEngine:
         final_qty = decision.adjusted_qty
 
         # Log signal
-        if intelligence_decision:
-            signal.indicators = signal.indicators or {}
-            signal.indicators["intelligence"] = {
-                "score": round(intelligence_decision.final_score, 2),
-                "regime": intelligence_decision.market_state.overall_regime,
-                "routing_reason": intelligence_decision.routing.reason,
-                "qty_multiplier": round(intelligence_decision.qty_multiplier, 4),
-                "explanation": intelligence_decision.explanation,
-            }
-        self._log_signal(signal, executed=True)
+        self._log_signal_v2(signal, executed=True, intelligence_decision=intelligence_decision)
 
         # Execute (or dry run)
         if self.dry_run:
             logger.info("engine.dry_run", symbol=signal.symbol, side=side, qty=final_qty,
-                       price=signal.price, confidence=signal.confidence)
+                       price=observed_price, signal_strength=signal.signal_strength)
             return {
                 "symbol": signal.symbol,
                 "side": side,
                 "qty": final_qty,
-                "price": signal.price,
+                "price": observed_price,
+                "signal_id": signal.signal_id,
+                "contract_id": decision_contract.contract_id if decision_contract else None,
                 "dry_run": True,
             }
 
@@ -635,7 +686,6 @@ class ExecutionEngine:
             if market_data and signal.symbol in market_data:
                 df = market_data[signal.symbol]
                 if len(df) > 14:
-                    # Quick ATR estimate
                     tr = (df['high'] - df['low']).rolling(14).mean()
                     atr = float(tr.iloc[-1]) if not tr.empty else None
 
@@ -643,14 +693,13 @@ class ExecutionEngine:
                 symbol=signal.symbol,
                 side=side,
                 qty=final_qty,
-                price=signal.price,
+                price=observed_price,
                 volume=volume,
                 atr=atr,
                 asset_type="crypto" if "/" in signal.symbol else "equity",
             )
 
             if not sim_result.get('executed', True):
-                # Simulated rejection — publish event and abort
                 logger.warning("engine.sim_rejected", symbol=signal.symbol,
                              reason=sim_result.get('rejection_reason'))
                 self._publish(OrderRejected(
@@ -662,14 +711,12 @@ class ExecutionEngine:
                     trade_lifecycle.transition(TradeState.CANCELLED, "sim_rejected")
                 return None
 
-            # Use simulated average price for logging
             logger.info("engine.sim_fill",
                        symbol=signal.symbol,
                        avg_price=sim_result.get('avg_price'),
                        slippage_bps=sim_result.get('slippage_bps', 0),
                        fees=sim_result.get('fees', 0))
 
-            # Respect simulator's actual fill quantity (may be partial)
             sim_qty = sim_result.get('total_qty', final_qty)
             if sim_qty < final_qty:
                 logger.info("engine.sim_partial_fill", symbol=signal.symbol,
@@ -680,15 +727,15 @@ class ExecutionEngine:
         if trade_lifecycle:
             trade_lifecycle.transition(TradeState.SUBMITTED, "order submitted to broker")
 
-        # Place the order
+        # Place the order — use contract SL/TP (system-determined) not strategy hints
         try:
-            if signal.stop_loss and signal.take_profit:
+            if final_stop_loss and final_take_profit:
                 order = self.broker.bracket_order(
                     symbol=signal.symbol,
                     qty=final_qty,
                     side=side,
-                    stop_loss_price=signal.stop_loss,
-                    take_profit_price=signal.take_profit,
+                    stop_loss_price=final_stop_loss,
+                    take_profit_price=final_take_profit,
                 )
             else:
                 order = self.broker.market_order(
@@ -697,7 +744,7 @@ class ExecutionEngine:
                     side=side,
                 )
 
-            # Check for error response (e.g., broker rejection, insufficient funds)
+            # Check for error response
             if not order or order.get("error"):
                 error_msg = order.get("message", "Unknown order error") if order else "No response from broker"
                 logger.error("engine.order_rejected_by_broker",
@@ -718,22 +765,20 @@ class ExecutionEngine:
                 symbol=signal.symbol,
                 side=side,
                 qty=final_qty,
-                price=signal.price,
-                order_type="bracket" if signal.stop_loss else "market",
+                price=observed_price,
+                order_type="bracket" if final_stop_loss else "market",
                 order_id=order.get("id", ""),
                 source="engine",
             ))
 
-            # Transition lifecycle: ACCEPTED, then either immediate fill (sim/no-stream)
-            # or wait for trade stream fill confirmation
             # Use trade lifecycle ID as the canonical trade_id for event correlation
             trade_id = trade_lifecycle.trade_id if trade_lifecycle else order.get("id", "")
             if trade_lifecycle:
                 trade_lifecycle.transition(TradeState.ACCEPTED, "broker accepted")
-                # Store order_id in lifecycle metadata for exit correlation
                 trade_lifecycle.metadata['order_id'] = order.get("id", "")
                 trade_lifecycle.metadata['symbol'] = signal.symbol
                 trade_lifecycle.metadata['total_qty'] = final_qty
+                trade_lifecycle.metadata['contract_id'] = decision_contract.contract_id if decision_contract else ""
 
             # Mark contract as executed in the store
             if decision_contract and self._contract_store:
@@ -745,16 +790,14 @@ class ExecutionEngine:
             # Determine fill mode: immediate (simulation or no trade stream) vs deferred
             use_immediate_fill = bool(sim_result) or not self._has_trade_stream()
 
-            fill_price = sim_result['avg_price'] if sim_result else signal.price
+            fill_price = sim_result['avg_price'] if sim_result else observed_price
             fill_fees = sim_result['fees'] if sim_result else 0.0
 
             if use_immediate_fill:
-                # Immediate fill — transition straight through to ACTIVE
                 if trade_lifecycle:
                     trade_lifecycle.transition(TradeState.FILLED, f"filled qty={final_qty}")
                     trade_lifecycle.transition(TradeState.ACTIVE, "position active")
 
-                # Publish OrderFilled
                 self._publish(OrderFilled(
                     order_id=order.get("id", ""),
                     fill_price=fill_price,
@@ -763,49 +806,50 @@ class ExecutionEngine:
                     source="engine",
                 ))
 
-                # Publish TradeOpened with consistent trade_id
                 self._publish(TradeOpened(
                     trade_id=trade_id,
                     symbol=signal.symbol,
                     side=side,
                     entry_price=fill_price,
                     qty=final_qty,
-                    stop_loss=signal.stop_loss or 0.0,
-                    take_profit=signal.take_profit or 0.0,
+                    stop_loss=final_stop_loss or 0.0,
+                    take_profit=final_take_profit or 0.0,
+                    contract_id=decision_contract.contract_id if decision_contract else "",
                     source="engine",
                 ))
 
                 # Store trade context for closed-loop feedback on exit
                 with self._trade_context_lock:
                     self._trade_context[trade_id] = {
+                        "signal_id": signal.signal_id,
                         "signal_package_id": signal_package.signal_id if signal_package else "",
-                        "model_version": getattr(signal, "model_version", ""),
-                        "strategy": self._current_strategy_name,
+                        "model_version": signal.strategy_version,
+                        "strategy": signal.strategy_id,
                         "entry_time": datetime.now(timezone.utc).isoformat(),
                         "side": side,
                         "entry_price": fill_price,
                         "contract_id": decision_contract.contract_id if decision_contract else "",
                     }
             else:
-                # Deferred fill — stay in ACCEPTED, trade stream will confirm
                 if trade_lifecycle:
                     trade_lifecycle.metadata['pending_fill'] = True
                     trade_lifecycle.metadata['expected_qty'] = final_qty
                 logger.info("engine.pending_fill", order_id=order.get("id", ""), qty=final_qty)
 
-            # Record trade to database
+            # Record trade to database (full audit trail)
             self.db.record_trade({
                 "symbol": signal.symbol,
                 "side": side,
                 "qty": final_qty,
-                "price": signal.price,
-                "order_type": "bracket" if signal.stop_loss else "market",
+                "price": observed_price,
+                "order_type": "bracket" if final_stop_loss else "market",
                 "status": order.get("status", "submitted"),
                 "order_id": order.get("id"),
-                "strategy": signal.reason[:50],
-                "signal_confidence": signal.confidence,
-                "stop_loss": signal.stop_loss,
-                "take_profit": signal.take_profit,
+                "strategy": signal.strategy_id,
+                "signal_id": signal.signal_id,
+                "signal_strength": signal.signal_strength,
+                "stop_loss": final_stop_loss,
+                "take_profit": final_take_profit,
                 "sim_slippage_bps": sim_result.get("slippage_bps") if sim_result else None,
                 "sim_fees": fill_fees if sim_result else None,
                 "contract_id": decision_contract.contract_id if decision_contract else None,
@@ -823,10 +867,13 @@ class ExecutionEngine:
                         "side": side,
                         "entry_price": fill_price,
                         "qty": final_qty,
-                        "strategy_name": self._current_strategy_name,
-                        "model_version": getattr(signal, 'model_version', None),
+                        "strategy_name": signal.strategy_id,
+                        "model_version": signal.strategy_version,
                         "prediction": side,
-                        "confidence": signal.confidence,
+                        "confidence": effective_confidence,
+                        "signal_strength": signal.signal_strength,
+                        "signal_id": signal.signal_id,
+                        "contract_id": decision_contract.contract_id if decision_contract else "",
                         "features_snapshot": signal.indicators,
                         "market_regime": (
                             intelligence_decision.market_state.overall_regime
@@ -838,7 +885,8 @@ class ExecutionEngine:
 
             logger.info("engine.order_placed",
                        symbol=signal.symbol, side=side, qty=final_qty,
-                       confidence=f"{signal.confidence:.1%}")
+                       signal_id=signal.signal_id,
+                       confidence=f"{effective_confidence:.1%}")
 
             return order
 
@@ -910,6 +958,7 @@ class ExecutionEngine:
                             model_version=ctx.get("model_version", ""),
                             strategy_name=ctx.get("strategy", self._current_strategy_name),
                             signal_package_id=ctx.get("signal_package_id", ""),
+                            contract_id=ctx.get("contract_id", ""),
                         ))
 
                         # Record contract outcome for audit trail
@@ -954,18 +1003,41 @@ class ExecutionEngine:
         return results
 
     def _log_signal(self, signal: TradeSignal, executed: bool):
-        """Log signal to database."""
+        """Log signal to database (legacy compat)."""
         import json
         try:
             self.db.log_signal({
                 "symbol": signal.symbol,
                 "strategy": self._current_strategy_name,
-                "signal": signal.signal.name,
-                "confidence": signal.confidence,
-                "price_at_signal": signal.price,
-                "indicators": json.dumps(signal.indicators),
+                "signal": signal.side.value if hasattr(signal, 'side') else "UNKNOWN",
+                "confidence": signal.signal_strength if hasattr(signal, 'signal_strength') else 0.0,
+                "price_at_signal": signal.features.get("observed_price", 0.0) if hasattr(signal, 'features') else 0.0,
+                "indicators": json.dumps(signal.indicators if hasattr(signal, 'indicators') else {}),
                 "was_executed": executed,
             })
+        except Exception as e:
+            logger.error("engine.signal_log_error", error=str(e))
+
+    def _log_signal_v2(self, signal: TradeSignal, executed: bool, intelligence_decision=None):
+        """Log clean TradeSignal to database with full provenance."""
+        import json
+        try:
+            log_data = {
+                "symbol": signal.symbol,
+                "strategy": signal.strategy_id,
+                "signal": signal.side.value,
+                "confidence": signal.signal_strength,
+                "price_at_signal": signal.features.get("observed_price", 0.0),
+                "indicators": json.dumps(signal.indicators),
+                "was_executed": executed,
+                "signal_id": signal.signal_id,
+            }
+            if intelligence_decision:
+                log_data["intelligence_score"] = round(intelligence_decision.final_score, 4)
+                log_data["intelligence_regime"] = getattr(
+                    intelligence_decision, 'market_state', None
+                ) and intelligence_decision.market_state.overall_regime or ""
+            self.db.log_signal(log_data)
         except Exception as e:
             logger.error("engine.signal_log_error", error=str(e))
 

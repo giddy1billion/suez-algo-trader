@@ -23,10 +23,11 @@ class TradeAuditTrail:
     Full audit trail linking a trade through its entire ML lifecycle.
 
     Provides complete traceability:
-    trade → signal → prediction → model → training run → dataset → features
+    trade → signal → prediction → model → training run → dataset → features → contract
     """
     trade_id: str = ""
     signal_id: str = ""
+    contract_id: str = ""  # Links to DecisionContract that approved this trade
     prediction_id: str = ""
     model_version: str = ""
     training_run_id: str = ""

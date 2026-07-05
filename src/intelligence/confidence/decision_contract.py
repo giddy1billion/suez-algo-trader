@@ -341,6 +341,8 @@ class DecisionContract:
 
     # ── Position Sizing Recommendation ──
     recommended_position_pct: float = 0.0
+    recommended_stop_loss: float = 0.0
+    recommended_take_profit: float = 0.0
     kelly_fraction: float = 0.0
     risk_grade: str = ""
 

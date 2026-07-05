@@ -46,6 +46,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
+from src.ml.label_encoder import DirectionEncoder
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -388,9 +389,9 @@ class MultiTargetPredictor:
                     "eval_metric": "mlogloss",
                     "verbosity": 0,
                 }
-                # Remap direction: -1→0, 0→1, 1→2
-                y_train_mapped = (y_train + 1).astype(int)
-                y_val_mapped = (y_val + 1).astype(int)
+                # Encode direction labels for classifier
+                y_train_mapped = DirectionEncoder.encode(y_train)
+                y_val_mapped = DirectionEncoder.encode(y_val)
 
                 model = xgb.XGBClassifier(**params)
                 model.fit(
@@ -474,8 +475,7 @@ class MultiTargetPredictor:
             model = self._models["direction"]
             proba = model.predict_proba(X)[0]  # [P(down), P(flat), P(up)]
             pred_class = int(np.argmax(proba))
-            direction_map = {0: "SELL", 1: "HOLD", 2: "BUY"}
-            direction_str = direction_map[pred_class]
+            direction_str = DirectionEncoder.CLASS_NAMES.get(pred_class, "HOLD")
             direction_prob = float(proba[pred_class])
 
         # Return magnitude prediction
@@ -667,8 +667,8 @@ class MultiTargetPredictor:
                 y_val = np.clip(y_val, *target_def.clip_range)
 
             if target_def.target_type == "classification":
-                y_train_mapped = (y_train + 1).astype(int)
-                y_val_mapped = (y_val + 1).astype(int)
+                y_train_mapped = DirectionEncoder.encode(y_train)
+                y_val_mapped = DirectionEncoder.encode(y_val)
                 model = GradientBoostingClassifier(
                     n_estimators=100, max_depth=5, learning_rate=0.05,
                 )

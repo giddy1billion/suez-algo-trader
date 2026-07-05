@@ -60,14 +60,75 @@ class Event:
 
 @dataclass(frozen=True)
 class SignalGenerated(Event):
-    """Emitted when a strategy generates a trade signal."""
+    """
+    Emitted when a strategy generates a trade signal (proposal).
 
-    symbol: str = ""
-    signal: str = ""  # "BUY" | "SELL"
-    confidence: float = 0.0
+    This represents the strategy's proposal BEFORE any system-level evaluation.
+    The payload follows the clean architecture: only what the strategy knows.
+    """
+
+    # Signal identity
+    signal_id: str = ""
+
+    # Strategy provenance
     strategy: str = ""
+    strategy_version: str = ""
+
+    # Market context
+    symbol: str = ""
+    timeframe: str = ""
+
+    # Signal proposal
+    signal: str = ""  # "BUY" | "SELL" (kept for backward compat)
+    side: str = ""    # "BUY" | "SELL" (canonical field)
+    signal_strength: float = 0.0
+    expected_direction: int = 0  # +1 or -1
+
+    # Legacy compat (deprecated — use signal_strength instead)
+    confidence: float = 0.0
     price: float = 0.0
+
+    # Evidence
+    reason: str = ""
+    tags: tuple[str, ...] = field(default_factory=tuple)
     indicators: dict[str, Any] = field(default_factory=dict)
+    features: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class DecisionContractCreated(Event):
+    """
+    Emitted when the DecisionOrchestrator produces an authoritative decision.
+
+    This is the first point where the system has actually DECIDED something.
+    The signal proposed; the contract decides.
+    """
+
+    contract_id: str = ""
+    signal_id: str = ""
+
+    # Decision outcome
+    decision: str = ""  # "execute" | "reject" | "reduce" | "defer"
+    final_confidence: float = 0.0
+
+    # Market context
+    symbol: str = ""
+    side: str = ""
+
+    # Execution parameters (determined by intelligence layer)
+    recommended_position_pct: float = 0.0
+    recommended_stop_loss: float = 0.0
+    recommended_take_profit: float = 0.0
+    risk_grade: str = ""
+
+    # Assessment breakdown
+    stage_scores: dict[str, float] = field(default_factory=dict)
+    provenance: dict[str, Any] = field(default_factory=dict)
+
+    # Governance
+    vetoed: bool = False
+    veto_reason: str = ""
+    expires_at: str = ""
 
 
 @dataclass(frozen=True)
@@ -79,6 +140,7 @@ class RiskEvaluated(Event):
     reasons: list[str] = field(default_factory=list)
     adjusted_qty: float = 0.0
     risk_score: float = 0.0
+    contract_id: str = ""  # Links to DecisionContract evaluated
 
 
 # ---------------------------------------------------------------------------
@@ -148,6 +210,7 @@ class TradeOpened(Event):
     qty: float = 0.0
     stop_loss: float = 0.0
     take_profit: float = 0.0
+    contract_id: str = ""  # Links to DecisionContract that approved this trade
 
 
 @dataclass(frozen=True)
@@ -168,6 +231,7 @@ class TradeClosed(Event):
     model_version: str = ""
     strategy_name: str = ""
     signal_package_id: str = ""
+    contract_id: str = ""  # Links to DecisionContract that approved this trade
 
 
 # ---------------------------------------------------------------------------

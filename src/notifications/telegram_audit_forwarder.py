@@ -21,6 +21,7 @@ from typing import Any, Callable, Optional
 from src.core.events import (
     Event,
     EventBus,
+    DecisionContractCreated,
     OrderAccepted,
     OrderFilled,
     OrderPartialFill,
@@ -44,10 +45,14 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _format_signal(event: SignalGenerated) -> str:
-    emoji = "📶" if event.signal == "BUY" else "📉" if event.signal == "SELL" else "⏸️"
+    side = event.side or event.signal
+    emoji = "📶" if side == "BUY" else "📉" if side == "SELL" else "⏸️"
+    strength = event.signal_strength if event.signal_strength > 0 else event.confidence
+    strategy_info = f"\nStrategy: <code>{event.strategy}</code>" if event.strategy else ""
     return (
-        f"{emoji} <b>Signal: {event.signal} {event.symbol}</b>\n"
-        f"Confidence: <code>{getattr(event, 'confidence', 'N/A')}</code>\n"
+        f"{emoji} <b>Signal: {side} {event.symbol}</b>\n"
+        f"Strength: <code>{strength:.2f}</code>"
+        f"{strategy_info}\n"
         f"Source: <code>{event.source}</code>"
     )
 
@@ -71,6 +76,25 @@ def _format_risk_evaluated(event: RiskEvaluated) -> str:
         f"{f' — {symbol}' if symbol else ''}\n"
         f"Reason: <code>{reason_str}</code>\n"
         f"Score: <code>{getattr(event, 'risk_score', 0):.2f}</code>"
+    )
+
+
+def _format_decision_contract(event: DecisionContractCreated) -> str:
+    decision = event.decision.upper()
+    if decision == "EXECUTE":
+        emoji = "✅"
+    elif decision == "REJECT":
+        emoji = "❌"
+    elif decision == "REDUCE":
+        emoji = "⚠️"
+    else:
+        emoji = "⏳"
+    return (
+        f"{emoji} <b>Decision: {decision}</b> — {event.symbol}\n"
+        f"Confidence: <code>{event.final_confidence:.2f}</code>\n"
+        f"Position: <code>{event.recommended_position_pct:.1f}%</code> | "
+        f"Grade: <code>{event.risk_grade or 'N/A'}</code>\n"
+        f"Contract: <code>{event.contract_id[:16]}</code>"
     )
 
 
@@ -175,6 +199,7 @@ def _format_generic(event: Event) -> str:
 # Formatter dispatch table
 _FORMATTERS: dict[type, Callable] = {
     SignalGenerated: _format_signal,
+    DecisionContractCreated: _format_decision_contract,
     RiskEvaluated: _format_risk_evaluated,
     OrderSubmitted: _format_order_submitted,
     OrderAccepted: _format_order_accepted,

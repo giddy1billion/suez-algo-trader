@@ -52,6 +52,7 @@ class NotificationManager:
         qty = trade.get('qty', 0)
         price = trade.get('price', 0)
         confidence = trade.get('signal_confidence', 0)
+        contract_id = trade.get('contract_id', '')
 
         emoji = "🟢" if side == "BUY" else "🔴"
         message = (
@@ -61,6 +62,8 @@ class NotificationManager:
             f"Time: {datetime.now().strftime('%H:%M:%S')}"
         )
 
+        if contract_id:
+            message += f"\nContract: {contract_id[:12]}"
         if trade.get('stop_loss'):
             message += f"\nSL: ${trade['stop_loss']:.2f}"
         if trade.get('take_profit'):

@@ -33,7 +33,7 @@ class TradeJournal:
         trade_data keys:
             symbol, side, entry_price, qty, strategy_name, model_version,
             prediction, confidence, features_snapshot (dict), volatility_at_entry,
-            market_regime, trade_id (optional)
+            market_regime, trade_id (optional), contract_id (optional)
         """
         features = trade_data.get("features_snapshot")
         if isinstance(features, dict):
@@ -51,6 +51,7 @@ class TradeJournal:
             prediction=trade_data.get("prediction"),
             confidence=trade_data.get("confidence"),
             features_snapshot=features,
+            contract_id=trade_data.get("contract_id", ""),
             volatility_at_entry=trade_data.get("volatility_at_entry"),
             market_regime=trade_data.get("market_regime"),
         )

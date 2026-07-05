@@ -21,7 +21,8 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-from src.strategy.base import BaseStrategy, Signal, TradeSignal
+from src.strategy.base import BaseStrategy, Signal, LegacyTradeSignal
+from src.ml.label_encoder import DirectionEncoder
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -297,11 +298,11 @@ class MLEntryModel(EntryModel):
 
         prediction = self._model.predict_proba(features.reshape(1, -1))[0]
 
-        # Assume classes: [sell, hold, buy] or binary [down, up]
-        if len(prediction) == 3:
-            if prediction[2] > self.threshold:
+        # Classes: [down, flat, up] (3-class) or [down, up] (binary)
+        if len(prediction) == DirectionEncoder.NUM_CLASSES:
+            if prediction[DirectionEncoder.UP_CLASS] > self.threshold:
                 return Signal.BUY
-            elif prediction[0] > self.threshold:
+            elif prediction[DirectionEncoder.DOWN_CLASS] > self.threshold:
                 return Signal.SELL
         elif len(prediction) == 2:
             if prediction[1] > self.threshold:
@@ -755,7 +756,7 @@ class ComposableStrategy(BaseStrategy):
 
         return signals
 
-    def _process_symbol(self, symbol: str, df: pd.DataFrame) -> Optional[TradeSignal]:
+    def _process_symbol(self, symbol: str, df: pd.DataFrame) -> Optional[LegacyTradeSignal]:
         """Process a single symbol through the component pipeline."""
         # 1. Generate entry signal
         entry_signal = self.entry.should_enter(df, symbol)
@@ -785,7 +786,7 @@ class ComposableStrategy(BaseStrategy):
         # 5. Calculate confidence from signal strength and sizing
         confidence = self._compute_confidence(entry_signal, df)
 
-        return TradeSignal(
+        return LegacyTradeSignal(
             symbol=symbol,
             signal=entry_signal,
             confidence=confidence,
@@ -796,7 +797,7 @@ class ComposableStrategy(BaseStrategy):
             indicators=self._gather_indicators(df),
         )
 
-    def should_exit(self, symbol: str, position: dict, current_price: float) -> Optional[TradeSignal]:
+    def should_exit(self, symbol: str, position: dict, current_price: float) -> Optional[LegacyTradeSignal]:
         """
         Check exit conditions using the exit model.
         Compatible with BaseStrategy.should_exit interface.
@@ -813,7 +814,7 @@ class ComposableStrategy(BaseStrategy):
         if exit_signal is None:
             return None
 
-        return TradeSignal(
+        return LegacyTradeSignal(
             symbol=symbol,
             signal=exit_signal,
             confidence=0.8,
