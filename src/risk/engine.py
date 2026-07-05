@@ -97,6 +97,19 @@ class RiskEngine:
         current_qty = request.qty
         reasons: list[str] = []
 
+        # Pre-check: reject signals with insufficient confidence.
+        # Signals at or below 0.5 confidence are likely placeholder/fallback
+        # values from strategies that failed to compute real predictions
+        # (e.g., no active ML model, missing features, exception branches).
+        if request.confidence <= 0.5:
+            return self._build_decision(
+                approved=False,
+                adjusted_qty=0.0,
+                reasons=[f"Confidence {request.confidence:.2f} below minimum threshold (>0.5 required)"],
+                layer_decisions=layer_decisions,
+                request=request,
+            )
+
         # Layer 1: Account Risk
         account_decision = self.account_layer.evaluate(
             request=request,

@@ -72,12 +72,14 @@ class ExecutionEngine:
         trade_manager=None,
         execution_simulator=None,
         intelligence_orchestrator: Optional[AdaptiveIntelligenceOrchestrator] = None,
+        min_signal_confidence: float = 0.55,
     ):
         self.broker = broker
         self.risk = risk_manager
         self.db = db
         self.dry_run = dry_run
         self.risk_engine = risk_engine or RiskEngine()
+        self.min_signal_confidence = min_signal_confidence
         self._last_cycle_time: Optional[datetime] = None
         self._current_strategy_name: str = "unknown"
         self._current_capital_weight: float = 1.0
@@ -198,6 +200,20 @@ class ExecutionEngine:
     def _process_signal(self, signal: TradeSignal, portfolio_value: float,
                         positions: list[dict], market_data: dict = None) -> Optional[dict]:
         """Process a single trade signal through risk engine and execution."""
+
+        # Hard confidence gate — reject signals below minimum threshold.
+        # This prevents placeholder/fallback signals (e.g., default 0.5 confidence)
+        # from reaching the risk engine or generating orders.
+        if signal.confidence < self.min_signal_confidence:
+            logger.info(
+                "engine.low_confidence_rejected",
+                symbol=signal.symbol,
+                confidence=round(signal.confidence, 3),
+                threshold=self.min_signal_confidence,
+                strategy=self._current_strategy_name,
+            )
+            self._log_signal(signal, executed=False)
+            return None
 
         # Determine side
         if signal.signal in (Signal.BUY, Signal.STRONG_BUY):
