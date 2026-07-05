@@ -170,7 +170,7 @@ def cmd_backtest(broker: AlpacaBroker, strategy_name: str, symbols: list[str], t
             print(f"  [!] Insufficient data for {symbol} (got {len(df) if df is not None else 0} bars)")
             continue
 
-        bt = Backtester(strategy=strategy, initial_capital=10000.0)
+        bt = Backtester.for_symbol(strategy=strategy, symbol=symbol, initial_capital=10000.0)
         result = bt.run(df, symbol)
         print(result.summary())
 
@@ -218,6 +218,7 @@ def cmd_backtest_bt(broker: AlpacaBroker, strategy_name: str, symbols: list[str]
 def cmd_backtest_vbt(broker: AlpacaBroker, symbols: list[str], timeframe: str, lookback: int):
     """Run VectorBT vectorized backtest with parameter sweep."""
     from backtesting.vbt_adapter import vectorbt_momentum_backtest, vectorbt_parameter_sweep
+    from src.config.backtest_params import get_backtest_config
 
     print(f"\n[*] Running VectorBT vectorized backtest")
     print(f"   Symbols: {', '.join(symbols)}")
@@ -231,11 +232,25 @@ def cmd_backtest_vbt(broker: AlpacaBroker, symbols: list[str], timeframe: str, l
             print(f"  [!] Insufficient data for {symbol}")
             continue
 
-        metrics = vectorbt_momentum_backtest(df, initial_cash=settings.backtest_initial_cash)
+        params = get_backtest_config(symbol)
+        metrics = vectorbt_momentum_backtest(
+            df,
+            fast_ema=params["fast_ema"],
+            slow_ema=params["slow_ema"],
+            initial_cash=settings.backtest_initial_cash,
+            fees=params["fees"],
+            risk_per_trade=params["risk_per_trade"],
+            atr_stop_multiplier=params["atr_stop_multiplier"],
+            cooldown_bars=params["cooldown_bars"],
+            annualization_periods=params["annualization_periods"],
+        )
 
         print(f"\n  {'='*50}")
         print(f"  VECTORBT RESULTS: {symbol}")
         print(f"  {'='*50}")
+        print(f"  EMA:           {params['fast_ema']}/{params['slow_ema']}")
+        print(f"  Fees:          {params['fees']*100:.2f}%")
+        print(f"  Risk/Trade:    {params['risk_per_trade']*100:.0f}%")
         print(f"  Total Return:  {metrics['total_return']:.2%}")
         print(f"  Sharpe Ratio:  {metrics['sharpe_ratio']:.3f}")
         print(f"  Max Drawdown:  {metrics['max_drawdown']:.2%}")
@@ -247,9 +262,17 @@ def cmd_backtest_vbt(broker: AlpacaBroker, symbols: list[str], timeframe: str, l
     for symbol in symbols:
         df = broker.get_bars_df(symbol, timeframe, limit=min(lookback * 3, 1000))
         if df is not None and len(df) >= 100:
+            params = get_backtest_config(symbol)
             print(f"\n  Running parameter sweep on {symbol}...")
             try:
-                sweep_df = vectorbt_parameter_sweep(df)
+                sweep_df = vectorbt_parameter_sweep(
+                    df,
+                    fees=params["fees"],
+                    risk_per_trade=params["risk_per_trade"],
+                    atr_stop_multiplier=params["atr_stop_multiplier"],
+                    cooldown_bars=params["cooldown_bars"],
+                    annualization_periods=params["annualization_periods"],
+                )
                 print(f"\n  Top 5 parameter combinations:")
                 print(sweep_df.sort_values('total_return', ascending=False).head(5).to_string())
             except Exception as e:
@@ -1004,6 +1027,7 @@ def cmd_run(
             """Run parameter sweep and report optimal params to Telegram."""
             try:
                 from backtesting.vbt_adapter import vectorbt_parameter_sweep
+                from src.config.backtest_params import get_backtest_config
 
                 sweep_symbols = symbols[:3]  # Top 3 symbols for sweep
                 results_text = [f"<b>🔬 Auto Parameter Sweep</b>\n{'=' * 30}\n"]
@@ -1015,7 +1039,15 @@ def cmd_run(
                         if df is None or len(df) < 100:
                             continue
 
-                        sweep_df = vectorbt_parameter_sweep(df)
+                        params = get_backtest_config(sym)
+                        sweep_df = vectorbt_parameter_sweep(
+                            df,
+                            fees=params["fees"],
+                            risk_per_trade=params["risk_per_trade"],
+                            atr_stop_multiplier=params["atr_stop_multiplier"],
+                            cooldown_bars=params["cooldown_bars"],
+                            annualization_periods=params["annualization_periods"],
+                        )
                         if sweep_df is not None and len(sweep_df) > 0:
                             best = sweep_df.sort_values('total_return', ascending=False).iloc[0]
                             results_text.append(
