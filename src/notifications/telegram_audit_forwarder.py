@@ -278,12 +278,15 @@ class TelegramAuditForwarder:
                     self._events_suppressed += 1
                     return  # Skip this event
 
-            # Suppress repeated health events (only notify on status CHANGE)
+            # Suppress health events: only forward status CHANGES to non-healthy
             if isinstance(event, SystemHealth):
                 prev = self._last_health_status.get(event.component)
                 self._last_health_status[event.component] = event.status
                 if prev == event.status:
                     return  # Same status as last time — suppress
+                # Suppress "healthy" events entirely unless recovering from degraded/down
+                if event.status == "healthy" and prev not in ("degraded", "down"):
+                    return  # No need to notify "healthy" on first appearance
             
             formatter = _FORMATTERS.get(type(event), _format_generic)
             message = formatter(event)

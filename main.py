@@ -855,6 +855,13 @@ def cmd_run(
             authorized_chat_ids=chat_ids,
         )
 
+        # Pre-authorize users BEFORE polling starts so commands work immediately.
+        # The full set_components() is called later with all trading components,
+        # but _authorized_users must be populated now to avoid auth race condition.
+        import src.notifications.telegram_bot as _tg_module
+        if chat_ids:
+            _tg_module._authorized_users = set(chat_ids)
+
         # Register config/strategy management commands router
         telegram_bot.dp.include_router(config_router)
         set_config_components(

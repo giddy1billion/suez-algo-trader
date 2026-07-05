@@ -174,7 +174,7 @@ class TestTelegramAuditForwarder:
             RiskHalt(reason="test", level="WARNING"),
             OrderRejected(order_id="O2", reason="insufficient"),
             SchedulerEvent(job_name="train", status="completed"),
-            SystemHealth(component="broker", status="healthy"),
+            SystemHealth(component="broker", status="degraded"),
         ]
 
         for event in events:
