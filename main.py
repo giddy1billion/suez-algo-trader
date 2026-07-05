@@ -889,10 +889,31 @@ def cmd_run(
             import asyncio
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
-            try:
-                loop.run_until_complete(bot.dp.start_polling(bot.bot, handle_signals=False))
-            except Exception as e:
-                logger.error("telegram.polling_crashed", error=str(e))
+            max_restarts = 5
+            restart_count = 0
+            while restart_count < max_restarts and not _shutdown_event.is_set():
+                try:
+                    loop.run_until_complete(
+                        bot.dp.start_polling(
+                            bot.bot,
+                            handle_signals=False,
+                            drop_pending_updates=True,
+                        )
+                    )
+                    break  # Normal exit
+                except Exception as e:
+                    restart_count += 1
+                    logger.error(
+                        "telegram.polling_crashed",
+                        error=str(e),
+                        restart_attempt=restart_count,
+                    )
+                    if restart_count < max_restarts:
+                        import time as _time
+                        _time.sleep(5)  # Wait before retry
+                        # Create fresh event loop for retry
+                        loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop)
 
         _telegram_thread = threading.Thread(target=_run_telegram_bot, args=(telegram_bot,), daemon=True)
         _telegram_thread.start()
@@ -1363,6 +1384,11 @@ def cmd_run(
                 snapshot_manager.take_snapshot(event_store.session_id, last_event_id, dashboard)
             except Exception as e:
                 logger.error("snapshot.error", error=str(e))
+
+        # Telegram bot thread health check (every 10 cycles)
+        if telegram_bot and cycle_count % 10 == 0:
+            if '_telegram_thread' in dir() and not _telegram_thread.is_alive():
+                logger.error("telegram.thread_dead", msg="Telegram polling thread has died — commands will not work")
 
         # Check if paused via Telegram
         if telegram_bot and telegram_bot.is_paused():
