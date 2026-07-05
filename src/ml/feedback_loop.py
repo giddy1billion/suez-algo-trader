@@ -381,9 +381,19 @@ class ExperienceDatabase:
         count = count_result[0] if count_result else 0
 
         if count < min_trades:
-            logger.warning(
-                "insufficient_training_data", available=count, required=min_trades
-            )
+            # Demote to info-level when bootstrapping (no trades yet) — this is
+            # expected on fresh sessions and not an actionable warning.
+            if count == 0:
+                logger.info(
+                    "training_data.bootstrapping",
+                    available=count,
+                    required=min_trades,
+                    msg="No trade outcomes yet — experience enrichment skipped",
+                )
+            else:
+                logger.warning(
+                    "insufficient_training_data", available=count, required=min_trades
+                )
             return pd.DataFrame()
 
         df = self._conn.execute(

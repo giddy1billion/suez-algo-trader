@@ -507,6 +507,10 @@ class TrainingPipeline:
             return feature_data
 
         try:
+            # Fast pre-check: skip entirely if no trades recorded yet
+            if hasattr(self._experience_db, 'total_trades') and self._experience_db.total_trades() == 0:
+                return feature_data
+
             experience_df = self._experience_db.get_training_samples(min_trades=20)
             if experience_df is None or experience_df.empty:
                 logger.info("training_pipeline.no_experience_data")
