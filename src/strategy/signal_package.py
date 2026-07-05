@@ -251,6 +251,28 @@ class TradeSignalPackage:
     reasons: list[str] = field(default_factory=list)
     indicators: dict[str, Any] = field(default_factory=dict)
 
+    # --- Multi-Target Prediction Evidence ---
+    probability_tp: float = 0.0  # probability of reaching take-profit
+    probability_sl: float = 0.0  # probability of hitting stop-loss
+    probability_timeout: float = 0.0  # probability of time-based exit
+    expected_holding_hours: float = 0.0  # predicted holding duration
+    time_to_tp_hours: float = 0.0  # expected time to reach TP
+    time_to_sl_hours: float = 0.0  # expected time to hit SL
+    kelly_fraction: float = 0.0  # optimal bet size via Kelly criterion
+    risk_grade: str = ""  # A, B, C, D, F
+    prediction_uncertainty: float = 0.0  # model uncertainty estimate
+
+    # --- Explainability ---
+    feature_contributions: list[dict[str, Any]] = field(default_factory=list)
+    explanation_summary: str = ""
+    counterfactual: dict[str, float] = field(default_factory=dict)
+
+    # --- Validation Artifacts ---
+    walk_forward_passed: Optional[bool] = None
+    monte_carlo_passed: Optional[bool] = None
+    reality_check_passed: Optional[bool] = None
+    deflated_sharpe: Optional[float] = None
+
     # --- Status ---
     status: SignalStatus = SignalStatus.PENDING_VALIDATION
 
