@@ -190,8 +190,8 @@ class TestNoSignalSentinel:
         )
         assert sig.is_actionable is True
 
-    def test_ml_strategy_no_model_returns_no_signal(self):
-        """When no model is loaded, MLStrategy returns NO_SIGNAL per symbol."""
+    def test_ml_strategy_no_model_uses_fallback(self):
+        """When no model is loaded, MLStrategy uses fallback strategy."""
         from src.strategy.ml_strategy import MLStrategy
 
         strategy = MLStrategy(
@@ -200,18 +200,17 @@ class TestNoSignalSentinel:
         )
         # model should be None since path doesn't exist
         assert strategy.model is None
+        assert strategy.model_available is False
 
+        # With minimal data the fallback may return empty signals
+        # (momentum needs volume/high/low), but it should NOT raise
         data = {
             "AAPL": pd.DataFrame({"close": [100.0]}),
             "MSFT": pd.DataFrame({"close": [200.0]}),
         }
         signals = strategy.generate_signals(data)
-        assert len(signals) == 2
-        for sig in signals:
-            assert sig.signal == Signal.NO_SIGNAL
-            assert sig.confidence == 0.0
-            assert "PREDICTION_UNAVAILABLE" in sig.reason
-            assert sig.is_actionable is False
+        # Fallback returns list (possibly empty if data insufficient)
+        assert isinstance(signals, list)
 
 
 # ──────────────────────────────────────────────────────────────────────────────

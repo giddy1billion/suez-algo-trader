@@ -268,6 +268,57 @@ class TradeManager:
                 del self._trades[tid]
             return len(terminal_ids)
 
+    def reap_stale_trades(self, timeout_seconds: float = 300.0) -> int:
+        """
+        Transition non-terminal, non-active trades to ERROR if stuck too long.
+
+        This prevents orphaned trades in states like SUBMITTED, PENDING_RISK,
+        or ACCEPTED from persisting indefinitely (e.g., broker never responds).
+
+        Args:
+            timeout_seconds: Max time a trade can sit in a non-active, non-terminal
+                           state before being reaped. Default 5 minutes.
+
+        Returns:
+            Number of stale trades reaped.
+        """
+        # States that are considered "in-flight" (not yet active, not terminal)
+        stale_states = {
+            TradeState.SIGNAL,
+            TradeState.PENDING_RISK,
+            TradeState.RISK_APPROVED,
+            TradeState.SUBMITTED,
+            TradeState.ACCEPTED,
+            TradeState.PARTIALLY_FILLED,
+        }
+        now = datetime.now(timezone.utc)
+        reaped = 0
+
+        with self._lock:
+            for trade in list(self._trades.values()):
+                if trade.state not in stale_states:
+                    continue
+                # Check time in current state
+                if not trade.history:
+                    continue
+                last_transition_time = trade.history[-1][1]
+                elapsed = (now - last_transition_time).total_seconds()
+                if elapsed > timeout_seconds:
+                    trade.transition(
+                        TradeState.ERROR,
+                        reason=f"timeout: stuck in {trade.state.value} for {elapsed:.0f}s"
+                    )
+                    logger.warning(
+                        "trade_manager.stale_trade_reaped",
+                        trade_id=trade.trade_id,
+                        symbol=trade.symbol,
+                        state=trade.state.value,
+                        elapsed_seconds=elapsed,
+                    )
+                    reaped += 1
+
+        return reaped
+
     @property
     def count(self) -> int:
         """Total number of tracked trades."""

@@ -15,6 +15,7 @@ Usage:
 """
 
 import argparse
+import os
 import sys
 import time
 import signal
@@ -756,8 +757,8 @@ def cmd_run(
                             fees=0.0,
                             source="trade_stream",
                         ))
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.error("event_bus.fill_publish_failed", order_id=order_id, error=str(e))
 
             elif event_type in ("canceled", "rejected", "expired"):
                 reason = order_info.get("status", event_type)
@@ -771,8 +772,8 @@ def cmd_run(
                             reason=f"{event_type}: {reason}",
                             source="trade_stream",
                         ))
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.error("event_bus.reject_publish_failed", order_id=order_id, error=str(e))
             else:
                 logger.debug("trade_update.event", event=event_type, symbol=symbol)
 
@@ -991,13 +992,18 @@ def cmd_run(
                 next_run_time=datetime.now(),  # Run immediately on start
             )
 
-        # Automated ML training
+        # Automated ML training — runs immediately if model missing, else on schedule
         if settings.auto_train_interval_hours > 0:
+            # Run immediately on startup if no model exists (bootstrap)
+            _needs_bootstrap = not os.path.exists(settings.ml_model_path)
             _scheduler.add_job(
                 _auto_train,
                 IntervalTrigger(hours=settings.auto_train_interval_hours),
                 id="auto_train",
+                next_run_time=datetime.now() if _needs_bootstrap else None,
             )
+            if _needs_bootstrap:
+                logger.info("scheduler.ml_bootstrap", msg="No model found, training immediately")
 
         # Automated parameter sweep
         if settings.auto_sweep_interval_hours > 0:
@@ -1041,6 +1047,12 @@ def cmd_run(
             removed = trade_manager.remove_terminal()
             if removed > 0:
                 logger.info("trade_manager.cleanup", removed=removed, cycle=cycle_count)
+
+        # Reap stale trades stuck in non-terminal states (every 5 cycles)
+        if trade_manager and cycle_count % 5 == 0:
+            reaped = trade_manager.reap_stale_trades(timeout_seconds=300.0)
+            if reaped > 0:
+                logger.warning("trade_manager.stale_reaped", count=reaped, cycle=cycle_count)
 
         # Periodic portfolio reconciliation (every 5 minutes / ~5 cycles at 60s interval)
         if reconciler and cycle_count % 5 == 0:

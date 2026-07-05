@@ -82,6 +82,7 @@ class ExecutionEngine:
         self.min_signal_confidence = min_signal_confidence
         self._last_cycle_time: Optional[datetime] = None
         self._current_strategy_name: str = "unknown"
+        self._current_capital_weight: float = 1.0
         self._cycle_count: int = 0
 
         # Event-driven components (optional but recommended)
@@ -107,7 +108,7 @@ class ExecutionEngine:
     # Main Loop
     # ──────────────────────────────────────────────────────────────────────
 
-    def run_cycle(self, strategy: BaseStrategy) -> list[dict]:
+    def run_cycle(self, strategy: BaseStrategy, capital_weight: float = 1.0) -> list[dict]:
         """
         Execute one complete trading cycle:
         1. Fetch data for all symbols
@@ -115,9 +116,15 @@ class ExecutionEngine:
         3. Filter through risk manager
         4. Execute orders
         5. Log everything
+
+        Args:
+            strategy: The strategy to run.
+            capital_weight: Fraction of portfolio allocated to this strategy (0.0-1.0+).
+                          Used for multi-strategy capital allocation.
         """
         self._last_cycle_time = datetime.now()
         self._current_strategy_name = strategy.name
+        self._current_capital_weight = max(0.01, min(capital_weight, 5.0))  # Clamp to sane range
         results = []
 
         # 0. Check circuit breaker
@@ -170,6 +177,9 @@ class ExecutionEngine:
         positions = self.broker.get_positions()
         portfolio_value = account['portfolio_value']
 
+        # Apply capital_weight for multi-strategy allocation
+        effective_portfolio = portfolio_value * self._current_capital_weight
+
         # Update risk manager with current equity
         self.risk.update_equity(portfolio_value)
 
@@ -177,7 +187,7 @@ class ExecutionEngine:
             if not signal.is_actionable:
                 continue
 
-            result = self._process_signal(signal, portfolio_value, positions, data)
+            result = self._process_signal(signal, effective_portfolio, positions, data)
             if result:
                 results.append(result)
 

@@ -68,6 +68,7 @@ class ModelPredictor:
         self._swap_count: int = 0
         self._last_check_time: Optional[float] = None
         self._errors: list[dict] = []
+        self._max_errors: int = 100  # Cap to prevent memory leak
 
         # Auto-reload watcher
         self._watcher_thread: Optional[threading.Thread] = None
@@ -92,7 +93,7 @@ class ModelPredictor:
         Thread-safe — multiple strategies can call this concurrently.
 
         Args:
-            features: Feature array (samples × features).
+            features: Feature array (samples x features).
 
         Returns:
             Prediction array from the model.
@@ -121,6 +122,8 @@ class ModelPredictor:
                     "error": str(e),
                     "version": self._version,
                 })
+                if len(self._errors) > self._max_errors:
+                    self._errors = self._errors[-self._max_errors:]
                 raise
 
     def predict_proba(self, features: np.ndarray) -> np.ndarray:
@@ -128,13 +131,13 @@ class ModelPredictor:
         Get probability predictions from the active model.
 
         Args:
-            features: Feature array (samples × features).
+            features: Feature array (samples x features).
 
         Returns:
-            Probability array (samples × classes).
+            Probability array (samples x classes).
 
         Raises:
-            RuntimeError: If model doesn't support predict_proba.
+            RuntimeError: If model does not support predict_proba.
         """
         start_time = time.perf_counter()
 
@@ -159,13 +162,15 @@ class ModelPredictor:
                     "error": str(e),
                     "version": self._version,
                 })
+                if len(self._errors) > self._max_errors:
+                    self._errors = self._errors[-self._max_errors:]
                 raise
 
     def predict_with_shadow(self, features: np.ndarray) -> tuple[np.ndarray, Optional[np.ndarray]]:
         """
         Get predictions from both active and shadow models.
 
-        Used for A/B testing — shadow predictions are returned but not
+        Used for A/B testing -- shadow predictions are returned but not
         used for trading decisions.
 
         Args:

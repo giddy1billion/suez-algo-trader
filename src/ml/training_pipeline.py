@@ -129,6 +129,7 @@ class TrainingPipeline:
         # State
         self._current: Optional[PipelineProgress] = None
         self._history: list[PipelineProgress] = []
+        self._max_history: int = 50  # Cap to prevent memory leak
         self._lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
 
@@ -189,6 +190,8 @@ class TrainingPipeline:
             finally:
                 with self._lock:
                     self._history.append(progress)
+                    if len(self._history) > self._max_history:
+                        self._history = self._history[-self._max_history:]
                 if callback:
                     try:
                         callback(progress)
@@ -248,8 +251,8 @@ class TrainingPipeline:
 
         with self._lock:
             self._history.append(progress)
-
-        return progress
+            if len(self._history) > self._max_history:
+                self._history = self._history[-self._max_history:]
 
     # ──────────────────────────────────────────────────────────────────────
     # Status

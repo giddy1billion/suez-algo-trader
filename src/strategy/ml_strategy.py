@@ -35,6 +35,7 @@ class MLStrategy(BaseStrategy):
         model_path: str = "models/latest_model.joblib",
         min_confidence: float = 0.65,
         retrain_interval_hours: int = 24,
+        fallback_strategy: str = "momentum",
     ):
         super().__init__(name="ml_xgboost", symbols=symbols, timeframe=timeframe, lookback=lookback)
         self.model_path = model_path
@@ -44,8 +45,20 @@ class MLStrategy(BaseStrategy):
         self._last_train_time: Optional[datetime] = None
         self._feature_columns: list[str] = []
         self._model_lock = threading.Lock()  # Protects model load/save/predict
+        self._fallback_strategy_name = fallback_strategy
+        self._fallback_strategy = None
+        self._bootstrap_attempted = False
 
         self._load_model()
+
+        # Warn clearly if no model available
+        if self.model is None:
+            logger.warning(
+                "ml.NO_MODEL_AVAILABLE",
+                msg="No trained model found. System will use fallback strategy "
+                    "until model is trained. Run /train or wait for auto-train.",
+                path=self.model_path,
+            )
 
     def _load_model(self):
         """Load a previously trained model from disk. Thread-safe."""
@@ -89,6 +102,11 @@ class MLStrategy(BaseStrategy):
 
         logger.info("ml.model_saved", path=self.model_path)
 
+    @property
+    def model_available(self) -> bool:
+        """Whether a trained model is loaded and ready for predictions."""
+        return self.model is not None
+
     def needs_retraining(self) -> bool:
         """Check if model needs retraining."""
         if self.model is None:
@@ -97,6 +115,47 @@ class MLStrategy(BaseStrategy):
             return True
         hours_since = (datetime.now() - self._last_train_time).total_seconds() / 3600
         return hours_since >= self.retrain_interval_hours
+
+    def _get_fallback_strategy(self):
+        """Lazy-create fallback strategy for when ML model is unavailable."""
+        if self._fallback_strategy is None:
+            try:
+                from src.strategy.momentum import MomentumStrategy
+                self._fallback_strategy = MomentumStrategy(
+                    symbols=self.symbols,
+                    timeframe=self.timeframe,
+                    lookback=self.lookback,
+                )
+                logger.info("ml.fallback_created", strategy=self._fallback_strategy_name)
+            except Exception as e:
+                logger.error("ml.fallback_creation_failed", error=str(e))
+        return self._fallback_strategy
+
+    def _fallback_signals(self, data: dict[str, pd.DataFrame]) -> list[TradeSignal]:
+        """Generate signals using fallback strategy when ML model unavailable."""
+        logger.warning("ml.using_fallback", reason="no trained model available")
+        fallback = self._get_fallback_strategy()
+        if fallback is not None:
+            try:
+                signals = fallback.generate_signals(data)
+                # Tag signals so they're identifiable as fallback
+                for sig in signals:
+                    sig.reason = f"[FALLBACK:{self._fallback_strategy_name}] {sig.reason or ''}"
+                return signals
+            except Exception as e:
+                logger.error("ml.fallback_error", error=str(e))
+
+        # Last resort: return NO_SIGNAL
+        return [
+            TradeSignal(
+                symbol=symbol,
+                signal=Signal.NO_SIGNAL,
+                confidence=0.0,
+                price=0.0,
+                reason="PREDICTION_UNAVAILABLE: no model and fallback failed",
+            )
+            for symbol in data.keys()
+        ]
 
     # ──────────────────────────────────────────────────────────────────────
     # Feature Engineering (delegates to shared pipeline)
@@ -218,20 +277,9 @@ class MLStrategy(BaseStrategy):
     # ──────────────────────────────────────────────────────────────────────
 
     def generate_signals(self, data: dict[str, pd.DataFrame]) -> list[TradeSignal]:
-        """Generate ML-based signals. Thread-safe model access."""
+        """Generate ML-based signals. Falls back to momentum if no model. Thread-safe."""
         if self.model is None:
-            logger.warning("ml.no_model", msg="Train model first")
-            # Return NO_SIGNAL for each symbol so the state is visible in logs/events
-            return [
-                TradeSignal(
-                    symbol=symbol,
-                    signal=Signal.NO_SIGNAL,
-                    confidence=0.0,
-                    price=0.0,
-                    reason="PREDICTION_UNAVAILABLE: no active validated model",
-                )
-                for symbol in data.keys()
-            ]
+            return self._fallback_signals(data)
 
         signals = []
         feature_cols = self._feature_columns or self.get_feature_columns()

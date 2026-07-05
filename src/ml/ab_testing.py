@@ -180,6 +180,7 @@ class ABTestManager:
 
         self._active_test: Optional[ABTest] = None
         self._completed_tests: list[ABTest] = []
+        self._max_completed: int = 50  # Cap to prevent memory leak
         self._lock = threading.Lock()
 
     # ──────────────────────────────────────────────────────────────────────
@@ -284,6 +285,8 @@ class ABTestManager:
             self._active_test.completed_at = datetime.now(timezone.utc)
             result = self._active_test.to_dict()
             self._completed_tests.append(self._active_test)
+            if len(self._completed_tests) > self._max_completed:
+                self._completed_tests = self._completed_tests[-self._max_completed:]
             self._active_test = None
 
             # Clean up shadow
@@ -542,4 +545,6 @@ class ABTestManager:
             self._predictor.clear_shadow_model()
 
         self._completed_tests.append(test)
+        if len(self._completed_tests) > self._max_completed:
+            self._completed_tests = self._completed_tests[-self._max_completed:]
         self._active_test = None

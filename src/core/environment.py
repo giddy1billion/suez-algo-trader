@@ -154,13 +154,17 @@ class BrokerManager:
             }
 
     def _drain_positions(self, broker: BrokerProtocol, timeout: float) -> int:
-        """Close all open positions on a broker. Returns count closed."""
+        """
+        Close all open positions on a broker. Returns count closed.
+        Raises RuntimeError if positions could not be drained.
+        """
         try:
             positions = broker.get_positions()
             if not positions:
                 return 0
 
             closed = 0
+            failed = []
             for pos in positions:
                 symbol = pos.get("symbol", "")
                 try:
@@ -168,6 +172,7 @@ class BrokerManager:
                     closed += 1
                     logger.info("broker_manager.position_closed", symbol=symbol)
                 except Exception as e:
+                    failed.append(symbol)
                     logger.warning(
                         "broker_manager.close_failed",
                         symbol=symbol,
@@ -178,10 +183,24 @@ class BrokerManager:
             if closed > 0:
                 time.sleep(min(2.0, timeout * 0.1))
 
+            if failed:
+                logger.error(
+                    "broker_manager.drain_incomplete",
+                    closed=closed,
+                    failed=failed,
+                    total=len(positions),
+                )
+                raise RuntimeError(
+                    f"Position drain incomplete: {len(failed)}/{len(positions)} "
+                    f"positions failed to close: {failed}"
+                )
+
             return closed
+        except RuntimeError:
+            raise  # Re-raise our own error
         except Exception as e:
             logger.error("broker_manager.drain_error", error=str(e))
-            return 0
+            raise RuntimeError(f"Position drain failed: {e}") from e
 
     def get_status(self) -> dict:
         """Get broker manager status."""
