@@ -13,6 +13,9 @@ build/
 # Data & Models
 data_cache/*.db
 data_cache/*.csv
+data_cache/**/*.duckdb
+data_cache/**/*.parquet
+data_cache/**/*.jsonl
 models/*.joblib
 models/*.pkl
 logs/*.log
