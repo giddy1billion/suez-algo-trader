@@ -27,15 +27,19 @@ from __future__ import annotations
 
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from src.intelligence.confidence.decision_contract import (
+    AlternativeConsidered,
     Decision,
     DecisionContract,
     DecisionContractBuilder,
     DecisionProvenance,
+    DeploymentRecord,
+    FeatureAttribution,
     StageAssessment,
     StageSeverity,
+    ThresholdsApplied,
     VetoAuthority,
 )
 from src.intelligence.confidence.gate import ConfidenceGate, ConfidenceGateConfig, SignalContext
@@ -80,6 +84,11 @@ class DecisionOrchestrator:
         position_pct: float = 0.0,
         kelly_fraction: float = 0.0,
         risk_grade: str = "",
+        strategy_name: str = "",
+        signal_type: str = "",
+        alternatives: Optional[List[Dict[str, Any]]] = None,
+        deployment: Optional[Dict[str, Any]] = None,
+        thresholds: Optional[Dict[str, Any]] = None,
     ) -> DecisionContract:
         """
         Evaluate a signal and produce an immutable DecisionContract.
@@ -92,6 +101,11 @@ class DecisionOrchestrator:
             position_pct: Recommended position size (% of portfolio).
             kelly_fraction: Kelly criterion optimal fraction.
             risk_grade: Risk grade (A-F).
+            strategy_name: Strategy that generated this signal.
+            signal_type: Signal type (e.g., "momentum_crossover").
+            alternatives: Signals evaluated but NOT taken this cycle.
+            deployment: Deployment record for the active model.
+            thresholds: Thresholds active at decision time.
 
         Returns:
             Frozen DecisionContract — the system's decision.
@@ -105,11 +119,15 @@ class DecisionOrchestrator:
         builder = DecisionContractBuilder(validity_minutes=self._validity_minutes)
         builder.set_symbol(context.symbol, "BUY" if confidence_score.approved else "HOLD")
 
-        # Build provenance
-        prov_kwargs = {
+        # Build provenance with deployment and thresholds
+        prov_kwargs: Dict[str, Any] = {
             "model_version": context.model_version,
             "timestamp": datetime.now(timezone.utc),
         }
+        if deployment:
+            prov_kwargs["deployment"] = DeploymentRecord(**deployment)
+        if thresholds:
+            prov_kwargs["thresholds"] = ThresholdsApplied(**thresholds)
         if provenance_kwargs:
             prov_kwargs.update(provenance_kwargs)
         builder.set_provenance(**prov_kwargs)
@@ -121,7 +139,31 @@ class DecisionOrchestrator:
             risk_grade=risk_grade,
         )
 
+        # Record alternatives (signals NOT taken this cycle)
+        for alt in (alternatives or []):
+            builder.add_alternative(
+                symbol=alt.get("symbol", ""),
+                direction=alt.get("direction", ""),
+                raw_confidence=alt.get("raw_confidence", 0.0),
+                rejection_reason=alt.get("rejection_reason", ""),
+                rejected_by_stage=alt.get("rejected_by_stage", ""),
+            )
+
+        # Set feature attribution from explainability output
+        if explanation:
+            top_features = explanation.get("top_features", [])
+            # Normalize: list of dicts or list of tuples
+            feature_tuples = self._normalize_features(top_features)
+            builder.set_feature_attribution(
+                top_features=feature_tuples,
+                method=explanation.get("method", "shap"),
+                baseline_prediction=explanation.get("baseline_prediction", 0.0),
+            )
+
         # Convert each gate result to a StageAssessment
+        supporting_factors: List[str] = []
+        risk_factors: List[str] = []
+
         for gate_result in confidence_score.breakdown.gate_results:
             is_veto = (
                 gate_result.verdict == GateVerdict.REJECT
@@ -157,6 +199,20 @@ class DecisionOrchestrator:
             )
             builder.add_stage(stage)
 
+            # Collect rationale factors from stages
+            if gate_result.score >= 0.8 and gate_result.verdict != GateVerdict.REJECT:
+                supporting_factors.append(
+                    f"{gate_result.gate_name}: {gate_result.reason} (score={gate_result.score:.2f})"
+                )
+            elif gate_result.verdict == GateVerdict.ADJUST and gate_result.adjustment < -0.05:
+                risk_factors.append(
+                    f"{gate_result.gate_name}: {gate_result.reason} (adj={gate_result.adjustment:.3f})"
+                )
+            elif gate_result.verdict == GateVerdict.REJECT:
+                risk_factors.append(
+                    f"{gate_result.gate_name}: BLOCKED - {gate_result.reason}"
+                )
+
         # Add multi-target evidence as an additional stage (if available)
         if multi_target:
             mt_score = multi_target.get("direction_probability", 0.5)
@@ -175,20 +231,37 @@ class DecisionOrchestrator:
                     "holding_hours": multi_target.get("expected_holding_hours", 0),
                 },
             ))
+            if mt_score > 0.6:
+                supporting_factors.append(
+                    f"Multi-target model agrees: p={mt_score:.2f}, E[R]={multi_target.get('expected_return_pct', 0):.2f}%"
+                )
 
         # Add explainability stage (if available)
         if explanation:
-            top_features = explanation.get("top_features", [])
+            top_features_raw = explanation.get("top_features", [])
             builder.add_stage(StageAssessment(
                 stage="explainability",
-                score=0.9 if top_features else 0.5,
+                score=0.9 if top_features_raw else 0.5,
                 passed=True,
                 weight=0.05,
                 evidence={
-                    "top_features": top_features[:5],
+                    "top_features": top_features_raw[:5],
                     "summary": explanation.get("summary", ""),
                 },
             ))
+
+        # Build rationale from collected evidence
+        primary_reason = self._synthesize_primary_reason(
+            context.symbol, confidence_score.approved, confidence_score.final_score,
+            strategy_name, signal_type, supporting_factors
+        )
+        builder.set_rationale(
+            primary_reason=primary_reason,
+            supporting_factors=supporting_factors[:5],
+            risk_factors=risk_factors[:5],
+            strategy_name=strategy_name,
+            signal_type=signal_type,
+        )
 
         # Build the immutable contract
         contract = builder.build()
@@ -202,6 +275,8 @@ class DecisionOrchestrator:
             confidence=round(contract.final_confidence, 3),
             stages=len(contract.stages),
             vetoed=contract.vetoed,
+            has_rationale=contract.rationale is not None,
+            strategy=strategy_name,
             elapsed_ms=round(elapsed_ms, 2),
         )
 
@@ -225,3 +300,46 @@ class DecisionOrchestrator:
             "execution": 0.05,
         }
         return weights.get(gate_name, 0.10)
+
+    def _normalize_features(
+        self, top_features: Any
+    ) -> List[Tuple[str, float]]:
+        """Normalize feature list to [(name, importance)] tuples."""
+        result: List[Tuple[str, float]] = []
+        if not top_features:
+            return result
+        for item in top_features[:10]:
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                result.append((str(item[0]), float(item[1])))
+            elif isinstance(item, dict):
+                name = item.get("feature", item.get("name", "unknown"))
+                importance = item.get("importance", item.get("value", 0.0))
+                result.append((str(name), float(importance)))
+        return result
+
+    def _synthesize_primary_reason(
+        self,
+        symbol: str,
+        approved: bool,
+        final_score: float,
+        strategy_name: str,
+        signal_type: str,
+        supporting_factors: List[str],
+    ) -> str:
+        """Generate a human-readable primary reason from collected evidence."""
+        if not approved:
+            return (
+                f"Signal REJECTED for {symbol}: confidence {final_score:.3f} below threshold. "
+                f"Strategy: {strategy_name or 'unknown'}."
+            )
+        strategy_desc = f" via {strategy_name}" if strategy_name else ""
+        signal_desc = f" ({signal_type})" if signal_type else ""
+        factor_summary = ""
+        if supporting_factors:
+            factor_summary = f" Supported by: {supporting_factors[0].split(':')[0]}"
+            if len(supporting_factors) > 1:
+                factor_summary += f" + {len(supporting_factors) - 1} more factors"
+        return (
+            f"EXECUTE {symbol}{strategy_desc}{signal_desc} with "
+            f"confidence {final_score:.3f}.{factor_summary}"
+        )

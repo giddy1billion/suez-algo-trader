@@ -223,12 +223,19 @@ class ExecutionEngine:
         actionable_count = len([s for s in signals if s.is_actionable])
         logger.info("engine.signals", count=len(signals), actionable=actionable_count)
 
-        # Publish signal events (respecting pause state)
+        # Publish signal events (respecting pause state and operating mode)
         for sig in signals:
             if sig.is_actionable:
-                # Skip signal publishing if bot is paused
+                # Skip signal publishing if bot is paused or mode prohibits entries
                 if self._runtime_state.is_paused():
                     logger.info("engine.signal_suppressed_paused", symbol=sig.symbol, signal=sig.signal.name)
+                    continue
+                if not self._runtime_state.can_open_positions:
+                    logger.info(
+                        "engine.signal_suppressed_mode",
+                        symbol=sig.symbol,
+                        mode=self._runtime_state.operating_mode.value,
+                    )
                     continue
                 
                 self._publish(SignalGenerated(
@@ -252,6 +259,10 @@ class ExecutionEngine:
         # Update risk manager with current equity
         self.risk.update_equity(portfolio_value)
 
+        # Track alternatives within this cycle (signals NOT taken become
+        # alternatives for those that ARE taken — institutional audit trail)
+        self._cycle_alternatives: list[dict] = []
+
         for signal in signals:
             if not signal.is_actionable:
                 continue
@@ -259,6 +270,18 @@ class ExecutionEngine:
             result = self._process_signal(signal, effective_portfolio, positions, data)
             if result:
                 results.append(result)
+            else:
+                # Signal was rejected — record as alternative for future signals this cycle
+                self._cycle_alternatives.append({
+                    "symbol": signal.symbol,
+                    "direction": signal.signal.name if hasattr(signal.signal, 'name') else str(signal.signal),
+                    "raw_confidence": signal.confidence,
+                    "rejection_reason": "Rejected by risk/contract evaluation",
+                    "rejected_by_stage": "execution_engine",
+                })
+
+        # Clear cycle alternatives after processing
+        self._cycle_alternatives = []
 
         # 5. Check existing positions for exit signals
         exit_results = self._check_exits(strategy, positions, data)
@@ -397,6 +420,18 @@ class ExecutionEngine:
                 self._log_signal(signal, executed=False)
                 return None
 
+        # Apply operating mode size reduction
+        mode_multiplier = self._runtime_state.position_size_multiplier
+        if mode_multiplier < 1.0:
+            qty *= mode_multiplier
+            if qty <= 0:
+                logger.info(
+                    "engine.mode_zero_qty",
+                    symbol=signal.symbol,
+                    mode=self._runtime_state.operating_mode.value,
+                )
+                return None
+
         # Build TradeRequest for the new risk engine
         confidence_score = None
         decision_contract = None
@@ -430,6 +465,9 @@ class ExecutionEngine:
                 position_pct=qty / portfolio_value * 100.0 if portfolio_value > 0 else 0.0,
                 kelly_fraction=getattr(signal, 'kelly_fraction', 0.0),
                 risk_grade=getattr(signal, 'risk_grade', ''),
+                strategy_name=self._current_strategy_name,
+                signal_type=getattr(signal, 'signal_type', ''),
+                alternatives=getattr(self, '_cycle_alternatives', None),
             )
             effective_confidence = decision_contract.final_confidence
 

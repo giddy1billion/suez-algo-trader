@@ -1270,6 +1270,20 @@ def cmd_run(
         # Health heartbeats
         if health_monitor:
             health_monitor.heartbeat("engine", latency_ms=(time.time() - cycle_start) * 1000)
+            # Auto-transition operating mode based on system health
+            overall_status, issues = health_monitor.check_component_health()
+            _health_scores = {"healthy": 1.0, "degraded": 0.5, "down": 0.1}
+            _current_health = _health_scores.get(overall_status, 0.5)
+            mode_changed = runtime_state.update_health(
+                _current_health,
+                reason="; ".join(issues[:3]) if issues else "all_healthy",
+            )
+            if mode_changed:
+                logger.warning(
+                    "system.mode_changed",
+                    new_mode=mode_changed.value,
+                    health=_current_health,
+                )
 
         # Periodic snapshots (every 500 events for fast recovery)
         if snapshot_manager and snapshot_manager.should_snapshot():
