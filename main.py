@@ -38,6 +38,8 @@ from src.core.runtime_state import RuntimeState
 from src.data.store import DatabaseManager
 from src.intelligence.orchestrator import AdaptiveIntelligenceOrchestrator
 from src.intelligence.confidence.gate import ConfidenceGate, ConfidenceGateConfig
+from src.intelligence.confidence.orchestrator import DecisionOrchestrator
+from src.intelligence.confidence.contract_store import ContractStore
 from src.notifications.alerts import NotificationManager
 from src.monitoring.health import HealthMonitor
 from src.monitoring.metrics import LiveMetrics
@@ -586,6 +588,7 @@ def cmd_run(
                 "model_version": event.model_version,
                 "strategy_name": event.strategy_name,
                 "signal_package_id": event.signal_package_id,
+                "contract_id": event.contract_id,
             }
             post_trade_validator.validate_trade(trade_result)
 
@@ -617,6 +620,13 @@ def cmd_run(
 
     confidence_gate = ConfidenceGate(ConfidenceGateConfig())
 
+    # Decision Contract infrastructure — every trading decision is auditable
+    contract_store = ContractStore(storage_path="data_cache/contracts")
+    decision_orchestrator = DecisionOrchestrator(
+        gate_config=ConfidenceGateConfig(),
+        validity_minutes=getattr(settings, 'contract_validity_minutes', 5.0),
+    )
+
     engine = ExecutionEngine(
         broker=broker,
         risk_manager=risk,
@@ -630,6 +640,8 @@ def cmd_run(
         signal_gate=signal_gate,
         signal_bridge_config=SignalBridgeConfig(),
         confidence_gate=confidence_gate,
+        decision_orchestrator=decision_orchestrator,
+        contract_store=contract_store,
         intelligence_orchestrator=AdaptiveIntelligenceOrchestrator(
             min_trade_score=settings.intelligence_min_trade_score,
             drift_window=settings.intelligence_drift_window,
