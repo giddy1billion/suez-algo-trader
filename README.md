@@ -57,7 +57,7 @@ Deployed on **Azure Container Instances** via GitHub Actions CI/CD pipeline.
 - ✅ **Market State Engine** — full market fingerprint with multi-dimensional regime analysis
 - ✅ **Meta-Strategy Engine** — dynamic strategy ranking and selection per market regime
 - ✅ **Concept Drift Monitor** — detect model degradation in real-time, trigger retraining
-- ✅ **Capital Allocator** — dynamic position sizing via Kelly criterion with sector correlation filters
+- ✅ **Capital Allocator** — dynamic position sizing via heuristic multipliers (stress, volatility, drift, correlation) + sector limits
 - ✅ **Decision Explainer** — human-readable reasons for every trade accept/reject
 - ✅ **Decision Journal** — full audit trail for all intelligence decisions
 - ✅ **Counterfactual Engine** — what-if analysis on alternative trade decisions
@@ -65,11 +65,15 @@ Deployed on **Azure Container Instances** via GitHub Actions CI/CD pipeline.
 ### ML/AI
 - ✅ **XGBoost ML strategy** — 30+ engineered features, time-series cross-validation
 - ✅ **Model governance** — version registry, lineage tracking (git hash, config hash, dataset hash), rollback
-- ✅ **A/B testing framework** — shadow mode and split-capital comparison with statistical significance
+- ✅ **A/B testing framework** — shadow, split-capital, and interleaved comparison with statistical significance
 - ✅ **Prediction registry** — full lifecycle tracking: prediction → outcome → quality grading
 - ✅ **Feature store** — cached feature computation with schema versioning
 - ✅ **Auto-retraining** — scheduled + drift-triggered + self-healing retry with exponential backoff
 - ✅ **Model promotion gates** — min Sharpe, max drawdown, min precision, WF validation, Monte Carlo probability
+- ✅ **Closed-loop learning** — post-trade scorecards, experience database, continuous calibration monitoring
+- ✅ **Champion-challenger promotion** — automated model promotion with governance gates and audit trail
+- ✅ **Prediction calibration** — ECE/MCE/Brier score computation for confidence reliability analysis
+- ✅ **Model hot-swap** — zero-downtime double-buffered model loading with automatic fallback
 
 ### Backtesting
 - ✅ **Backtrader engine** — event-driven backtesting with full analyzers
@@ -78,11 +82,11 @@ Deployed on **Azure Container Instances** via GitHub Actions CI/CD pipeline.
 - ✅ **Monte Carlo simulation** — probability of profit/ruin analysis with configurable trials
 - ✅ **Portfolio-level backtesting** — multi-symbol combined strategy evaluation
 - ✅ **Asset-class-aware parameters** — per-symbol backtest config via layered configuration
-- ✅ **Execution simulator** — realistic slippage, partial fills, latency, and spread modeling
+- ✅ **Execution simulator** — realistic slippage (volume-impact square-root model), partial fills, latency, and spread modeling
 
 ### Risk Management
-- ✅ **4-layer risk engine** — Portfolio, Account, Exposure, and Execution risk layers
-- ✅ **Position sizing** — ATR-based dynamic stops, Kelly criterion, correlation-aware
+- ✅ **4-layer risk engine** — Account, Portfolio, Exposure, and Execution risk layers (sequential fast-fail)
+- ✅ **Position sizing** — ATR-based dynamic stops, heuristic multipliers, correlation-aware
 - ✅ **Circuit breakers** — daily loss limits, max drawdown, consecutive loss halt
 - ✅ **PDT protection** — Pattern Day Trader rule awareness ($25K threshold)
 - ✅ **Sector concentration limits** — max sector exposure with dynamic lookup
@@ -91,13 +95,15 @@ Deployed on **Azure Container Instances** via GitHub Actions CI/CD pipeline.
 ### Operations & Observability
 - ✅ **Full Telegram bot interface** — 50+ commands, inline buttons, real-time control
 - ✅ **Telegram audit forwarder** — ALL events + WARNING+ logs forwarded as rich HTML notifications
-- ✅ **Event-driven architecture** — event bus, persistent event store, replay, crash recovery
+- ✅ **Event-driven architecture** — 33+ domain event types, persistent event store, replay, crash recovery
 - ✅ **CQRS read models** — incremental projections for fast dashboard queries
 - ✅ **State snapshotting** — periodic persistence for sub-second recovery
 - ✅ **Portfolio reconciliation** — periodic broker ↔ internal state sync with auto-fix
 - ✅ **Health monitoring** — CPU, memory, latency, component status, structured logging
 - ✅ **Notifications** — Telegram + Discord alerts on trades, signals, errors, daily summaries
 - ✅ **SQLite persistence** — trade history, signals, portfolio snapshots, trade journal, event store
+- ✅ **Risk decision audit log** — last 1000 risk decisions retained for review
+- ✅ **Three operational modes** — research, paper, live (with distinct risk profiles)
 
 ### Configuration & Automation
 - ✅ **Database-backed configuration** — persisted settings survive restarts, seeded from .env
@@ -800,9 +806,14 @@ python main.py --strategy multi --strategies "momentum:AAPL,MSFT:1Hour:60:1.0;ml
 
 ### Event-Driven Core
 
-The system is built on a lightweight, thread-safe, in-process event bus:
+The system is built on a lightweight, thread-safe, in-process event bus with 33+ domain event types:
 
-- **Domain Events**: `SignalGenerated`, `OrderSubmitted`, `OrderFilled`, `OrderRejected`, `PositionOpened`, `PositionClosed`, `RiskHalt`, `DriftDetected`, `BacktestTriggered`, `ModelTrainingCompleted`, `SchedulerEvent`
+- **Signal & Order Events**: `SignalGenerated`, `OrderSubmitted`, `OrderFilled`, `OrderRejected`
+- **Trade Lifecycle**: `TradeOpened`, `TradeClosed`
+- **Risk Events**: `RiskHalt`, `CircuitBreakerTripped`, `CircuitBreakerReset`
+- **ML Events**: `ModelSwapped`, `ModelTrainingStarted`, `ModelTrainingCompleted`, `ModelAutoRollback`, `ModelRejected`, `ABTestStarted`, `ABTestCompleted`, `DriftDetected`
+- **Backtest Events**: `BacktestStarted`, `BacktestCompleted`, `BacktestTriggered`
+- **Infrastructure Events**: `EnvironmentSwitched`, `BrokerSwitched`, `DataIngested`, `SchedulerEvent`
 - **Event Store**: Persistent SQLite-backed event log with session tracking
 - **Event Replay**: Reconstruct state from event history (for debugging or recovery)
 - **Crash Recovery**: On startup, reconciles broker positions with internal state and replays missed events
@@ -816,15 +827,15 @@ Every trade signal passes through a validation pipeline before execution:
 
 ```
 Strategy Signal → Signal Package → Validation Gate → Intelligence Layer → Risk Engine → Execution
-                   (completeness)   (confidence,      (regime, score,      (4-layer     (broker
-                                    risk/reward,       drift, routing,      checks)      + simulator)
-                                    provenance)        allocation)
+                   (completeness)   (confidence ≥0.5,  (regime, score,     (4-layer     (broker
+                                    risk/reward,        drift, routing,     sequential    + simulator)
+                                    provenance)         allocation)         checks)
 ```
 
 - **Signal Package**: Comprehensive execution package with entry zone, stop loss, take profit levels, holding period, confidence decay schedule, and model provenance
-- **Validation Gate**: Blocks incomplete signals from execution (configurable strictness)
+- **Validation Gate**: Blocks incomplete signals from execution (configurable strictness); hard floor at 0.5 confidence
 - **Intelligence Layer**: Scores trade quality, checks regime compatibility, allocates capital
-- **Risk Engine**: 4 independent risk layers evaluate every order independently
+- **Risk Engine**: 4 sequential risk layers evaluate every order (Account → Portfolio → Exposure → Execution)
 
 ---
 
@@ -834,13 +845,13 @@ The intelligence subsystem orchestrates multiple components for adaptive decisio
 
 | Component | Responsibility |
 |-----------|---------------|
-| **Market State Engine** | Computes market fingerprint (volatility, trend, breadth, correlation) |
+| **Market State Engine** | Computes 8-dimensional market fingerprint (trend, volatility, liquidity, momentum, correlation, stress, seasonality, session) |
 | **Regime Classifier** | Classifies current market regime (trending, mean-reverting, volatile, quiet) |
 | **Meta-Strategy Engine** | Ranks strategies by expected performance in current regime |
 | **Strategy Router** | Enables/disables strategies based on regime compatibility |
-| **Drift Monitor** | Detects concept drift via rolling accuracy windows |
-| **Trade Quality Scorer** | Composite score (0–100) evaluating trade worthiness |
-| **Capital Allocator** | Dynamic sizing via Kelly criterion + correlation filters + sector limits |
+| **Drift Monitor** | Detects concept drift via split-half accuracy comparison (baseline vs recent) |
+| **Trade Quality Scorer** | Composite score evaluating trade worthiness (threshold-based gating, default ≥70) |
+| **Capital Allocator** | Dynamic sizing via heuristic multipliers (stress, volatility, drift, correlation) + sector limits |
 | **Decision Explainer** | Human-readable explanations for accept/reject decisions |
 | **Decision Journal** | Full audit trail of every intelligence decision |
 | **Counterfactual Engine** | What-if analysis comparing actual vs alternative outcomes |
@@ -848,8 +859,8 @@ The intelligence subsystem orchestrates multiple components for adaptive decisio
 Configuration:
 ```env
 INTELLIGENCE_ENABLED=true
-INTELLIGENCE_MIN_TRADE_SCORE=70       # Minimum score to allow trade (0-100)
-INTELLIGENCE_DRIFT_WINDOW=200         # Rolling window for drift detection
+INTELLIGENCE_MIN_TRADE_SCORE=70       # Minimum score to allow trade
+INTELLIGENCE_DRIFT_WINDOW=200         # History size for drift detection
 INTELLIGENCE_DRIFT_MIN_SAMPLES=50     # Minimum samples before drift alerts
 INTELLIGENCE_DRIFT_ALERT_DROP=0.12    # Accuracy drop threshold for alert
 ```
@@ -858,9 +869,23 @@ INTELLIGENCE_DRIFT_ALERT_DROP=0.12    # Accuracy drop threshold for alert
 
 ## Risk Management
 
-The platform implements a **4-layer risk engine** where every order must pass all enabled layers independently:
+The platform implements a **4-layer risk engine** where every order must pass all enabled layers in sequence. Signals below 0.5 confidence are rejected outright before layer evaluation.
 
-### Layer 1: Portfolio Risk
+**Evaluation order:** Account → Portfolio → Exposure → Execution
+
+### Layer 1: Account Risk (evaluated first — fast-fail on account limits)
+
+| Rule | Default | Description |
+|------|---------|-------------|
+| Max daily loss | 3% | Auto-halt when breached |
+| Max weekly loss | 7% | Weekly drawdown circuit breaker |
+| Max drawdown | 15% | Peak-to-trough limit |
+| Min cash reserve | 20% | Always keep this % in cash |
+| PDT threshold | $25,000 | Pattern Day Trader rule awareness |
+| Consecutive loss limit | 5 | Halt after N consecutive losses |
+| Daily trade limit | 20 | Max trades per day |
+
+### Layer 2: Portfolio Risk
 
 | Rule | Default | Description |
 |------|---------|-------------|
@@ -872,18 +897,6 @@ The platform implements a **4-layer risk engine** where every order must pass al
 | Max net exposure | 100% | Net long-short exposure |
 | Max VaR | 5% | Portfolio Value-at-Risk limit |
 | Max portfolio heat | 10% | Total portfolio risk (sum of position risks) |
-
-### Layer 2: Account Risk
-
-| Rule | Default | Description |
-|------|---------|-------------|
-| Max daily loss | 3% | Auto-halt when breached |
-| Max weekly loss | 7% | Weekly drawdown circuit breaker |
-| Max drawdown | 15% | Peak-to-trough limit |
-| Min cash reserve | 20% | Always keep this % in cash |
-| PDT threshold | $25,000 | Pattern Day Trader rule awareness |
-| Consecutive loss limit | 5 | Halt after N consecutive losses |
-| Daily trade limit | 20 | Max trades per day |
 
 ### Layer 3: Exposure Risk
 
@@ -897,7 +910,7 @@ The platform implements a **4-layer risk engine** where every order must pass al
 | High volatility threshold | 3% | Daily move threshold |
 | High vol size reduction | 50% | Reduce position size in volatile markets |
 
-### Layer 4: Execution Risk
+### Layer 4: Execution Risk (evaluated last — market microstructure checks)
 
 | Rule | Default | Description |
 |------|---------|-------------|
@@ -905,8 +918,10 @@ The platform implements a **4-layer risk engine** where every order must pass al
 | Min volume | 10,000 | Minimum daily volume |
 | Max slippage | 0.3% | Expected slippage limit |
 | Max orders/minute | 10 | Rate limiting |
-| Cooldown after loss | 5 min | Pause after large loss |
+| Cooldown after loss | 5 min | Automated pause after large loss |
 | Large loss threshold | 1% | What constitutes a "large" loss |
+
+The risk engine maintains a decision log (last 1000 decisions) for audit and computes a risk score per order.
 
 ### Legacy Risk Manager (Backward-Compatible)
 
@@ -925,7 +940,7 @@ Additionally, the primary risk manager provides top-level guardrails:
 | Default stop-loss | 3% | 0.5%–50% | Automatic stop-loss on every trade |
 | Default take-profit | 6% | 0.5%–100% | Default take-profit target |
 
-All parameters configurable via `/setrisk` or `/set` on Telegram. Risk layer enabled/disabled individually:
+All parameters configurable via `/setrisk` or `/set` on Telegram. Risk layers enabled/disabled individually:
 ```env
 RISK_PORTFOLIO_LAYER_ENABLED=true
 RISK_ACCOUNT_LAYER_ENABLED=true
@@ -1042,9 +1057,9 @@ algo-trader/
 │   │   ├── scoring/
 │   │   │   └── trade_quality.py       # Composite trade quality scoring (0–100)
 │   │   ├── drift/
-│   │   │   └── monitor.py             # Concept drift detection via rolling windows
+│   │   │   └── monitor.py             # Concept drift detection via split-half comparison
 │   │   ├── allocator/
-│   │   │   ├── capital_allocator.py   # Kelly criterion + dynamic sizing
+│   │   │   ├── capital_allocator.py   # Heuristic multiplier-based dynamic sizing
 │   │   │   ├── correlation_filter.py  # Correlation-based position blocking
 │   │   │   └── portfolio_allocator.py # Portfolio-level allocation optimization
 │   │   ├── routing/
@@ -1062,12 +1077,14 @@ algo-trader/
 │   ├── ml/
 │   │   ├── features.py                # Feature engineering (30+ features)
 │   │   ├── feature_store.py           # Feature caching & schema versioning
-│   │   ├── predictor.py               # Model inference wrapper
+│   │   ├── predictor.py               # Model inference with double-buffered hot-swap
 │   │   ├── training_pipeline.py       # Full training pipeline with CV
 │   │   ├── dataset_builder.py         # Training dataset construction
 │   │   ├── model_registry.py          # Model version management
 │   │   ├── governance.py              # Model governance, lineage, promotion gates
-│   │   ├── ab_testing.py              # A/B testing framework (shadow + split modes)
+│   │   ├── ab_testing.py              # A/B testing framework (shadow, split, interleaved modes)
+│   │   ├── feedback_loop.py           # Closed-loop learning (scorecards, experience DB, calibration)
+│   │   ├── promotion_engine.py        # Champion-challenger auto-promotion with governance gates
 │   │   └── retraining_trigger.py      # Drift-triggered + scheduled retraining
 │   ├── risk/
 │   │   ├── manager.py                 # Primary risk manager (legacy guardrails)
@@ -1079,7 +1096,7 @@ algo-trader/
 │   │   └── execution_risk.py          # Execution risk layer (spread, volume, rate)
 │   ├── execution/
 │   │   ├── engine.py                  # Trade execution orchestrator
-│   │   ├── simulator.py               # Execution realism simulator (slippage, fills)
+│   │   ├── simulator.py               # Execution realism simulator (volume-impact square-root model)
 │   │   └── sector_lookup.py           # Dynamic sector classification with DB cache
 │   ├── data/
 │   │   ├── store.py                   # SQLAlchemy models + DB manager
@@ -1097,7 +1114,7 @@ algo-trader/
 │   │   ├── ops_commands.py            # Ops command handlers (health, latency, system)
 │   │   └── telemetry.py              # Telemetry & observability
 │   ├── core/
-│   │   ├── events.py                  # Domain events (20+ event types)
+│   │   ├── events.py                  # Domain events (33+ event types)
 │   │   ├── bus.py                     # Thread-safe event bus (pub/sub)
 │   │   ├── event_store.py             # Persistent SQLite event storage + replay
 │   │   ├── subscribers.py             # Default event subscribers (audit, journal, notifications)
@@ -1122,6 +1139,7 @@ algo-trader/
 │   │   ├── validation.py              # Configuration value validation
 │   │   ├── seed.py                    # First-run configuration seeding
 │   │   ├── snapshots.py               # Configuration snapshots
+│   │   ├── secrets.py                 # Secrets management (reference-only, never stored in DB)
 │   │   └── models.py                  # Configuration data models
 │   ├── predictions/
 │   │   ├── registry.py                # Prediction lifecycle tracking
@@ -1166,7 +1184,6 @@ algo-trader/
 ├── .env.example                       # Environment variable template
 ├── Dockerfile                         # Python 3.12-slim, non-root, health check
 ├── pytest.ini                         # Test configuration
-├── verify_integration.py              # Integration verification script
 └── README.md
 ```
 
@@ -1213,7 +1230,7 @@ Settings are loaded by Pydantic with validation, type coercion, and range checki
 |----------|---------|-------------|
 | `INTELLIGENCE_ENABLED` | `true` | Enable adaptive intelligence layer |
 | `INTELLIGENCE_MIN_TRADE_SCORE` | `70` | Minimum trade quality score (0–100) |
-| `INTELLIGENCE_DRIFT_WINDOW` | `200` | Rolling window for drift detection |
+| `INTELLIGENCE_DRIFT_WINDOW` | `200` | History size for drift detection |
 | `INTELLIGENCE_DRIFT_MIN_SAMPLES` | `50` | Min samples before drift alerts fire |
 | `INTELLIGENCE_DRIFT_ALERT_DROP` | `0.12` | Accuracy drop threshold |
 
