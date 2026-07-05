@@ -47,6 +47,21 @@ class PaperBroker:
         """Broker identifier."""
         return "paper"
 
+    @property
+    def capabilities(self):
+        """Paper broker supports all features for testing."""
+        from src.broker.base import BrokerCapabilities
+        return BrokerCapabilities(
+            supports_fractional=True,
+            supports_shorting=True,
+            supports_options=False,
+            supports_crypto=True,
+            supports_extended_hours=True,
+            supports_bracket_orders=True,
+            supports_notional_orders=True,
+            supports_stop_limit=True,
+        )
+
     def set_price(self, symbol: str, price: float) -> None:
         """Set the current price for a symbol (for test/simulation use)."""
         with self._lock:
@@ -91,15 +106,32 @@ class PaperBroker:
     # --- Orders ---
 
     def market_order(self, symbol: str, qty: float, side: str,
-                     time_in_force: str = "day") -> dict:
-        """Submit a market order. Fills instantly at last known price."""
+                     time_in_force: str = "day",
+                     client_order_id: Optional[str] = None) -> dict:
+        """Submit a market order. Fills instantly at last known price.
+
+        Args:
+            client_order_id: Idempotency key. If a filled order with the same
+                client_order_id exists, the original order is returned instead
+                of creating a duplicate.
+        """
         with self._lock:
+            # Idempotency check: reject duplicate client_order_id
+            if client_order_id:
+                for existing in self._orders:
+                    if existing.get("client_order_id") == client_order_id:
+                        logger.info("paper_broker.duplicate_order_rejected",
+                                    client_order_id=client_order_id)
+                        return existing
+
             price = self._prices.get(symbol)
             if price is None:
                 raise ValueError(f"No price set for {symbol}. Use set_price() first.")
 
             order = self._create_order(symbol, qty, side, "market",
                                        time_in_force=time_in_force)
+            if client_order_id:
+                order["client_order_id"] = client_order_id
             self._fill_order(order, price)
             logger.info("paper_broker.market_order_filled",
                         symbol=symbol, qty=qty, side=side, price=price)

@@ -16,7 +16,14 @@ logger = get_logger(__name__)
 
 
 def _compute_sharpe(returns: np.ndarray, periods_per_year: float = 252.0) -> float:
-    """Annualized Sharpe ratio from an array of per-trade returns."""
+    """Annualized Sharpe ratio from an array of per-trade returns.
+
+    Args:
+        returns: Array of per-period returns.
+        periods_per_year: Number of trading periods per year.
+            Use src.market_calendar.get_periods_per_year() for calendar-aware values.
+            Default 252 assumes daily equity bars.
+    """
     if len(returns) < 2:
         return 0.0
     mean = np.mean(returns)

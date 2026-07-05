@@ -60,9 +60,13 @@ class TestGenerateEnvContent:
 
         content = _generate_env_content()
         assert "TRADING_MODE=paper" in content
-        assert "ALPACA_PAPER_API_KEY=test_key_12345678" in content
-        assert "TELEGRAM_BOT_TOKEN=123456:ABC-DEF" in content
+        # Secrets must be redacted — never written in plaintext
+        assert "ALPACA_PAPER_API_KEY=REDACTED_USE_ENV_VAR_OR_SECRETS_MANAGER" in content
+        assert "TELEGRAM_BOT_TOKEN=REDACTED_USE_ENV_VAR_OR_SECRETS_MANAGER" in content
         assert "TELEGRAM_CHAT_ID=12345" in content
+        # Ensure actual secret values are NOT present
+        assert "test_key_12345678" not in content
+        assert "123456:ABC-DEF" not in content
 
     def test_env_contains_all_sections(self):
         from config.settings import Settings

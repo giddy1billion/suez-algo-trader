@@ -41,6 +41,7 @@ class SnapshotStore:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._create_tables()
+        self._run_migrations()
 
     def _create_tables(self):
         self._conn.execute("""
@@ -50,6 +51,9 @@ class SnapshotStore:
                 timestamp TEXT NOT NULL,
                 last_event_id INTEGER NOT NULL,
                 state TEXT NOT NULL,
+                schema_version TEXT NOT NULL DEFAULT '1',
+                engine_version TEXT NOT NULL DEFAULT '1.0.0',
+                config_hash TEXT NOT NULL DEFAULT '',
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
         """)
@@ -58,17 +62,45 @@ class SnapshotStore:
         """)
         self._conn.commit()
 
-    def save_snapshot(self, session_id: str, last_event_id: int, state: dict) -> int:
-        """Save a state snapshot. Returns the snapshot ID."""
+    def _run_migrations(self):
+        """Ensure snapshot schema is up-to-date for pre-existing databases."""
+        # Add versioning columns if they don't exist (safe for fresh DBs too)
+        for col, default in [
+            ("schema_version", "'1'"),
+            ("engine_version", "'1.0.0'"),
+            ("config_hash", "''"),
+        ]:
+            try:
+                self._conn.execute(
+                    f"ALTER TABLE snapshots ADD COLUMN {col} TEXT NOT NULL DEFAULT {default}"
+                )
+            except sqlite3.OperationalError:
+                pass  # Column already exists
+        self._conn.commit()
+
+    def save_snapshot(
+        self,
+        session_id: str,
+        last_event_id: int,
+        state: dict,
+        schema_version: str = "1",
+        engine_version: str = "1.0.0",
+        config_hash: str = "",
+    ) -> int:
+        """Save a state snapshot with versioning metadata. Returns the snapshot ID."""
         with self._lock:
             cursor = self._conn.execute(
-                """INSERT INTO snapshots (session_id, timestamp, last_event_id, state)
-                   VALUES (?, ?, ?, ?)""",
+                """INSERT INTO snapshots
+                   (session_id, timestamp, last_event_id, state, schema_version, engine_version, config_hash)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     datetime.now(timezone.utc).isoformat(),
                     last_event_id,
                     json.dumps(state, default=str),
+                    schema_version,
+                    engine_version,
+                    config_hash,
                 )
             )
             self._conn.commit()
@@ -77,16 +109,24 @@ class SnapshotStore:
             return snapshot_id
 
     def get_latest_snapshot(self, session_id: Optional[str] = None) -> Optional[dict]:
-        """Get the most recent snapshot, optionally filtered by session."""
+        """Get the most recent snapshot, optionally filtered by session.
+
+        Returns dict with keys: id, session_id, timestamp, last_event_id, state,
+        schema_version, engine_version, config_hash.
+        """
         with self._lock:
             if session_id:
                 cursor = self._conn.execute(
-                    "SELECT * FROM snapshots WHERE session_id = ? ORDER BY id DESC LIMIT 1",
+                    "SELECT id, session_id, timestamp, last_event_id, state, "
+                    "schema_version, engine_version, config_hash "
+                    "FROM snapshots WHERE session_id = ? ORDER BY id DESC LIMIT 1",
                     (session_id,)
                 )
             else:
                 cursor = self._conn.execute(
-                    "SELECT * FROM snapshots ORDER BY id DESC LIMIT 1"
+                    "SELECT id, session_id, timestamp, last_event_id, state, "
+                    "schema_version, engine_version, config_hash "
+                    "FROM snapshots ORDER BY id DESC LIMIT 1"
                 )
             row = cursor.fetchone()
             if row is None:
@@ -97,6 +137,9 @@ class SnapshotStore:
                 "timestamp": row[2],
                 "last_event_id": row[3],
                 "state": json.loads(row[4]),
+                "schema_version": row[5] if len(row) > 5 else "1",
+                "engine_version": row[6] if len(row) > 6 else "1.0.0",
+                "config_hash": row[7] if len(row) > 7 else "",
             }
 
     def get_snapshot_count(self, session_id: Optional[str] = None) -> int:

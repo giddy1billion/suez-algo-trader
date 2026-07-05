@@ -65,10 +65,16 @@ def _align_data(data: dict[str, pd.DataFrame]) -> tuple[pd.DatetimeIndex, dict[s
     """
     Align all symbol DataFrames to a common DatetimeIndex via union + forward-fill.
 
+    Calendar-aware: symbols are only forward-filled within their valid trading
+    sessions. Crypto bars during equity "closed" hours are preserved without
+    forcing equity NaN fills at those timestamps.
+
     Returns:
         common_index: The unified DatetimeIndex covering all dates.
         aligned: Dict of symbol -> reindexed DataFrame with forward-filled prices.
     """
+    from src.market_calendar import classify_symbol
+
     all_indices = [df.index for df in data.values()]
     common_index = all_indices[0]
     for idx in all_indices[1:]:
@@ -77,7 +83,20 @@ def _align_data(data: dict[str, pd.DataFrame]) -> tuple[pd.DatetimeIndex, dict[s
 
     aligned = {}
     for symbol, df in data.items():
-        reindexed = df.reindex(common_index).ffill()
+        instrument = classify_symbol(symbol)
+        reindexed = df.reindex(common_index)
+
+        if instrument.trades_24_7:
+            # Crypto: forward-fill all gaps (should be continuous)
+            reindexed = reindexed.ffill()
+        else:
+            # Equities: only forward-fill within trading sessions.
+            # Do NOT fill weekend/overnight gaps with stale prices for more than
+            # a reasonable lookback. Use ffill with a limit to avoid propagating
+            # Friday's close across an entire weekend of crypto bars.
+            # Limit = max intraday bars (e.g., 7 hourly bars per NYSE session)
+            reindexed = reindexed.ffill(limit=7)
+
         aligned[symbol] = reindexed
 
     return common_index, aligned

@@ -16,6 +16,12 @@ class TradingMode(str, Enum):
     LIVE = "live"
 
 
+class OperationalMode(str, Enum):
+    RESEARCH = "research"
+    PAPER = "paper"
+    LIVE = "live"
+
+
 class Settings(BaseSettings):
     """Application configuration -- loaded from .env + environment variables."""
 
@@ -54,7 +60,7 @@ class Settings(BaseSettings):
 
     # --- Strategy ---
     active_strategy: str = "momentum"
-    trading_symbols: str = "AAPL,MSFT,GOOGL,AMZN,NVDA"
+    trading_symbols: str = "AAPL,MSFT,GOOGL,AMZN,NVDA,BTC/USD,ETH/USD,SOL/USD,AAVE/USD,ADA/USD"
     timeframe: str = "1Hour"
     lookback_bars: int = 200
 
@@ -161,6 +167,40 @@ class Settings(BaseSettings):
     auto_sweep_interval_hours: int = 12         # Parameter sweep every N hours (0=disabled)
     auto_backtest_symbols: str = ""             # Override symbols for backtest (empty=use trading_symbols)
     auto_train_bars: int = 1000                 # Bars to use for training
+
+    # --- Asset-Class Scheduler ---
+    operational_mode: OperationalMode = OperationalMode.PAPER
+    scheduler_equity_symbols: str = "AAPL,MSFT,GOOGL,AMZN,NVDA"
+    scheduler_crypto_symbols: str = "BTC/USD,ETH/USD,SOL/USD,AAVE/USD,ADA/USD"
+    scheduler_research_cycle_hours: int = 24    # Research cycle interval
+    scheduler_data_accumulation_threshold: int = 100  # Bars before triggering backtest
+
+    # --- Prediction Registry ---
+    prediction_registry_storage_path: str = "data_cache/predictions"
+    prediction_default_horizon_bars: int = 24   # Default prediction horizon
+    prediction_metrics_window: int = 200        # Rolling window for metrics
+
+    # --- Retraining Triggers ---
+    retraining_min_outcomes: int = 500          # Min validated outcomes before retraining
+    retraining_drift_threshold: float = 0.15    # Drift score threshold
+    retraining_max_frequency_hours: int = 48    # Min hours between retrains
+    retraining_scheduled_interval_hours: int = 168  # Fallback weekly schedule
+
+    # --- Portfolio Allocator ---
+    portfolio_correlation_threshold: float = 0.70  # Correlation filter threshold
+    portfolio_max_sector_concentration: float = 0.40  # Max sector weight
+    portfolio_cash_reserve_min: float = 0.10    # Minimum cash reserve
+    portfolio_max_kelly_fraction: float = 0.25  # Kelly criterion cap
+
+    # --- Shadow Deployment ---
+    shadow_min_period_hours: int = 72           # Minimum shadow deployment duration
+    shadow_min_predictions: int = 100           # Min predictions before evaluation
+    shadow_comparison_threshold: float = 0.05   # Max performance gap allowed
+
+    # --- Backtest Triggers ---
+    backtest_trigger_data_threshold: int = 100  # New bars before auto-backtest
+    backtest_trigger_param_change: bool = True  # Trigger on parameter changes
+    backtest_trigger_drift_threshold: float = 0.12  # Drift score to trigger
 
     # --- Execution Simulator ---
     enable_execution_simulator: bool = True     # Enable realistic execution simulation

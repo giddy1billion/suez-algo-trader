@@ -54,6 +54,21 @@ class ReplayBroker:
         """Broker identifier."""
         return "replay"
 
+    @property
+    def capabilities(self):
+        """Replay broker supports all features for backtesting."""
+        from src.broker.base import BrokerCapabilities
+        return BrokerCapabilities(
+            supports_fractional=True,
+            supports_shorting=True,
+            supports_options=False,
+            supports_crypto=True,
+            supports_extended_hours=True,
+            supports_bracket_orders=True,
+            supports_notional_orders=True,
+            supports_stop_limit=True,
+        )
+
     def advance(self, symbol: str, bars: int = 1) -> None:
         """Advance the replay index for a symbol by N bars."""
         with self._lock:

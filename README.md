@@ -20,6 +20,7 @@ Fully manageable via **Telegram** — monitor, trade, configure, backtest, and t
   - [Backtesting & ML Commands](#backtesting--ml-commands)
   - [Advanced Research Commands](#advanced-research-commands)
   - [System & Monitoring Commands](#system--monitoring-commands)
+  - [Sector Management Commands](#sector-management-commands)
   - [Model Governance Commands](#model-governance-commands)
   - [Automated Notifications](#automated-notifications)
 - [Strategies](#strategies)
@@ -579,6 +580,19 @@ Open Positions:             5
 Cash Ratio:            45.2%
 Portfolio Heat:          0.67
 ```
+
+---
+
+### Sector Management Commands
+
+| Command | Description | Example |
+|---------|-------------|---------|
+| `/setsector SYMBOL SECTOR` | Manually classify a symbol's sector (persists to DB) | `/setsector PLTR technology` |
+| `/sectors` | List all manually cached sector classifications | `/sectors` |
+
+**Valid sectors:** `communication_services`, `consumer_discretionary`, `consumer_staples`, `crypto`, `energy`, `financials`, `healthcare`, `industrials`, `materials`, `real_estate`, `technology`, `utilities`
+
+Sector classifications are used by the Portfolio Risk Layer for concentration checks. Symbols that can't be auto-resolved get classified as `unmapped_equity` until manually set via `/setsector`.
 
 ---
 

@@ -15,6 +15,7 @@ from typing import Optional
 from src.broker.alpaca_client import AlpacaBroker
 from src.risk.manager import RiskManager, RiskLimits
 from src.risk.engine import RiskEngine
+from src.execution.sector_lookup import build_sector_map
 from src.risk.models import TradeRequest, RiskDecision
 from src.strategy.base import BaseStrategy, TradeSignal, Signal
 from src.data.store import DatabaseManager
@@ -29,19 +30,6 @@ from src.core.events import (
 from src.core.state_machine import TradeState
 
 logger = get_logger(__name__)
-
-# Static sector map for known trading symbols. Used by PortfolioRiskLayer
-# for sector concentration checks. Extend as new symbols are added.
-_SECTOR_MAP = {
-    "AAPL": "technology", "MSFT": "technology", "GOOGL": "technology",
-    "AMZN": "technology", "NVDA": "technology", "META": "technology",
-    "TSLA": "consumer_discretionary", "AMD": "technology", "INTC": "technology",
-    "NFLX": "communication_services", "DIS": "communication_services",
-    "JPM": "financials", "BAC": "financials", "GS": "financials",
-    "JNJ": "healthcare", "UNH": "healthcare", "PFE": "healthcare",
-    "XOM": "energy", "CVX": "energy",
-    "WMT": "consumer_staples", "PG": "consumer_staples",
-}
 
 # Lazy-initialized trade journal (double-checked locking)
 _journal = None
@@ -232,11 +220,23 @@ class ExecutionEngine:
         if self.intelligence_orchestrator:
             symbol_df = market_data.get(signal.symbol) if market_data else None
             portfolio_context = self._build_portfolio_context(positions, portfolio_value, signal.symbol)
+            # Build market context from available data
+            market_context = None
+            if symbol_df is not None and len(symbol_df) > 0:
+                market_context = {
+                    "symbol": signal.symbol,
+                    "last_price": signal.price,
+                    "volume": symbol_df["volume"].iloc[-1] if "volume" in symbol_df.columns else 0,
+                    "bar_count": len(symbol_df),
+                }
             intelligence_decision = self.intelligence_orchestrator.evaluate_signal(
                 strategy_name=self._current_strategy_name,
                 signal_confidence=signal.confidence,
+                symbol=signal.symbol,
+                side=side,
                 indicators=signal.indicators,
                 df=symbol_df,
+                market_context=market_context,
                 portfolio_context=portfolio_context,
             )
             if not intelligence_decision.accepted:
@@ -300,11 +300,20 @@ class ExecutionEngine:
         try:
             account = self.broker.get_account()
             cash = account.get('cash', 0.0)
-        except Exception:
-            cash = portfolio_value * 0.5
+        except Exception as e:
+            logger.error(
+                "engine.broker_unavailable",
+                symbol=signal.symbol,
+                error=type(e).__name__,
+            )
+            # Do NOT invent portfolio state — abort this signal and let the caller retry
+            return None
 
         # Build market_data context for risk engine
-        risk_market_data = {"sector_map": _SECTOR_MAP}
+        # Dynamic sector map: includes signal symbol + all current position symbols
+        position_symbols = [p.get('symbol', '') for p in positions] if positions else []
+        all_symbols = list(set([signal.symbol] + position_symbols))
+        risk_market_data = {"sector_map": build_sector_map(all_symbols, db=self.db)}
         if market_data and signal.symbol in market_data:
             df = market_data[signal.symbol]
             if len(df) > 0:
@@ -430,6 +439,11 @@ class ExecutionEngine:
         if trade_lifecycle:
             trade_lifecycle.transition(TradeState.SUBMITTED, "order submitted to broker")
 
+        # Generate idempotent client_order_id to prevent duplicate executions
+        import hashlib
+        _idempotency_seed = f"{signal.symbol}:{side}:{final_qty}:{signal.price}:{self._cycle_count}"
+        client_order_id = hashlib.sha256(_idempotency_seed.encode()).hexdigest()[:32]
+
         # Place the order
         try:
             if signal.stop_loss and signal.take_profit:
@@ -445,6 +459,7 @@ class ExecutionEngine:
                     symbol=signal.symbol,
                     qty=final_qty,
                     side=side,
+                    client_order_id=client_order_id,
                 )
 
             # Publish OrderSubmitted event

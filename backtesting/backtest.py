@@ -63,6 +63,16 @@ class BacktestResult:
     max_consecutive_losses: int = 0
     trades: list[BacktestTrade] = field(default_factory=list)
     equity_curve: list[float] = field(default_factory=list)
+    # Enhanced metrics (Phase 2)
+    cagr: float = 0.0
+    sortino_ratio: float = 0.0
+    calmar_ratio: float = 0.0
+    expectancy: float = 0.0
+    exposure_pct: float = 0.0
+    trade_count: int = 0
+    trigger_reason: str = ""
+    run_timestamp: str = ""
+    parameters_hash: str = ""
 
     @property
     def total_return_pct(self) -> float:
@@ -75,20 +85,25 @@ class BacktestResult:
             f"{'='*60}\n"
             f"Symbol:        {self.symbol} ({self.timeframe})\n"
             f"Period:        {self.start_date} -> {self.end_date}\n"
-            f"{'â”€'*60}\n"
+            f"{'─'*60}\n"
             f"Initial:       ${self.initial_capital:,.2f}\n"
             f"Final:         ${self.final_capital:,.2f}\n"
             f"Total Return:  {self.total_return_pct:.2%}\n"
-            f"{'â”€'*60}\n"
+            f"CAGR:          {self.cagr:.2%}\n"
+            f"{'─'*60}\n"
             f"Total Trades:  {self.total_trades}\n"
             f"Win Rate:      {self.win_rate:.1%}\n"
             f"Profit Factor: {self.profit_factor:.2f}\n"
+            f"Expectancy:    ${self.expectancy:.2f}\n"
             f"Avg Trade:     ${self.avg_trade_pnl:.2f}\n"
             f"Avg Win:       ${self.avg_win:.2f}\n"
             f"Avg Loss:      ${self.avg_loss:.2f}\n"
-            f"{'â”€'*60}\n"
+            f"{'─'*60}\n"
             f"Max Drawdown:  {self.max_drawdown:.2%}\n"
             f"Sharpe Ratio:  {self.sharpe_ratio:.3f}\n"
+            f"Sortino Ratio: {self.sortino_ratio:.3f}\n"
+            f"Calmar Ratio:  {self.calmar_ratio:.3f}\n"
+            f"Exposure:      {self.exposure_pct:.1%}\n"
             f"Max Consec. L: {self.max_consecutive_losses}\n"
             f"{'='*60}\n"
         )
@@ -285,11 +300,15 @@ class Backtester:
             dd = (peak - eq) / peak
             max_dd = max(max_dd, dd)
 
-        # Sharpe ratio (annualized, assuming daily)
+        # Sharpe ratio (annualized, calendar-aware)
         if len(equity_curve) > 1:
             returns = pd.Series(equity_curve).pct_change().dropna()
             if returns.std() > 0:
-                sharpe = (returns.mean() / returns.std()) * np.sqrt(252)
+                # Use calendar-aware annualization factor
+                from src.market_calendar import classify_symbol, get_annualization_factor
+                instrument = classify_symbol(symbol)
+                ann_factor = get_annualization_factor(instrument, self.strategy.timeframe)
+                sharpe = (returns.mean() / returns.std()) * ann_factor
             else:
                 sharpe = 0.0
         else:
@@ -305,6 +324,49 @@ class Backtester:
             else:
                 current_consec = 0
 
+        # Enhanced metrics (Phase 2)
+        # CAGR
+        total_bars = len(data) - self.strategy.lookback
+        bars_per_year = ann_factor ** 2 if 'ann_factor' in dir() else 252
+        try:
+            from src.market_calendar import classify_symbol, get_annualization_factor
+            instrument = classify_symbol(symbol)
+            bars_per_year_val = get_annualization_factor(instrument, self.strategy.timeframe) ** 2
+        except Exception:
+            bars_per_year_val = 252 * 6.5  # Default for hourly equity
+        years = total_bars / bars_per_year_val if bars_per_year_val > 0 else 1
+        if years > 0 and final_capital > 0 and self.initial_capital > 0:
+            cagr = (final_capital / self.initial_capital) ** (1 / max(years, 0.01)) - 1
+        else:
+            cagr = 0.0
+
+        # Sortino ratio (annualized, using downside deviation)
+        sortino = 0.0
+        if len(equity_curve) > 1:
+            returns_series = pd.Series(equity_curve).pct_change().dropna()
+            downside = returns_series[returns_series < 0]
+            if len(downside) > 0 and downside.std() > 0:
+                try:
+                    ann_f = get_annualization_factor(instrument, self.strategy.timeframe)
+                except Exception:
+                    ann_f = np.sqrt(252 * 6.5)
+                sortino = (returns_series.mean() / downside.std()) * ann_f
+
+        # Calmar ratio (CAGR / max drawdown)
+        calmar = cagr / max_dd if max_dd > 0 else 0.0
+
+        # Expectancy (avg win × win rate - avg loss × loss rate)
+        win_rate_val = len(wins) / len(trades) if trades else 0
+        loss_rate_val = len(losses) / len(trades) if trades else 0
+        avg_win_val = float(np.mean(wins)) if wins else 0.0
+        avg_loss_val = float(np.mean(losses)) if losses else 0.0
+        expectancy = (avg_win_val * win_rate_val) + (avg_loss_val * loss_rate_val)
+
+        # Exposure % (fraction of bars with an open position)
+        bars_in_market = sum(1 for t in trades for _ in range(t.hold_bars))
+        exposure_pct = bars_in_market / total_bars if total_bars > 0 else 0.0
+        exposure_pct = min(exposure_pct, 1.0)
+
         return BacktestResult(
             strategy_name=self.strategy.name,
             symbol=symbol,
@@ -319,12 +381,20 @@ class Backtester:
             total_pnl=sum(pnls),
             max_drawdown=max_dd,
             sharpe_ratio=sharpe,
-            win_rate=len(wins) / len(trades) if trades else 0,
+            win_rate=win_rate_val,
             profit_factor=abs(sum(wins) / sum(losses)) if losses else float('inf'),
-            avg_trade_pnl=np.mean(pnls) if pnls else 0,
-            avg_win=np.mean(wins) if wins else 0,
-            avg_loss=np.mean(losses) if losses else 0,
+            avg_trade_pnl=float(np.mean(pnls)) if pnls else 0,
+            avg_win=avg_win_val,
+            avg_loss=avg_loss_val,
             max_consecutive_losses=max_consec,
             trades=trades,
             equity_curve=equity_curve,
+            # Enhanced metrics
+            cagr=cagr,
+            sortino_ratio=sortino,
+            calmar_ratio=calmar,
+            expectancy=expectancy,
+            exposure_pct=exposure_pct,
+            trade_count=len(trades),
+            run_timestamp=datetime.now().isoformat(),
         )

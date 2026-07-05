@@ -123,9 +123,13 @@ async def cmd_setalpaca(message: Message):
         api_key = parts[2].strip()
         secret_key = parts[3].strip()
 
-        # Basic validation
-        if len(api_key) < 10 or len(secret_key) < 10:
-            await message.answer("❌ Keys seem too short. Alpaca keys are typically 20+ characters.")
+        # Strict validation: Alpaca keys are alphanumeric, 20+ chars
+        import re as _re
+        _ALPACA_KEY_PATTERN = _re.compile(r'^[A-Za-z0-9]{20,}$')
+        if not _ALPACA_KEY_PATTERN.match(api_key) or not _ALPACA_KEY_PATTERN.match(secret_key):
+            await message.answer(
+                "❌ Invalid key format. Alpaca keys must be 20+ alphanumeric characters."
+            )
             return
 
         if sub_cmd == "paper":
@@ -186,8 +190,31 @@ async def cmd_setalpaca(message: Message):
         if mode not in ("paper", "live"):
             await message.answer("❌ Mode must be 'paper' or 'live'.")
             return
-        if not url.startswith("http"):
-            await message.answer("❌ URL must start with http:// or https://")
+
+        # Strict URL validation: HTTPS only, allowlisted Alpaca domains
+        _ALLOWED_BROKER_HOSTS = {
+            "paper-api.alpaca.markets",
+            "api.alpaca.markets",
+            "data.alpaca.markets",
+            "broker-api.alpaca.markets",
+        }
+        from urllib.parse import urlparse
+        try:
+            parsed = urlparse(url)
+        except Exception:
+            await message.answer("❌ Invalid URL format.")
+            return
+
+        if parsed.scheme != "https":
+            await message.answer("❌ Only HTTPS URLs are allowed for broker endpoints.")
+            return
+        if parsed.hostname not in _ALLOWED_BROKER_HOSTS:
+            allowed_list = ", ".join(sorted(_ALLOWED_BROKER_HOSTS))
+            await message.answer(
+                f"❌ URL hostname not allowed.\n\n"
+                f"<b>Allowed hosts:</b>\n<code>{allowed_list}</code>",
+                parse_mode=ParseMode.HTML,
+            )
             return
 
         if mode == "paper":
@@ -531,11 +558,46 @@ async def cmd_newstrategy(message: Message):
         )
         return
 
+    # Input validation
+    import re as _re
+    _NAME_PATTERN = _re.compile(r'^[a-z][a-z0-9_]{0,31}$')
+    _SYMBOL_PATTERN = _re.compile(r'^[A-Z0-9/]{1,10}$')
+    _TIMEFRAME_WHITELIST = {"1Min", "5Min", "15Min", "30Min", "1Hour", "4Hour", "1Day", "1Week"}
+
     name = parts[1].lower()
+    if not _NAME_PATTERN.match(name):
+        await message.answer(
+            "❌ Invalid strategy name. Use lowercase letters, digits, underscores. "
+            "Must start with a letter. Max 32 chars."
+        )
+        return
+
     template = parts[2].lower()
     symbols = [s.strip().upper() for s in parts[3].split(",") if s.strip()]
+
+    if not symbols or len(symbols) > 50:
+        await message.answer("❌ Provide 1-50 valid symbols.")
+        return
+
+    for sym in symbols:
+        if not _SYMBOL_PATTERN.match(sym):
+            await message.answer(f"❌ Invalid symbol: {sym}. Use uppercase letters, digits, and /.")
+            return
+
     timeframe = parts[4] if len(parts) > 4 else "1Hour"
-    interval = int(parts[5]) if len(parts) > 5 else 60
+    if timeframe not in _TIMEFRAME_WHITELIST:
+        await message.answer(
+            f"❌ Invalid timeframe. Allowed: {', '.join(sorted(_TIMEFRAME_WHITELIST))}"
+        )
+        return
+
+    try:
+        interval = int(parts[5]) if len(parts) > 5 else 60
+        if not (10 <= interval <= 86400):
+            raise ValueError("out of range")
+    except (ValueError, IndexError):
+        await message.answer("❌ Interval must be a number between 10 and 86400 seconds.")
+        return
 
     success, msg = _strategy_store.create(
         name=name,
@@ -893,24 +955,33 @@ async def cmd_applystrats(message: Message):
 
 
 def _generate_env_content() -> str:
-    """Generate .env file content from current settings."""
+    """Generate .env file content from current settings.
+
+    SECURITY: Secrets are written as placeholders. Users must set them
+    via environment variables or a secrets manager — never in plaintext files.
+    """
+    _REDACTED = "REDACTED_USE_ENV_VAR_OR_SECRETS_MANAGER"
+
     lines = [
         "# ============================================================================",
         "# ALPACA ALGO TRADER — ENVIRONMENT CONFIGURATION",
         "# ============================================================================",
         f"# Auto-saved: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}",
+        "#",
+        "# ⚠️  SECRETS ARE NOT EXPORTED. Set them via environment variables or a",
+        "#     secrets manager (Vault, AWS Secrets Manager, Azure Key Vault).",
         "",
         "# --- Account Mode ---",
         f"TRADING_MODE={_settings.trading_mode.value}",
         "",
         "# --- Alpaca Paper Trading ---",
-        f"ALPACA_PAPER_API_KEY={_settings.alpaca_paper_api_key}",
-        f"ALPACA_PAPER_SECRET_KEY={_settings.alpaca_paper_secret_key}",
+        f"ALPACA_PAPER_API_KEY={_REDACTED}",
+        f"ALPACA_PAPER_SECRET_KEY={_REDACTED}",
         f"ALPACA_PAPER_BASE_URL={_settings.alpaca_paper_base_url}",
         "",
         "# --- Alpaca Live Trading ---",
-        f"ALPACA_LIVE_API_KEY={_settings.alpaca_live_api_key}",
-        f"ALPACA_LIVE_SECRET_KEY={_settings.alpaca_live_secret_key}",
+        f"ALPACA_LIVE_API_KEY={_REDACTED}",
+        f"ALPACA_LIVE_SECRET_KEY={_REDACTED}",
         f"ALPACA_LIVE_BASE_URL={_settings.alpaca_live_base_url}",
         "",
         "# --- Data Feed ---",
@@ -970,9 +1041,9 @@ def _generate_env_content() -> str:
         f"INTELLIGENCE_DRIFT_ALERT_DROP={_settings.intelligence_drift_alert_drop}",
         "",
         "# --- Notifications ---",
-        f"TELEGRAM_BOT_TOKEN={_settings.telegram_bot_token}",
+        f"TELEGRAM_BOT_TOKEN={_REDACTED}",
         f"TELEGRAM_CHAT_ID={_settings.telegram_chat_id}",
-        f"DISCORD_WEBHOOK_URL={_settings.discord_webhook_url}",
+        f"DISCORD_WEBHOOK_URL={_REDACTED}",
         f"NOTIFY_ON_TRADE={'true' if _settings.notify_on_trade else 'false'}",
         f"NOTIFY_ON_ERROR={'true' if _settings.notify_on_error else 'false'}",
         f"NOTIFY_ON_SIGNAL={'true' if _settings.notify_on_signal else 'false'}",
