@@ -1023,22 +1023,24 @@ class ExecutionEngine:
         """Log clean TradeSignal to database with full provenance."""
         import json
         try:
-            log_data = {
+            # Build extended indicators JSON (includes signal_id + intelligence)
+            extended_indicators = dict(signal.indicators)
+            extended_indicators["_signal_id"] = signal.signal_id
+            if intelligence_decision:
+                extended_indicators["_intelligence_score"] = round(intelligence_decision.final_score, 4)
+                extended_indicators["_intelligence_regime"] = getattr(
+                    intelligence_decision, 'market_state', None
+                ) and intelligence_decision.market_state.overall_regime or ""
+
+            self.db.log_signal({
                 "symbol": signal.symbol,
                 "strategy": signal.strategy_id,
                 "signal": signal.side.value,
                 "confidence": signal.signal_strength,
                 "price_at_signal": signal.features.get("observed_price", 0.0),
-                "indicators": json.dumps(signal.indicators),
+                "indicators": json.dumps(extended_indicators),
                 "was_executed": executed,
-                "signal_id": signal.signal_id,
-            }
-            if intelligence_decision:
-                log_data["intelligence_score"] = round(intelligence_decision.final_score, 4)
-                log_data["intelligence_regime"] = getattr(
-                    intelligence_decision, 'market_state', None
-                ) and intelligence_decision.market_state.overall_regime or ""
-            self.db.log_signal(log_data)
+            })
         except Exception as e:
             logger.error("engine.signal_log_error", error=str(e))
 
