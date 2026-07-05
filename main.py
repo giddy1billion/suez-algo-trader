@@ -85,20 +85,28 @@ if hasattr(signal, 'SIGBREAK'):
 # ──────────────────────────────────────────────────────────────────────────
 
 def create_strategy(name: str, symbols: list[str], timeframe: str, lookback: int):
-    """Factory to create strategy instances by name, using settings for params."""
+    """Factory to create strategy instances by name, using settings for params.
+    
+    Automatically detects asset class from symbols and applies appropriate
+    parameters (crypto vs equity) for the momentum strategy.
+    """
     from src.strategy.composable import momentum_preset, mean_reversion_preset
+
+    # Detect if symbols are crypto — apply crypto-optimized parameters
+    is_crypto = any("/" in s or s.endswith("USD") for s in symbols)
 
     strategies = {
         "momentum": lambda: MomentumStrategy(
             symbols=symbols, timeframe=timeframe, lookback=lookback,
-            fast_ema=settings.momentum_fast_ema,
-            slow_ema=settings.momentum_slow_ema,
+            fast_ema=settings.crypto_momentum_fast_ema if is_crypto else settings.momentum_fast_ema,
+            slow_ema=settings.crypto_momentum_slow_ema if is_crypto else settings.momentum_slow_ema,
             rsi_period=settings.momentum_rsi_period,
-            rsi_oversold=settings.momentum_rsi_oversold,
-            rsi_overbought=settings.momentum_rsi_overbought,
+            rsi_oversold=settings.crypto_momentum_rsi_oversold if is_crypto else settings.momentum_rsi_oversold,
+            rsi_overbought=settings.crypto_momentum_rsi_overbought if is_crypto else settings.momentum_rsi_overbought,
             atr_period=settings.momentum_atr_period,
-            atr_sl_multiplier=settings.momentum_atr_sl_mult,
-            atr_tp_multiplier=settings.momentum_atr_tp_mult,
+            atr_sl_multiplier=settings.crypto_momentum_atr_sl_mult if is_crypto else settings.momentum_atr_sl_mult,
+            atr_tp_multiplier=settings.crypto_momentum_atr_tp_mult if is_crypto else settings.momentum_atr_tp_mult,
+            min_confirming_indicators=settings.crypto_min_confirming_indicators if is_crypto else 2,
         ),
         "mean_reversion": lambda: MeanReversionStrategy(
             symbols=symbols, timeframe=timeframe, lookback=lookback,
@@ -414,12 +422,12 @@ def cmd_run(
                 logger.warning("orchestrator.ml_strategy_unavailable", error=str(e))
 
             if crypto_symbols:
-                crypto_strat = create_strategy("momentum", crypto_symbols, "5Min", lookback)
+                crypto_strat = create_strategy("momentum", crypto_symbols, settings.crypto_timeframe, lookback)
                 orchestrator.add_strategy(
                     name="crypto_momentum",
                     strategy=crypto_strat,
                     symbols=crypto_symbols,
-                    timeframe="5Min",
+                    timeframe=settings.crypto_timeframe,
                     interval=max(30, interval // 2),
                     weight=0.8,
                 )
@@ -1013,12 +1021,13 @@ def cmd_run(
                 results_text = [f"<b>🔄 Auto-Backtest Results</b>\n{'=' * 30}\n"]
                 for sym in bt_symbols:
                     try:
+                        # Resolve asset-class-aware parameters (includes timeframe)
+                        params = get_backtest_config(sym)
+                        sym_timeframe = params.get("timeframe", timeframe)
                         with _broker_lock:
-                            df = broker.get_bars_df(sym, timeframe, limit=500)
+                            df = broker.get_bars_df(sym, sym_timeframe, limit=500)
                         if df is None or len(df) < 50:
                             continue
-                        # Resolve asset-class-aware parameters via LayeredConfig
-                        params = get_backtest_config(sym)
                         metrics = vectorbt_momentum_backtest(
                             df,
                             fast_ema=params["fast_ema"],

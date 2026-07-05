@@ -39,6 +39,7 @@ class MomentumStrategy(BaseStrategy):
         atr_tp_multiplier: float = 3.0,
         volume_ma_period: int = 20,
         volume_spike_threshold: float = 1.5,
+        min_confirming_indicators: int = 2,
     ):
         super().__init__(name="momentum", symbols=symbols, timeframe=timeframe, lookback=lookback)
 
@@ -53,6 +54,7 @@ class MomentumStrategy(BaseStrategy):
         self.atr_tp_multiplier = atr_tp_multiplier
         self.volume_ma_period = volume_ma_period
         self.volume_spike_threshold = volume_spike_threshold
+        self.min_confirming_indicators = min_confirming_indicators
 
     def calculate_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         """Calculate all technical indicators for the momentum strategy."""
@@ -180,12 +182,13 @@ class MomentumStrategy(BaseStrategy):
         # Calculate confidence
         confidence = np.mean(confidence_factors) if confidence_factors else 0.0
 
-        # Require at least 2 confirming indicators for a BUY/SELL signal.
+        # Require minimum confirming indicators for a BUY/SELL signal.
         # A single weak indicator (e.g., just "below slow EMA") should not
         # generate actionable signals — it produces score=±1 at confidence=0.5
         # which fires every cycle for every symbol, creating signal spam.
+        # For crypto (min_confirming_indicators=1), single strong signals are allowed.
         confirming_count = len(confidence_factors)
-        if confirming_count < 2 and abs(score) <= 1:
+        if confirming_count < self.min_confirming_indicators and abs(score) <= 1:
             signal = Signal.HOLD
         elif score >= 3:
             signal = Signal.STRONG_BUY

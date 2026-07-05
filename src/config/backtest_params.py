@@ -34,6 +34,7 @@ _SYSTEM_DEFAULTS = {
     "atr_stop_multiplier": 2.0,
     "cooldown_bars": 0,
     "annualization_periods": 252.0,
+    "timeframe": "1Hour",
 }
 
 for key, value in _SYSTEM_DEFAULTS.items():
@@ -51,6 +52,7 @@ _EQUITY_OVERRIDES = {
     "atr_stop_multiplier": 2.0,
     "cooldown_bars": 2,
     "annualization_periods": 252.0,
+    "timeframe": "1Hour",
 }
 
 _CRYPTO_OVERRIDES = {
@@ -61,6 +63,7 @@ _CRYPTO_OVERRIDES = {
     "atr_stop_multiplier": 2.5,
     "cooldown_bars": 4,
     "annualization_periods": 365.0,
+    "timeframe": "15Min",     # Higher resolution for 24/7 crypto markets
 }
 
 for key, value in _EQUITY_OVERRIDES.items():
@@ -99,6 +102,7 @@ def get_backtest_config(symbol: str) -> dict:
         "atr_stop_multiplier": backtest_params.get("atr_stop_multiplier", exchange=exchange_context),
         "cooldown_bars": backtest_params.get("cooldown_bars", exchange=exchange_context),
         "annualization_periods": backtest_params.get("annualization_periods", exchange=exchange_context),
+        "timeframe": backtest_params.get("timeframe", exchange=exchange_context),
     }
 
 
