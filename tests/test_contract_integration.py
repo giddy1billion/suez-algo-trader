@@ -435,3 +435,251 @@ class TestContractExpiry:
         decision = engine.evaluate(request=request, portfolio_value=100000.0, cash=50000.0)
         assert not decision.approved
         assert "Decision contract rejected" in decision.reasons[0]
+
+
+
+# ???????????????????????????????????????????????????????????????????????????????
+# System-Wide Contract Integration Tests
+# ???????????????????????????????????????????????????????????????????????????????
+
+
+class TestContractIdFlowsSystemWide:
+    """Verify contract_id flows through ALL system components end-to-end."""
+
+    def test_trade_opened_event_carries_contract_id(self):
+        """TradeOpened event carries contract_id field."""
+        from src.core.events import TradeOpened
+
+        event = TradeOpened(
+            trade_id="T-001",
+            symbol="BTC/USD",
+            side="BUY",
+            entry_price=67000.0,
+            qty=0.1,
+            contract_id="DC-abc123",
+        )
+        assert event.contract_id == "DC-abc123"
+        # Verify serializable
+        d = event.to_dict()
+        assert d["contract_id"] == "DC-abc123"
+
+    def test_trade_closed_event_carries_contract_id(self):
+        """TradeClosed event carries contract_id for feedback loop."""
+        from src.core.events import TradeClosed
+
+        event = TradeClosed(
+            trade_id="T-001",
+            symbol="BTC/USD",
+            exit_price=68000.0,
+            pnl=100.0,
+            pnl_pct=1.49,
+            reason="take_profit",
+            contract_id="DC-abc123",
+        )
+        assert event.contract_id == "DC-abc123"
+        d = event.to_dict()
+        assert d["contract_id"] == "DC-abc123"
+
+    def test_risk_evaluated_event_carries_contract_id(self):
+        """RiskEvaluated event carries contract_id."""
+        from src.core.events import RiskEvaluated
+
+        event = RiskEvaluated(
+            symbol="BTC/USD",
+            approved=True,
+            risk_score=0.85,
+            contract_id="DC-xyz789",
+        )
+        assert event.contract_id == "DC-xyz789"
+
+    def test_trade_scorecard_carries_contract_fields(self):
+        """TradeScorecard has contract_id, contract_decision, contract_confidence."""
+        from src.ml.feedback_loop import TradeScorecard
+        from datetime import datetime, timezone
+
+        scorecard = TradeScorecard(
+            trade_id="T-001",
+            signal_id="SIG-001",
+            symbol="ETH/USD",
+            timestamp=datetime.now(timezone.utc),
+            predicted_direction="buy",
+            actual_profitable=True,
+            predicted_confidence=0.82,
+            predicted_win_probability=0.75,
+            predicted_return_pct=3.0,
+            actual_return_pct=2.5,
+            predicted_risk_reward=2.0,
+            actual_risk_reward=1.8,
+            predicted_duration_minutes=120,
+            actual_duration_minutes=90,
+            entry_price=3500.0,
+            exit_price=3587.5,
+            stop_loss_price=3400.0,
+            stop_loss_hit=False,
+            take_profit_prices=[3600.0],
+            take_profit_reached=[False],
+            max_favorable_excursion=3600.0,
+            max_adverse_excursion=3480.0,
+            model_version="v14.3",
+            strategy_name="momentum",
+            market_regime="trending",
+            volatility_level="medium",
+            contract_id="DC-eth001",
+            contract_decision="execute",
+            contract_confidence=0.82,
+        )
+        assert scorecard.contract_id == "DC-eth001"
+        assert scorecard.contract_decision == "execute"
+        assert scorecard.contract_confidence == 0.82
+
+    def test_audit_trail_carries_contract_id(self):
+        """TradeAuditTrail has contract_id field for full traceability."""
+        from src.core.audit_log import TradeAuditTrail
+
+        trail = TradeAuditTrail(
+            trade_id="T-001",
+            signal_id="SIG-001",
+            contract_id="DC-audit001",
+            prediction_id="PRED-001",
+            model_version="v14.3",
+        )
+        assert trail.contract_id == "DC-audit001"
+        d = trail.to_dict()
+        assert d["contract_id"] == "DC-audit001"
+        assert trail.is_complete()
+
+    def test_journal_entry_model_has_contract_id(self):
+        """JournalEntry SQLAlchemy model has contract_id column."""
+        from src.data.store import JournalEntry
+
+        assert hasattr(JournalEntry, "contract_id")
+
+    def test_trade_model_has_contract_id(self):
+        """Trade SQLAlchemy model has contract_id column."""
+        from src.data.store import Trade
+
+        assert hasattr(Trade, "contract_id")
+
+    def test_experience_db_stores_contract_id(self):
+        """ExperienceDatabase tables include contract_id columns."""
+        import tempfile, shutil
+        from src.ml.feedback_loop import ExperienceDatabase, TradeScorecard
+        from datetime import datetime, timezone
+
+        tmp = tempfile.mkdtemp()
+        try:
+            db = ExperienceDatabase(storage_path=tmp)
+            # Record a trade with contract_id
+            scorecard = TradeScorecard(
+                trade_id="T-exp001",
+                signal_id="SIG-exp001",
+                symbol="SOL/USD",
+                timestamp=datetime.now(timezone.utc),
+                predicted_direction="buy",
+                actual_profitable=True,
+                predicted_confidence=0.78,
+                predicted_win_probability=0.70,
+                predicted_return_pct=5.0,
+                actual_return_pct=4.2,
+                predicted_risk_reward=2.5,
+                actual_risk_reward=2.1,
+                predicted_duration_minutes=60,
+                actual_duration_minutes=45,
+                entry_price=150.0,
+                exit_price=156.3,
+                stop_loss_price=145.0,
+                stop_loss_hit=False,
+                take_profit_prices=[160.0],
+                take_profit_reached=[False],
+                max_favorable_excursion=157.0,
+                max_adverse_excursion=148.5,
+                model_version="v2.1",
+                strategy_name="momentum",
+                market_regime="trending",
+                volatility_level="high",
+                contract_id="DC-sol-test",
+                contract_decision="execute",
+                contract_confidence=0.78,
+            )
+            db.record_trade(scorecard)
+
+            # Verify stored in predictions table
+            result = db._conn.execute(
+                "SELECT contract_id FROM predictions WHERE trade_id = ?",
+                ["T-exp001"]
+            ).fetchone()
+            assert result[0] == "DC-sol-test"
+
+            # Verify stored in outcomes table
+            result = db._conn.execute(
+                "SELECT contract_id, contract_decision, contract_confidence FROM outcomes WHERE trade_id = ?",
+                ["T-exp001"]
+            ).fetchone()
+            assert result[0] == "DC-sol-test"
+            assert result[1] == "execute"
+            assert result[2] == 0.78
+
+            # Verify stored in scorecards table
+            result = db._conn.execute(
+                "SELECT contract_id FROM scorecards WHERE trade_id = ?",
+                ["T-exp001"]
+            ).fetchone()
+            assert result[0] == "DC-sol-test"
+
+            db._conn.close()
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_notification_includes_contract_id(self):
+        """NotificationManager.notify_trade() includes contract_id in message."""
+        pytest.importorskip("httpx")
+        from src.notifications.alerts import NotificationManager
+        from unittest.mock import patch
+
+        mgr = NotificationManager(notify_trades=True)
+        sent_messages = []
+
+        with patch.object(mgr, "_send", side_effect=lambda msg: sent_messages.append(msg)):
+            mgr.notify_trade({
+                "symbol": "BTC/USD",
+                "side": "BUY",
+                "qty": 0.5,
+                "price": 67000.0,
+                "signal_confidence": 0.82,
+                "contract_id": "DC-notif-test-12345678",
+            })
+
+        assert len(sent_messages) == 1
+        assert "DC-notif-test" in sent_messages[0]
+
+    def test_backward_compat_no_contract_id(self):
+        """All components work fine without contract_id (backward compatible)."""
+        from src.core.events import TradeOpened, TradeClosed, RiskEvaluated
+        from src.core.audit_log import TradeAuditTrail
+
+        # Events work without contract_id
+        opened = TradeOpened(trade_id="T-001", symbol="AAPL", side="BUY")
+        assert opened.contract_id == ""
+
+        closed = TradeClosed(trade_id="T-001", symbol="AAPL")
+        assert closed.contract_id == ""
+
+        risk = RiskEvaluated(symbol="AAPL", approved=True)
+        assert risk.contract_id == ""
+
+        # AuditTrail works without contract_id
+        trail = TradeAuditTrail(trade_id="T-001")
+        assert trail.contract_id == ""
+
+    def test_backward_compat_notifications_no_contract(self):
+        """Notifications work without contract_id."""
+        pytest.importorskip("httpx")
+        from src.notifications.alerts import NotificationManager
+        from unittest.mock import patch
+
+        mgr = NotificationManager(notify_trades=True)
+        sent = []
+        with patch.object(mgr, "_send", side_effect=lambda msg: sent.append(msg)):
+            mgr.notify_trade({"symbol": "AAPL", "side": "BUY", "qty": 10, "price": 150.0, "signal_confidence": 0.7})
+        assert len(sent) == 1
+        assert "Contract" not in sent[0]  # No contract line when absent

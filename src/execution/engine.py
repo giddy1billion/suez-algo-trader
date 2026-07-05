@@ -645,6 +645,7 @@ class ExecutionEngine:
             reasons=decision.reasons,
             adjusted_qty=decision.adjusted_qty,
             risk_score=getattr(decision, 'risk_score', 0.0),
+            contract_id=decision_contract.contract_id if decision_contract else "",
             source="risk_engine",
         ))
 
