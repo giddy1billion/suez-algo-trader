@@ -75,16 +75,28 @@ class RuntimeManager:
             event_bus=event_bus,
             auto_reload=True,
         )
+
+        # Closed-loop feedback components
+        from src.ml.feedback_loop import ExperienceDatabase
+        from src.ml.promotion_engine import ModelPromotionEngine
+        self._experience_db = ExperienceDatabase()
+        self._promotion_engine = ModelPromotionEngine(
+            min_evaluation_trades=30,
+            min_improvement_pct=5.0,
+        )
+
         self._training_pipeline = TrainingPipeline(
             registry=self._registry,
             governance=self._governance,
             broker=broker_manager.broker,
             event_bus=event_bus,
+            experience_db=self._experience_db,
         )
         self._ab_manager = ABTestManager(
             registry=self._registry,
             predictor=self._predictor,
             event_bus=event_bus,
+            promotion_engine=self._promotion_engine,
         )
 
         # Backtesting

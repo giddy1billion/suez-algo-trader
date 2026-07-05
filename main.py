@@ -517,6 +517,40 @@ def cmd_run(
         min_risk_reward=1.0,
     )
 
+    # ─── Closed-Loop Feedback System ────────────────────────────────────────
+    # Transforms every trade outcome into training data for model improvement.
+    from src.ml.feedback_loop import (
+        ExperienceDatabase, PostTradeValidator, ContinuousCalibrationMonitor
+    )
+    from src.ml.promotion_engine import ModelPromotionEngine
+
+    experience_db = ExperienceDatabase()
+    post_trade_validator = PostTradeValidator(experience_db)
+    calibration_monitor = ContinuousCalibrationMonitor(experience_db, tolerance=0.12)
+    promotion_engine = ModelPromotionEngine(
+        min_evaluation_trades=30,
+        min_improvement_pct=5.0,
+    )
+
+    # Subscribe TradeClosed events to the post-trade validator
+    def _on_trade_closed(event):
+        """Record every trade close as a training sample."""
+        try:
+            trade_result = {
+                "trade_id": event.trade_id,
+                "symbol": event.symbol,
+                "exit_price": event.exit_price,
+                "pnl": event.pnl,
+                "pnl_pct": event.pnl_pct,
+                "reason": event.reason,
+            }
+            post_trade_validator.validate_trade(trade_result)
+        except Exception as e:
+            logger.debug("feedback_loop.score_error", error=str(e))
+
+    from src.core.events import TradeClosed as _TradeClosed
+    event_bus.subscribe(_TradeClosed, _on_trade_closed)
+
     engine = ExecutionEngine(
         broker=broker,
         risk_manager=risk,
@@ -1056,6 +1090,40 @@ def cmd_run(
                 IntervalTrigger(hours=settings.auto_sweep_interval_hours),
                 id="auto_sweep",
             )
+
+        # ─── Continuous Calibration Check (every 6 hours) ───────────────
+        def _calibration_check():
+            """Check model calibration and trigger retraining if needed."""
+            try:
+                report = calibration_monitor.check_calibration()
+                if report.get("recommendation") == "needs_retraining":
+                    logger.warning(
+                        "calibration.drift_detected",
+                        ece=report.get("ece"),
+                        recommendation=report["recommendation"],
+                    )
+                    _send_telegram(
+                        f"⚠️ <b>Model Calibration Drift</b>\n"
+                        f"ECE: {report.get('ece', 0):.3f}\n"
+                        f"Recommendation: {report['recommendation']}\n"
+                        f"Auto-retraining will trigger on next cycle."
+                    )
+                elif report.get("recommendation") == "needs_recalibration":
+                    logger.info("calibration.minor_drift", ece=report.get("ece"))
+                else:
+                    logger.info(
+                        "calibration.check_ok",
+                        ece=report.get("ece"),
+                        total_trades=experience_db.total_trades,
+                    )
+            except Exception as e:
+                logger.debug("calibration.check_error", error=str(e))
+
+        _scheduler.add_job(
+            _calibration_check,
+            IntervalTrigger(hours=6),
+            id="calibration_check",
+        )
 
         _scheduler.start()
 

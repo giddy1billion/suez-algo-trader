@@ -170,6 +170,7 @@ class ABTestManager:
         significance_threshold: float = 0.05,
         min_trades_default: int = 30,
         max_duration_hours_default: float = 168.0,  # 1 week
+        promotion_engine=None,
     ):
         self._registry = registry
         self._predictor = predictor  # ModelPredictor instance
@@ -177,6 +178,7 @@ class ABTestManager:
         self._significance_threshold = significance_threshold
         self._min_trades_default = min_trades_default
         self._max_duration_default = max_duration_hours_default
+        self._promotion_engine = promotion_engine  # ModelPromotionEngine for governance
 
         self._active_test: Optional[ABTest] = None
         self._completed_tests: list[ABTest] = []
@@ -507,7 +509,7 @@ class ABTestManager:
             return None, None
 
     def _conclude_test(self, test: ABTest, reason: str):
-        """Conclude a test and optionally promote winner."""
+        """Conclude a test and optionally promote winner via governance gates."""
         test.status = ABTestStatus.COMPLETED
         test.completed_at = datetime.now(timezone.utc)
 
@@ -530,16 +532,12 @@ class ABTestManager:
             p_value=test.significance_p_value,
         )
 
-        # Auto-promote if enabled and challenger won
+        # Auto-promote with governance gates if challenger won
         if test.auto_promote and test.winner == test.challenger_version:
-            try:
-                self._registry.rollback(test.challenger_version)
-                logger.info(
-                    "ab_test.auto_promoted",
-                    version=test.challenger_version,
-                )
-            except Exception as e:
-                logger.error("ab_test.promotion_failed", error=str(e))
+            promoted = self._try_governed_promotion(test)
+            if not promoted:
+                logger.info("ab_test.promotion_blocked_by_governance",
+                           challenger=test.challenger_version)
 
         # Publish event
         if self._event_bus:
@@ -561,3 +559,86 @@ class ABTestManager:
         if len(self._completed_tests) > self._max_completed:
             self._completed_tests = self._completed_tests[-self._max_completed:]
         self._active_test = None
+
+    def _try_governed_promotion(self, test: ABTest) -> bool:
+        """
+        Attempt promotion through governance gates.
+
+        If no promotion engine is configured, falls back to simple promotion.
+        Returns True if promotion succeeded.
+        """
+        if self._promotion_engine is None:
+            # Fallback: direct promotion (legacy behavior)
+            try:
+                self._registry.rollback(test.challenger_version)
+                logger.info("ab_test.auto_promoted_legacy", version=test.challenger_version)
+                return True
+            except Exception as e:
+                logger.error("ab_test.promotion_failed", error=str(e))
+                return False
+
+        # Build metrics from A/B test results
+        champion_metrics = {
+            "sharpe": test.champion_perf.sharpe_ratio,
+            "win_rate": test.champion_perf.win_rate,
+            "avg_return": test.champion_perf.avg_pnl,
+            "max_dd": self._compute_max_drawdown(test.champion_perf.trades),
+            "calibration_ece": 0.0,  # Will be filled if experience DB available
+            "total_trades": test.champion_perf.total_trades,
+        }
+        challenger_metrics = {
+            "sharpe": test.challenger_perf.sharpe_ratio,
+            "win_rate": test.challenger_perf.win_rate,
+            "avg_return": test.challenger_perf.avg_pnl,
+            "max_dd": self._compute_max_drawdown(test.challenger_perf.trades),
+            "calibration_ece": 0.0,
+            "total_trades": test.challenger_perf.total_trades,
+        }
+
+        # Run through governance gates
+        report = self._promotion_engine.evaluate_promotion(
+            champion_metrics=champion_metrics,
+            challenger_metrics=challenger_metrics,
+            champion_trades=test.champion_perf.trades,
+            challenger_trades=test.challenger_perf.trades,
+        )
+
+        if self._promotion_engine.should_promote(report):
+            try:
+                self._registry.rollback(test.challenger_version)
+                logger.info(
+                    "ab_test.governed_promotion",
+                    version=test.challenger_version,
+                    gates_passed=report.gates_passed,
+                    gates_total=report.gates_total,
+                )
+                return True
+            except Exception as e:
+                logger.error("ab_test.governed_promotion_failed", error=str(e))
+                return False
+        else:
+            logger.info(
+                "ab_test.promotion_rejected",
+                challenger=test.challenger_version,
+                gates_passed=report.gates_passed,
+                gates_total=report.gates_total,
+                decision=report.decision,
+            )
+            return False
+
+    @staticmethod
+    def _compute_max_drawdown(trades: list[dict]) -> float:
+        """Compute max drawdown from a list of trade results."""
+        if not trades:
+            return 0.0
+        cumulative = 0.0
+        peak = 0.0
+        max_dd = 0.0
+        for t in trades:
+            cumulative += t.get("pnl_pct", 0.0)
+            if cumulative > peak:
+                peak = cumulative
+            dd = peak - cumulative
+            if dd > max_dd:
+                max_dd = dd
+        return max_dd

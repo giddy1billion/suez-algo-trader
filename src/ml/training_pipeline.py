@@ -107,12 +107,14 @@ class TrainingPipeline:
         event_bus=None,
         auto_deploy: bool = True,
         min_training_samples: int = 500,
+        experience_db=None,
     ):
         self._registry = registry
         self._governance = governance
         self._broker = broker
         self._event_bus = event_bus
         self._auto_deploy = auto_deploy
+        self._experience_db = experience_db  # ExperienceDatabase for closed-loop training
         self._min_samples = min_training_samples
 
         # Recovery settings (loaded from config when available)
@@ -333,6 +335,9 @@ class TrainingPipeline:
 
         progress.steps_completed = 2
 
+        # Step 2.5: Enrich with live trade outcomes (closed-loop)
+        feature_data = self._enrich_with_experience(feature_data)
+
         # Step 3: Train model
         progress.status = PipelineStatus.TRAINING
         progress.current_step = "Training XGBoost model"
@@ -458,6 +463,73 @@ class TrainingPipeline:
                 )
 
         return data
+
+    def _enrich_with_experience(
+        self, feature_data: dict[str, pd.DataFrame]
+    ) -> dict[str, pd.DataFrame]:
+        """
+        Enrich training data with live trade outcomes from ExperienceDatabase.
+
+        The experience DB contains real trade results with:
+        - Actual outcomes (profitable/not) as verified labels
+        - Feature vectors used at prediction time
+        - Calibration targets (predicted vs actual confidence)
+
+        This creates a closed-loop: live outcomes improve future models.
+        """
+        if self._experience_db is None:
+            return feature_data
+
+        try:
+            experience_df = self._experience_db.get_training_samples(min_trades=20)
+            if experience_df is None or experience_df.empty:
+                logger.info("training_pipeline.no_experience_data")
+                return feature_data
+
+            # Group experience samples by symbol
+            if '_symbol' not in experience_df.columns and 'symbol' in experience_df.columns:
+                experience_df = experience_df.rename(columns={'symbol': '_symbol'})
+
+            experience_count = 0
+            for symbol, df in feature_data.items():
+                sym_exp = experience_df[experience_df['_symbol'] == symbol] if '_symbol' in experience_df.columns else pd.DataFrame()
+                if sym_exp.empty:
+                    continue
+
+                # Match feature columns that exist in both
+                common_cols = [c for c in df.columns if c in sym_exp.columns and c != '_symbol']
+                if not common_cols:
+                    continue
+
+                # Append experience samples (they have verified labels)
+                # Mark source so we can weight them higher during training
+                df_copy = df.copy()
+                df_copy['_from_experience'] = 0
+
+                exp_subset = sym_exp[common_cols].copy()
+                exp_subset['_from_experience'] = 1
+                # Align any missing columns with NaN
+                for col in df_copy.columns:
+                    if col not in exp_subset.columns:
+                        exp_subset[col] = float('nan')
+                exp_subset = exp_subset.reindex(columns=df_copy.columns, fill_value=float('nan'))
+
+                feature_data[symbol] = pd.concat([df_copy, exp_subset], ignore_index=True)
+                experience_count += len(exp_subset)
+
+            if experience_count > 0:
+                logger.info(
+                    "training_pipeline.experience_enrichment",
+                    samples_added=experience_count,
+                    symbols_enriched=sum(
+                        1 for df in feature_data.values()
+                        if '_from_experience' in df.columns and df['_from_experience'].sum() > 0
+                    ),
+                )
+        except Exception as e:
+            logger.warning("training_pipeline.experience_enrichment_error", error=str(e))
+
+        return feature_data
 
     def _train_model(
         self, feature_data: dict[str, pd.DataFrame]

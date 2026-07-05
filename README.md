@@ -1,8 +1,13 @@
-# Alpaca Algo Trader 🤖📈
+# Suez Algo Trader 🤖📈
 
-A fully robust, scalable algorithmic trading bot with AI/ML integration.  
-Uses **Alpaca Markets API** for commission-free trading (US stocks + crypto).  
-Fully manageable via **Telegram** — monitor, trade, configure, backtest, and train ML models from your phone.
+[![Build & Deploy](https://github.com/giddy1billion/suez-algo-trader/actions/workflows/deploy.yml/badge.svg)](https://github.com/giddy1billion/suez-algo-trader/actions/workflows/deploy.yml)
+[![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)](https://www.python.org/downloads/)
+[![License](https://img.shields.io/badge/license-Private-red.svg)]()
+
+An institutional-grade, event-driven algorithmic trading platform with adaptive AI/ML intelligence.  
+Uses **Alpaca Markets API** for commission-free trading (US equities + crypto).  
+Fully manageable via **Telegram** — monitor, trade, configure, backtest, and train ML models from your phone.  
+Deployed on **Azure Container Instances** via GitHub Actions CI/CD pipeline.
 
 ---
 
@@ -25,49 +30,111 @@ Fully manageable via **Telegram** — monitor, trade, configure, backtest, and t
   - [Automated Notifications](#automated-notifications)
 - [Strategies](#strategies)
 - [Architecture](#architecture)
+- [Adaptive Intelligence Layer](#adaptive-intelligence-layer)
 - [Risk Management](#risk-management)
+- [Configuration System](#configuration-system)
 - [CLI Options](#cli-options)
 - [Project Structure](#project-structure)
 - [Environment Configuration](#environment-configuration)
 - [Alpaca Account Setup](#alpaca-account-setup)
-- [Docker Deployment](#docker-deployment)
+- [Deployment](#deployment)
+- [Testing](#testing)
 - [Safety Notes](#safety-notes)
 
 ---
 
 ## Features
 
-- ✅ **Paper + Live trading** — switch with one env var
-- ✅ **Full Telegram bot interface** — 50+ commands, inline buttons, real-time control
+### Core Trading
+- ✅ **Paper + Live trading** — switch with one env var, live mode requires explicit CLI confirmation
+- ✅ **Multi-strategy orchestrator** — run multiple strategies concurrently with independent schedules and capital weights
 - ✅ **5 built-in strategies**: Momentum, Mean Reversion, ML (XGBoost), Composable, Composable MR
-- ✅ **Risk Management** — position sizing, daily loss limits, exposure caps, circuit breakers
-- ✅ **Backtesting engines** — Backtrader, VectorBT vectorized backtests, parameter sweeps
-- ✅ **ML/AI integration** — XGBoost with 30+ engineered features, auto-retraining, model versioning
-- ✅ **Walk-forward optimization** — out-of-sample parameter validation
-- ✅ **Monte Carlo simulation** — probability of profit/ruin analysis
+- ✅ **Asset-class-aware execution** — separate handling for equities (market hours) and crypto (24/7)
+- ✅ **Real-time WebSocket streaming** — sub-second bar data + live trade update stream from Alpaca
+
+### Adaptive Intelligence
+- ✅ **Adaptive Intelligence Layer** — regime classification, trade quality scoring, drift detection, strategy routing
+- ✅ **Market State Engine** — full market fingerprint with multi-dimensional regime analysis
+- ✅ **Meta-Strategy Engine** — dynamic strategy ranking and selection per market regime
+- ✅ **Concept Drift Monitor** — detect model degradation in real-time, trigger retraining
+- ✅ **Capital Allocator** — dynamic position sizing via Kelly criterion with sector correlation filters
+- ✅ **Decision Explainer** — human-readable reasons for every trade accept/reject
+- ✅ **Decision Journal** — full audit trail for all intelligence decisions
+- ✅ **Counterfactual Engine** — what-if analysis on alternative trade decisions
+
+### ML/AI
+- ✅ **XGBoost ML strategy** — 30+ engineered features, time-series cross-validation
+- ✅ **Model governance** — version registry, lineage tracking (git hash, config hash, dataset hash), rollback
+- ✅ **A/B testing framework** — shadow mode and split-capital comparison with statistical significance
+- ✅ **Prediction registry** — full lifecycle tracking: prediction → outcome → quality grading
+- ✅ **Feature store** — cached feature computation with schema versioning
+- ✅ **Auto-retraining** — scheduled + drift-triggered + self-healing retry with exponential backoff
+- ✅ **Model promotion gates** — min Sharpe, max drawdown, min precision, WF validation, Monte Carlo probability
+
+### Backtesting
+- ✅ **Backtrader engine** — event-driven backtesting with full analyzers
+- ✅ **VectorBT engine** — vectorized high-performance backtests with parameter sweeps
+- ✅ **Walk-forward optimization** — out-of-sample parameter validation with stability scoring
+- ✅ **Monte Carlo simulation** — probability of profit/ruin analysis with configurable trials
 - ✅ **Portfolio-level backtesting** — multi-symbol combined strategy evaluation
-- ✅ **Model governance** — version registry, lineage tracking, rollback, audit
-- ✅ **Real-time WebSocket streaming** — sub-second data for stocks + crypto
+- ✅ **Asset-class-aware parameters** — per-symbol backtest config via layered configuration
+- ✅ **Execution simulator** — realistic slippage, partial fills, latency, and spread modeling
+
+### Risk Management
+- ✅ **4-layer risk engine** — Portfolio, Account, Exposure, and Execution risk layers
+- ✅ **Position sizing** — ATR-based dynamic stops, Kelly criterion, correlation-aware
+- ✅ **Circuit breakers** — daily loss limits, max drawdown, consecutive loss halt
+- ✅ **PDT protection** — Pattern Day Trader rule awareness ($25K threshold)
+- ✅ **Sector concentration limits** — max sector exposure with dynamic lookup
+- ✅ **Emergency controls** — panic liquidation, risk halts, cooldown after large losses
+
+### Operations & Observability
+- ✅ **Full Telegram bot interface** — 50+ commands, inline buttons, real-time control
+- ✅ **Telegram audit forwarder** — ALL events + WARNING+ logs forwarded as rich HTML notifications
+- ✅ **Event-driven architecture** — event bus, persistent event store, replay, crash recovery
+- ✅ **CQRS read models** — incremental projections for fast dashboard queries
+- ✅ **State snapshotting** — periodic persistence for sub-second recovery
+- ✅ **Portfolio reconciliation** — periodic broker ↔ internal state sync with auto-fix
+- ✅ **Health monitoring** — CPU, memory, latency, component status, structured logging
 - ✅ **Notifications** — Telegram + Discord alerts on trades, signals, errors, daily summaries
-- ✅ **Event-driven architecture** — event bus, event store, replay, recovery
-- ✅ **Health monitoring** — CPU, memory, latency, component status
-- ✅ **SQLite persistence** — full trade history, signals, portfolio snapshots, trade journal
-- ✅ **Emergency controls** — panic liquidation, circuit breakers, risk halts
-- ✅ **Runtime configuration** — change any parameter live via Telegram without restart
-- ✅ **Automation scheduler** — periodic backtests, retraining, parameter sweeps
-- ✅ **Docker ready** — deploy anywhere
+- ✅ **SQLite persistence** — trade history, signals, portfolio snapshots, trade journal, event store
+
+### Configuration & Automation
+- ✅ **Database-backed configuration** — persisted settings survive restarts, seeded from .env
+- ✅ **Layered configuration** — System Default → Environment → Strategy → Exchange → User Override
+- ✅ **Runtime hot-swap** — change any parameter live via Telegram without restart
+- ✅ **Asset-class scheduler** — DAG-based activity orchestration with dependency tracking
+- ✅ **Automation scheduler** — periodic backtests, ML retraining, parameter sweeps, daily summaries
+
+### Deployment
+- ✅ **Docker containerized** — Python 3.12-slim, non-root user, health checks
+- ✅ **Azure CI/CD** — GitHub Actions → Azure Container Registry → Azure Container Instances
+- ✅ **Log Analytics integration** — Azure Monitor workspace for production observability
 
 ---
 
 ## Quick Start
 
+### Prerequisites
+
+- Python 3.12+
+- Alpaca Markets account (free paper trading account included)
+- Telegram bot token (optional, for remote management)
+
 ### 1. Setup
 
 ```bash
 cd algo-trader
+
+# Create virtual environment
+python -m venv venv
+
+# Activate
 source venv/Scripts/activate   # Windows Git Bash
 # OR
 .\venv\Scripts\activate        # Windows PowerShell
+# OR
+source venv/bin/activate       # Linux/macOS
 
 pip install -r requirements.txt
 ```
@@ -81,6 +148,8 @@ cp .env.example .env
 
 Get free API keys: https://app.alpaca.markets/signup
 
+> **Note:** On first run, the configuration service seeds the database from your `.env` file. Subsequent changes made via Telegram or the config service persist across restarts.
+
 ### 3. Run
 
 ```bash
@@ -90,16 +159,27 @@ python main.py
 # Check account status
 python main.py --status
 
+# Multi-strategy mode (concurrent strategies)
+python main.py --strategy multi
+
+# Custom multi-strategy config
+python main.py --strategy multi --strategies "momentum:AAPL,MSFT:1Hour:60:1.0;ml:NVDA,TSLA:15Min:120:1.5"
+
 # Backtest before going live
 python main.py --backtest --strategy momentum
+python main.py --backtest-bt --strategy momentum     # Backtrader engine
+python main.py --backtest-vbt                         # VectorBT vectorized
 
 # Dry run (signals only, no orders)
 python main.py --dry-run
 
 # Train ML model
-python main.py --train --strategy ml
+python main.py --train
 
-# Live trading (⚠️ real money!)
+# Disable WebSocket streaming
+python main.py --no-stream
+
+# Live trading (⚠️ real money! requires typing "YES" to confirm)
 python main.py --live
 ```
 
@@ -651,59 +731,186 @@ Statistical mean reversion:
 - Z-score for deviation measurement
 - RSI for confirmation
 - Targets SMA as exit point
+- Configurable minimum confidence threshold
 
-**Telegram-configurable params:** `mean_rev_bb_period`, `mean_rev_bb_std`, `mean_rev_zscore_entry`, `mean_rev_zscore_exit`, `mean_rev_rsi_period`
+**Telegram-configurable params:** `mean_rev_bb_period`, `mean_rev_bb_std`, `mean_rev_zscore_entry`, `mean_rev_zscore_exit`, `mean_rev_rsi_period`, `mean_rev_min_confidence`
 
 ### ML (XGBoost)
 Machine learning prediction:
-- 30+ engineered features
-- XGBoost multi-class classifier (UP/DOWN/FLAT)
-- Time-series cross-validation
-- Auto-retrain on schedule
+- 30+ engineered features (momentum, volatility, volume, pattern recognition)
+- XGBoost multi-class classifier (BUY/HOLD/SELL)
+- Time-series cross-validation (prevents look-ahead bias)
+- Auto-retrain on schedule + drift-triggered
 - Confidence threshold filtering
+- Full model governance with versioning and lineage
 
 **Telegram-configurable params:** `ml_min_confidence`, `ml_retrain_interval_hours`
 
 ### Composable
-A rule-composition framework allowing custom indicator combinations via presets.
+A rule-composition framework allowing custom indicator combinations via presets. Two built-in presets:
+- **Composable Momentum** — combines multiple momentum indicators with customizable weights
+- **Composable Mean Reversion** — statistical mean reversion with pluggable exit rules
+
+### Multi-Strategy Orchestrator (`--strategy multi`)
+Run multiple strategies concurrently, each with independent:
+- Symbol universe
+- Timeframe and cycle interval
+- Capital allocation weight
+- Performance tracking (win rate, P&L, trade count)
+- Enable/disable at runtime via Telegram
+
+```bash
+# Auto-configures: momentum (equities), mean_reversion (equities, 15Min), 
+# ML (all symbols), crypto_momentum (crypto, 5Min)
+python main.py --strategy multi
+
+# Explicit config: name:symbols:timeframe:interval:weight
+python main.py --strategy multi --strategies "momentum:AAPL,MSFT:1Hour:60:1.0;ml:NVDA:15Min:120:1.5"
+```
 
 ---
 
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│                        main.py                            │
-├──────────┬──────────────┬──────────┬───────────┬───────────┬────────────┤
-│ Strategy │ Intelligence │Execution │   Risk    │Telegram   │ Monitoring │
-│ Engine   │    Layer     │ Engine   │  Manager  │   Bot     │  & Health  │
-├──────────┼──────────────┼──────────┼───────────┼───────────┼────────────┤
-│ Momentum │ Regime       │ Orders   │ Position  │ Commands  │ HealthMon  │
-│ MeanRev  │ Scoring      │ Brackets │ Sizing    │ Alerts    │ Metrics    │
-│ ML/XGB   │ Drift        │ Trailing │ Drawdown  │ Controls  │ OpsHandler │
-│Composable│ Routing      │ Recovery │ VaR       │ Config    │ Telemetry  │
-└────┬─────┴──────┬───────┴────┬─────┴─────┬─────┴─────┬─────┴──────┬─────┘
-     │            │            │           │           │            │
-     ▼            ▼            ▼           ▼           ▼            ▼
-┌──────────┐  ┌────────┐   ┌────────┐ ┌────────┐ ┌────────┐  ┌────────┐
-│ Alpaca   │  │ SQLite │   │ Models │ │Telegram│ │ Event  │  │  Logs  │
-│ REST+WS  │  │  DB    │   │.joblib │ │  API   │ │ Store  │  │        │
-└──────────┘  └────────┘   └────────┘ └────────┘ └────────┘  └────────┘
+┌────────────────────────────────────────────────────────────────────────────────────┐
+│                                    main.py                                          │
+│                           (Entry point + Trading Loop)                              │
+├──────────┬──────────────┬──────────────┬──────────┬────────────┬───────────────────┤
+│ Strategy │  Adaptive    │  Execution   │   Risk   │  Telegram  │   Monitoring &    │
+│Orchestr. │Intelligence  │   Engine     │  Engine  │    Bot     │   Observability   │
+├──────────┼──────────────┼──────────────┼──────────┼────────────┼───────────────────┤
+│ Momentum │ Market State │ Orders       │Portfolio │ 50+ Cmds   │ Health Monitor    │
+│ MeanRev  │ Regime Class.│ Signal Gate  │ Account  │ Audit Fwd  │ Live Metrics      │
+│ ML/XGB   │ Trade Scorer │ Exec Simul.  │ Exposure │ Sector Mgmt│ Ops Handler       │
+│Composable│ Drift Monitor│ Signal Bridge│Execution │ Config Cmds│ Telemetry         │
+│ Multi    │ Meta Strategy│ Trade Stream │ PDT/VaR  │ Runtime Sw │ Structured Logs   │
+│          │ Capital Alloc│              │ Sector   │            │                   │
+│          │ Explainability              │ Circuit  │            │                   │
+│          │ Counterfactual              │ Breakers │            │                   │
+└────┬─────┴──────┬───────┴──────┬───────┴────┬─────┴──────┬─────┴────────┬──────────┘
+     │            │              │            │            │              │
+     ▼            ▼              ▼            ▼            ▼              ▼
+┌──────────┐ ┌─────────┐  ┌──────────┐ ┌─────────┐ ┌──────────┐  ┌──────────────┐
+│ Alpaca   │ │ SQLite  │  │  Models  │ │Telegram │ │  Event   │  │     Logs     │
+│ REST+WS  │ │  DB     │  │ .joblib  │ │   API   │ │  Store   │  │  (structlog) │
+│ Streams  │ │ Config  │  │ Registry │ │   Bot   │ │ Snapshots│  │  Azure Log   │
+└──────────┘ └─────────┘  └──────────┘ └─────────┘ └──────────┘  └──────────────┘
 ```
 
 ### Event-Driven Core
 
-The system uses an internal event bus for decoupled communication:
-- **Events**: `TradeExecuted`, `PositionOpened`, `PositionClosed`, `RiskHalt`, `SignalGenerated`
-- **Event Store**: Persistent event log for replay and recovery
-- **Subscribers**: Risk manager, notifications, trade journal all react to events
-- **Recovery**: On crash, replays events to reconstruct state
+The system is built on a lightweight, thread-safe, in-process event bus:
+
+- **Domain Events**: `SignalGenerated`, `OrderSubmitted`, `OrderFilled`, `OrderRejected`, `PositionOpened`, `PositionClosed`, `RiskHalt`, `DriftDetected`, `BacktestTriggered`, `ModelTrainingCompleted`, `SchedulerEvent`
+- **Event Store**: Persistent SQLite-backed event log with session tracking
+- **Event Replay**: Reconstruct state from event history (for debugging or recovery)
+- **Crash Recovery**: On startup, reconciles broker positions with internal state and replays missed events
+- **CQRS Read Models**: Incremental projections for fast dashboard queries without re-scanning events
+- **State Snapshots**: Periodic persistence (every 500 events) for sub-second cold-start recovery
+- **Portfolio Reconciliation**: Periodic broker ↔ internal state sync with auto-fix for safe discrepancies
+
+### Signal Pipeline
+
+Every trade signal passes through a validation pipeline before execution:
+
+```
+Strategy Signal → Signal Package → Validation Gate → Intelligence Layer → Risk Engine → Execution
+                   (completeness)   (confidence,      (regime, score,      (4-layer     (broker
+                                    risk/reward,       drift, routing,      checks)      + simulator)
+                                    provenance)        allocation)
+```
+
+- **Signal Package**: Comprehensive execution package with entry zone, stop loss, take profit levels, holding period, confidence decay schedule, and model provenance
+- **Validation Gate**: Blocks incomplete signals from execution (configurable strictness)
+- **Intelligence Layer**: Scores trade quality, checks regime compatibility, allocates capital
+- **Risk Engine**: 4 independent risk layers evaluate every order independently
+
+---
+
+## Adaptive Intelligence Layer
+
+The intelligence subsystem orchestrates multiple components for adaptive decision-making:
+
+| Component | Responsibility |
+|-----------|---------------|
+| **Market State Engine** | Computes market fingerprint (volatility, trend, breadth, correlation) |
+| **Regime Classifier** | Classifies current market regime (trending, mean-reverting, volatile, quiet) |
+| **Meta-Strategy Engine** | Ranks strategies by expected performance in current regime |
+| **Strategy Router** | Enables/disables strategies based on regime compatibility |
+| **Drift Monitor** | Detects concept drift via rolling accuracy windows |
+| **Trade Quality Scorer** | Composite score (0–100) evaluating trade worthiness |
+| **Capital Allocator** | Dynamic sizing via Kelly criterion + correlation filters + sector limits |
+| **Decision Explainer** | Human-readable explanations for accept/reject decisions |
+| **Decision Journal** | Full audit trail of every intelligence decision |
+| **Counterfactual Engine** | What-if analysis comparing actual vs alternative outcomes |
+
+Configuration:
+```env
+INTELLIGENCE_ENABLED=true
+INTELLIGENCE_MIN_TRADE_SCORE=70       # Minimum score to allow trade (0-100)
+INTELLIGENCE_DRIFT_WINDOW=200         # Rolling window for drift detection
+INTELLIGENCE_DRIFT_MIN_SAMPLES=50     # Minimum samples before drift alerts
+INTELLIGENCE_DRIFT_ALERT_DROP=0.12    # Accuracy drop threshold for alert
+```
 
 ---
 
 ## Risk Management
 
-All trades pass through the risk manager before execution:
+The platform implements a **4-layer risk engine** where every order must pass all enabled layers independently:
+
+### Layer 1: Portfolio Risk
+
+| Rule | Default | Description |
+|------|---------|-------------|
+| Max positions | 10 | Concurrent open positions cap |
+| Max single stock | 20% | No single position larger than this |
+| Max sector exposure | 40% | Maximum capital in one sector |
+| Max correlation | 0.80 | Block trades in highly correlated assets |
+| Max gross exposure | 200% | Total absolute exposure |
+| Max net exposure | 100% | Net long-short exposure |
+| Max VaR | 5% | Portfolio Value-at-Risk limit |
+| Max portfolio heat | 10% | Total portfolio risk (sum of position risks) |
+
+### Layer 2: Account Risk
+
+| Rule | Default | Description |
+|------|---------|-------------|
+| Max daily loss | 3% | Auto-halt when breached |
+| Max weekly loss | 7% | Weekly drawdown circuit breaker |
+| Max drawdown | 15% | Peak-to-trough limit |
+| Min cash reserve | 20% | Always keep this % in cash |
+| PDT threshold | $25,000 | Pattern Day Trader rule awareness |
+| Consecutive loss limit | 5 | Halt after N consecutive losses |
+| Daily trade limit | 20 | Max trades per day |
+
+### Layer 3: Exposure Risk
+
+| Rule | Default | Description |
+|------|---------|-------------|
+| Require stop loss | Yes | Block orders without a stop loss |
+| Max ADV % | 1% | Maximum percentage of average daily volume |
+| Max trade concentration | 5% | Single trade vs portfolio |
+| Max overnight exposure | 60% | Reduce exposure before close |
+| Earnings blackout | 1 day | No trading around earnings dates |
+| High volatility threshold | 3% | Daily move threshold |
+| High vol size reduction | 50% | Reduce position size in volatile markets |
+
+### Layer 4: Execution Risk
+
+| Rule | Default | Description |
+|------|---------|-------------|
+| Max spread | 0.5% | Block illiquid instruments |
+| Min volume | 10,000 | Minimum daily volume |
+| Max slippage | 0.3% | Expected slippage limit |
+| Max orders/minute | 10 | Rate limiting |
+| Cooldown after loss | 5 min | Pause after large loss |
+| Large loss threshold | 1% | What constitutes a "large" loss |
+
+### Legacy Risk Manager (Backward-Compatible)
+
+Additionally, the primary risk manager provides top-level guardrails:
 
 | Rule | Default | Range | Description |
 |------|---------|-------|-------------|
@@ -718,7 +925,47 @@ All trades pass through the risk manager before execution:
 | Default stop-loss | 3% | 0.5%–50% | Automatic stop-loss on every trade |
 | Default take-profit | 6% | 0.5%–100% | Default take-profit target |
 
-All parameters configurable via `/setrisk` or `/set` on Telegram.
+All parameters configurable via `/setrisk` or `/set` on Telegram. Risk layer enabled/disabled individually:
+```env
+RISK_PORTFOLIO_LAYER_ENABLED=true
+RISK_ACCOUNT_LAYER_ENABLED=true
+RISK_EXPOSURE_LAYER_ENABLED=true
+RISK_EXECUTION_LAYER_ENABLED=true
+```
+
+---
+
+## Configuration System
+
+The platform uses a sophisticated multi-level configuration system:
+
+### Configuration Precedence
+
+```
+User Override (Telegram /set)  ←  highest priority
+    ↓
+Exchange-specific overrides
+    ↓
+Strategy-specific overrides
+    ↓
+Environment variables (.env)
+    ↓
+System defaults               ←  lowest priority
+```
+
+### Database-Backed Persistence
+
+- On first run: seeds database from `.env` + built-in defaults
+- Subsequent runs: loads from database (user changes persist across restarts)
+- Telegram `/set` commands persist to database immediately
+- Configuration snapshots for audit trail
+
+### Asset-Class Awareness
+
+Different parameters for equities vs crypto:
+- Equities: market-hours-only trading, `1Hour` default timeframe, standard fees
+- Crypto: 24/7 trading, `5Min` default timeframe, adjusted risk parameters
+- Backtesting parameters adapt per-symbol via layered config
 
 ---
 
@@ -728,16 +975,37 @@ All parameters configurable via `/setrisk` or `/set` on Telegram.
 python main.py --help
 
 Options:
-  --live              ⚠️ Enable LIVE trading
-  --strategy, -s      Strategy: momentum, mean_reversion, ml, composable
+  --live              ⚠️ Enable LIVE trading (requires explicit "YES" confirmation)
+  --strategy, -s      Strategy: momentum, mean_reversion, ml, multi
+  --strategies        Multi-strategy config: "name:symbols:tf:interval:weight;..."
   --symbols           Comma-separated (AAPL,TSLA,BTC/USD)
   --timeframe, -tf    1Min, 5Min, 15Min, 30Min, 1Hour, 4Hour, 1Day
   --lookback          Historical bars to analyze (default: 200)
   --interval, -i      Seconds between cycles (default: 60)
   --dry-run           Signals only, no order execution
-  --backtest          Run backtest on historical data
-  --train             Train/retrain ML model
-  --status            Show account status
+  --backtest          Run custom backtest engine
+  --backtest-bt       Run Backtrader event-driven backtest
+  --backtest-vbt      Run VectorBT vectorized backtest + parameter sweep
+  --train             Train/retrain ML model on configured symbols
+  --status            Show account status and exit
+  --no-telegram       Disable Telegram bot
+  --no-stream         Disable WebSocket streaming for real-time data
+```
+
+### Examples
+
+```bash
+# Paper trade with ML strategy on specific symbols
+python main.py --strategy ml --symbols NVDA,TSLA,AAPL --interval 120
+
+# Multi-strategy: momentum on equities, ML on crypto
+python main.py --strategy multi --strategies "momentum:AAPL,MSFT:1Hour:60:1.0;ml:BTC/USD,ETH/USD:5Min:30:1.5"
+
+# VectorBT backtest with 4-hour candles
+python main.py --backtest-vbt --timeframe 4Hour --lookback 500
+
+# Dry run (no orders) without Telegram
+python main.py --dry-run --no-telegram --no-stream
 ```
 
 ---
@@ -746,79 +1014,159 @@ Options:
 
 ```
 algo-trader/
-├── main.py                        # Entry point, CLI, trading loop
+├── main.py                            # Entry point, CLI, trading loop, orchestrator setup
 ├── config/
-│   └── settings.py                # Pydantic configuration (all env vars)
+│   ├── settings.py                    # Pydantic settings (all env vars + validation)
+│   └── __init__.py
 ├── src/
 │   ├── broker/
-│   │   └── alpaca_client.py       # Alpaca REST + WebSocket client
+│   │   ├── alpaca_client.py           # Alpaca REST + WebSocket client (bars, orders, streaming)
+│   │   ├── base.py                    # Abstract broker interface
+│   │   ├── paper.py                   # Paper trading broker implementation
+│   │   └── replay_broker.py          # Replay broker for backtesting
 │   ├── strategy/
-│   │   ├── base.py                # Abstract strategy interface
-│   │   ├── momentum.py            # Momentum (EMA/RSI/MACD/ATR)
-│   │   ├── mean_reversion.py      # Mean reversion (BB/Z-score)
-│   │   ├── ml_strategy.py         # ML/XGBoost strategy
-│   │   ├── composable.py          # Composable rule-based strategy
-│   │   └── orchestrator.py        # Multi-strategy orchestrator
+│   │   ├── base.py                    # Abstract strategy interface + TradeSignal
+│   │   ├── momentum.py                # Momentum (EMA/RSI/MACD/ATR)
+│   │   ├── mean_reversion.py          # Mean reversion (BB/Z-score/RSI)
+│   │   ├── ml_strategy.py             # ML/XGBoost strategy wrapper
+│   │   ├── composable.py              # Composable rule-based strategy framework
+│   │   ├── orchestrator.py            # Multi-strategy concurrent orchestrator
+│   │   ├── signal_package.py          # Trade signal package with validation gate
+│   │   ├── signal_bridge.py           # Bridge raw signals → full signal packages
+│   │   └── strategy_store.py          # User-defined strategy persistence
 │   ├── intelligence/
-│   │   ├── regime/                # Multi-dimensional regime classifier
-│   │   ├── scoring/               # Trade quality scoring engine
-│   │   ├── drift/                 # Concept drift monitor
-│   │   ├── allocator/             # Dynamic capital allocation
-│   │   ├── routing/               # Strategy enable/disable router
-│   │   ├── explainability/        # Decision explanations
-│   │   └── orchestrator.py        # Intelligence subsystem coordinator
+│   │   ├── orchestrator.py            # Top-level adaptive intelligence coordinator
+│   │   ├── models.py                  # Intelligence decision data models
+│   │   ├── regime/
+│   │   │   └── classifier.py          # Multi-dimensional regime classifier
+│   │   ├── scoring/
+│   │   │   └── trade_quality.py       # Composite trade quality scoring (0–100)
+│   │   ├── drift/
+│   │   │   └── monitor.py             # Concept drift detection via rolling windows
+│   │   ├── allocator/
+│   │   │   ├── capital_allocator.py   # Kelly criterion + dynamic sizing
+│   │   │   ├── correlation_filter.py  # Correlation-based position blocking
+│   │   │   └── portfolio_allocator.py # Portfolio-level allocation optimization
+│   │   ├── routing/
+│   │   │   └── strategy_router.py     # Enable/disable strategies per regime
+│   │   ├── explainability/
+│   │   │   └── explainer.py           # Human-readable decision explanations
+│   │   ├── journal/
+│   │   │   └── decision_journal.py    # Full audit trail of intelligence decisions
+│   │   ├── counterfactual/
+│   │   │   └── engine.py              # What-if analysis engine
+│   │   ├── meta_strategy/
+│   │   │   └── engine.py              # Strategy ranking per market state
+│   │   └── market_state/
+│   │       └── engine.py              # Market fingerprint computation
 │   ├── ml/
-│   │   ├── features.py            # Feature engineering (30+ features)
-│   │   ├── feature_store.py       # Feature caching & storage
-│   │   ├── model_registry.py      # Model version management
-│   │   ├── governance.py          # Model governance & lineage
-│   │   ├── finrl_adapter.py       # FinRL integration adapter
-│   │   └── liu_adapter.py         # Liu ML adapter
+│   │   ├── features.py                # Feature engineering (30+ features)
+│   │   ├── feature_store.py           # Feature caching & schema versioning
+│   │   ├── predictor.py               # Model inference wrapper
+│   │   ├── training_pipeline.py       # Full training pipeline with CV
+│   │   ├── dataset_builder.py         # Training dataset construction
+│   │   ├── model_registry.py          # Model version management
+│   │   ├── governance.py              # Model governance, lineage, promotion gates
+│   │   ├── ab_testing.py              # A/B testing framework (shadow + split modes)
+│   │   └── retraining_trigger.py      # Drift-triggered + scheduled retraining
 │   ├── risk/
-│   │   └── manager.py             # Risk management engine
+│   │   ├── manager.py                 # Primary risk manager (legacy guardrails)
+│   │   ├── engine.py                  # 4-layer risk engine orchestrator
+│   │   ├── models.py                  # Risk data models
+│   │   ├── portfolio_risk.py          # Portfolio risk layer (positions, sector, VaR)
+│   │   ├── account_risk.py            # Account risk layer (P&L limits, drawdown)
+│   │   ├── exposure_risk.py           # Exposure risk layer (concentration, overnight)
+│   │   └── execution_risk.py          # Execution risk layer (spread, volume, rate)
 │   ├── execution/
-│   │   └── engine.py              # Trade execution orchestrator
+│   │   ├── engine.py                  # Trade execution orchestrator
+│   │   ├── simulator.py               # Execution realism simulator (slippage, fills)
+│   │   └── sector_lookup.py           # Dynamic sector classification with DB cache
 │   ├── data/
-│   │   └── store.py               # SQLAlchemy models + DB manager
+│   │   ├── store.py                   # SQLAlchemy models + DB manager
+│   │   └── journal.py                 # Trade journal persistence
 │   ├── notifications/
-│   │   ├── alerts.py              # Simple webhook notifications
-│   │   └── telegram_bot.py        # Full interactive Telegram bot (50+ commands)
+│   │   ├── alerts.py                  # Simple webhook notifications (Telegram + Discord)
+│   │   ├── telegram_bot.py            # Full interactive Telegram bot (50+ commands)
+│   │   ├── telegram_audit_forwarder.py # Rich HTML event + log forwarding to Telegram
+│   │   ├── telegram_config_commands.py # Runtime config & strategy management commands
+│   │   ├── telegram_runtime_commands.py# Hot-swap, A/B test, environment switching
+│   │   └── telegram_sector_commands.py # Sector classification commands
 │   ├── monitoring/
-│   │   ├── health.py              # Component health monitoring
-│   │   ├── metrics.py             # Live trading metrics (Sharpe, etc.)
-│   │   ├── ops_commands.py        # Ops command formatters
-│   │   └── telemetry.py           # Telemetry & observability
+│   │   ├── health.py                  # Component health monitoring (heartbeats)
+│   │   ├── metrics.py                 # Live trading metrics (Sharpe, Sortino, etc.)
+│   │   ├── ops_commands.py            # Ops command handlers (health, latency, system)
+│   │   └── telemetry.py              # Telemetry & observability
 │   ├── core/
-│   │   ├── bus.py                 # Event bus (pub/sub)
-│   │   ├── events.py              # Domain events
-│   │   ├── event_store.py         # Persistent event storage
-│   │   ├── subscribers.py         # Event subscribers
-│   │   ├── state_machine.py       # Trade state machine
-│   │   ├── recovery.py            # Crash recovery
-│   │   ├── replay.py              # Event replay engine
-│   │   ├── reconciliation.py      # Broker ↔ internal state sync
-│   │   ├── snapshots.py           # State snapshots
-│   │   ├── projections.py         # Event projections
-│   │   └── audit_log.py           # Audit trail
+│   │   ├── events.py                  # Domain events (20+ event types)
+│   │   ├── bus.py                     # Thread-safe event bus (pub/sub)
+│   │   ├── event_store.py             # Persistent SQLite event storage + replay
+│   │   ├── subscribers.py             # Default event subscribers (audit, journal, notifications)
+│   │   ├── state_machine.py           # Trade lifecycle state machine
+│   │   ├── recovery.py                # Crash recovery (broker reconciliation + event replay)
+│   │   ├── replay.py                  # Event replay engine for debugging
+│   │   ├── reconciliation.py          # Broker ↔ internal state sync with auto-fix
+│   │   ├── projections.py             # CQRS read model projections
+│   │   ├── snapshots.py               # State snapshotting for fast recovery
+│   │   ├── runtime.py                 # Runtime manager (hot-swap, env switching)
+│   │   ├── runtime_state.py           # Runtime state (pause/resume, halt tracking)
+│   │   ├── environment.py             # Broker environment manager
+│   │   ├── circuit_breaker.py         # Circuit breaker implementation
+│   │   └── audit_log.py               # Audit trail logging
+│   ├── config/
+│   │   ├── initializer.py             # Configuration service bootstrap
+│   │   ├── service.py                 # Configuration service (CRUD + caching)
+│   │   ├── repository.py              # Database-backed config repository
+│   │   ├── layered.py                 # Multi-level config with precedence
+│   │   ├── backtest_params.py         # Asset-class-aware backtest parameters
+│   │   ├── typed_config.py            # Typed configuration accessors
+│   │   ├── validation.py              # Configuration value validation
+│   │   ├── seed.py                    # First-run configuration seeding
+│   │   ├── snapshots.py               # Configuration snapshots
+│   │   └── models.py                  # Configuration data models
+│   ├── predictions/
+│   │   ├── registry.py                # Prediction lifecycle tracking
+│   │   ├── outcome_recorder.py        # Outcome recording (win/loss/timeout)
+│   │   ├── calibration.py             # Prediction calibration analysis
+│   │   └── metrics.py                 # Prediction accuracy metrics
+│   ├── scheduler/
+│   │   ├── asset_class_scheduler.py   # DAG-based activity orchestrator
+│   │   ├── activity_graph.py          # Activity dependency graph
+│   │   ├── triggers.py                # Activity trigger conditions
+│   │   └── market_status.py           # Market hours/status service
+│   ├── market/
+│   │   ├── calendars.py               # Exchange calendar definitions
+│   │   ├── sessions.py                # Trading session management
+│   │   ├── holidays.py                # Market holiday database
+│   │   ├── instruments.py             # Instrument metadata
+│   │   ├── timezones.py               # Timezone handling
+│   │   ├── annualization.py           # Annualization factors per asset class
+│   │   ├── gap_detection.py           # Price gap detection
+│   │   └── ...                        # (exchanges, constraints, corporate actions)
 │   ├── portfolio/
-│   │   └── optimizer.py           # Portfolio optimization
+│   │   └── optimizer.py               # Portfolio optimization
 │   └── utils/
-│       └── logger.py              # Structured logging (structlog)
+│       └── logger.py                  # Structured logging (structlog)
 ├── backtesting/
-│   ├── backtest.py                # Simple custom backtester
-│   ├── bt_adapter.py              # Backtrader adapter
-│   ├── vbt_adapter.py             # VectorBT adapter
-│   ├── walk_forward.py            # Walk-forward optimization
-│   ├── monte_carlo.py             # Monte Carlo simulation
-│   └── portfolio_backtest.py      # Multi-symbol portfolio backtest
-├── models/                        # Saved ML models (versioned .joblib)
-├── data_cache/                    # SQLite DB + cached data + events
-├── logs/                          # Application logs
-├── tests/                         # Test suite
-├── requirements.txt
-├── .env.example
-├── .gitignore
-├── Dockerfile
+│   ├── backtest.py                    # Simple custom backtester
+│   ├── bt_adapter.py                  # Backtrader adapter + strategies
+│   ├── vbt_adapter.py                 # VectorBT adapter + parameter sweep
+│   ├── walk_forward.py                # Walk-forward optimization
+│   ├── monte_carlo.py                 # Monte Carlo simulation engine
+│   ├── portfolio_backtest.py          # Multi-symbol portfolio backtest
+│   ├── runner.py                      # Backtest runner orchestration
+│   └── param_validator.py             # Parameter validation for backtests
+├── models/                            # Saved ML models (versioned .joblib)
+├── data_cache/                        # SQLite DB + cached data + events + snapshots
+├── logs/                              # Application logs (structlog JSON)
+├── tests/                             # Comprehensive test suite (50+ test files)
+├── .github/
+│   └── workflows/
+│       └── deploy.yml                 # CI/CD: Build → ACR → Azure Container Instances
+├── requirements.txt                   # Python dependencies
+├── .env.example                       # Environment variable template
+├── Dockerfile                         # Python 3.12-slim, non-root, health check
+├── pytest.ini                         # Test configuration
+├── verify_integration.py              # Integration verification script
 └── README.md
 ```
 
@@ -826,7 +1174,8 @@ algo-trader/
 
 ## Environment Configuration
 
-All configuration is done via `.env` file (see `.env.example` for template):
+All configuration is done via `.env` file (see `.env.example` for template).  
+Settings are loaded by Pydantic with validation, type coercion, and range checking.
 
 ### Core Settings
 
@@ -844,17 +1193,41 @@ All configuration is done via `.env` file (see `.env.example` for template):
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `TELEGRAM_BOT_TOKEN` | — | Bot token from @BotFather |
-| `TELEGRAM_CHAT_ID` | — | Your numeric chat ID (for auth) |
+| `TELEGRAM_CHAT_ID` | — | Your numeric chat ID (for auth; auto-detects if empty) |
+| `DISCORD_WEBHOOK_URL` | — | Discord webhook for notifications (optional) |
 
 ### Trading
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `ACTIVE_STRATEGY` | `momentum` | Default strategy |
-| `TRADING_SYMBOLS` | `AAPL,MSFT,...` | Comma-separated symbols |
+| `ACTIVE_STRATEGY` | `momentum` | Default strategy (`momentum`, `mean_reversion`, `ml`, `multi`) |
+| `TRADING_SYMBOLS` | `AAPL,MSFT,GOOGL,AMZN,NVDA,BTC/USD,ETH/USD,SOL/USD,AAVE/USD,ADA/USD` | Comma-separated symbols |
 | `TIMEFRAME` | `1Hour` | Candle timeframe |
 | `LOOKBACK_BARS` | `200` | Historical bars to analyze |
 | `TRADING_INTERVAL` | `60` | Seconds between trading cycles |
+| `MULTI_STRATEGY_CONFIG` | — | Multi-strategy format: `name:symbols:tf:interval:weight;...` |
+
+### Intelligence Layer
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `INTELLIGENCE_ENABLED` | `true` | Enable adaptive intelligence layer |
+| `INTELLIGENCE_MIN_TRADE_SCORE` | `70` | Minimum trade quality score (0–100) |
+| `INTELLIGENCE_DRIFT_WINDOW` | `200` | Rolling window for drift detection |
+| `INTELLIGENCE_DRIFT_MIN_SAMPLES` | `50` | Min samples before drift alerts fire |
+| `INTELLIGENCE_DRIFT_ALERT_DROP` | `0.12` | Accuracy drop threshold |
+
+### Risk Engine (4-Layer)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `RISK_PORTFOLIO_LAYER_ENABLED` | `true` | Enable portfolio risk layer |
+| `RISK_ACCOUNT_LAYER_ENABLED` | `true` | Enable account risk layer |
+| `RISK_EXPOSURE_LAYER_ENABLED` | `true` | Enable exposure risk layer |
+| `RISK_EXECUTION_LAYER_ENABLED` | `true` | Enable execution risk layer |
+| `RISK_MAX_DAILY_LOSS_PCT` | `0.03` | Daily loss circuit breaker |
+| `RISK_MAX_DRAWDOWN_PCT` | `0.15` | Maximum peak-to-trough drawdown |
+| `RISK_MIN_CASH_RESERVE_PCT` | `0.20` | Minimum cash buffer |
 
 ### Automation
 
@@ -864,6 +1237,33 @@ All configuration is done via `.env` file (see `.env.example` for template):
 | `AUTO_TRAIN_INTERVAL_HOURS` | `24` | Auto-retrain ML every N hours (0=off) |
 | `AUTO_SWEEP_INTERVAL_HOURS` | `12` | Auto parameter sweep every N hours (0=off) |
 | `AUTO_TRAIN_BARS` | `1000` | Bars to use for auto-training |
+
+### Model Governance
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MODEL_MIN_SHARPE_RATIO` | `0.5` | Minimum Sharpe for model promotion |
+| `MODEL_MAX_DRAWDOWN_PCT` | `0.20` | Maximum drawdown for promotion |
+| `MODEL_MIN_PRECISION` | `0.50` | Minimum prediction precision |
+| `MODEL_MIN_CV_ACCURACY` | `0.52` | Minimum cross-validation accuracy |
+| `MODEL_MIN_WALK_FORWARD_SHARPE` | `0.0` | Walk-forward Sharpe gate |
+| `MODEL_MIN_MONTE_CARLO_PROB_PROFIT` | `0.50` | Monte Carlo profit probability gate |
+| `MODEL_MIN_BACKTEST_TRADES` | `30` | Minimum trades for statistical validity |
+
+### Execution Simulator
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ENABLE_EXECUTION_SIMULATOR` | `true` | Enable execution realism modeling |
+| `EXECUTION_SIMULATOR_PRESET` | `realistic` | `realistic`, `conservative`, or `ideal` |
+
+### Self-Healing
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MODEL_MAX_RETRIES` | `3` | Max training retries on failure |
+| `MODEL_RETRY_BACKOFF_SECONDS` | `60` | Base backoff between retries |
+| `MODEL_STALE_THRESHOLD_HOURS` | `168` | Trigger retraining if model older than this |
 
 ---
 
@@ -877,7 +1277,9 @@ All configuration is done via `.env` file (see `.env.example` for template):
 
 ---
 
-## Docker Deployment
+## Deployment
+
+### Docker (Local)
 
 ```bash
 # Build
@@ -886,12 +1288,80 @@ docker build -t algo-trader .
 # Run (paper mode)
 docker run -d --name trader --env-file .env algo-trader
 
-# Run with live data feed
-docker run -d --name trader --env-file .env -e ALPACA_DATA_FEED=sip algo-trader
+# Run with live data feed and custom interval
+docker run -d --name trader --env-file .env \
+  -e ALPACA_DATA_FEED=sip \
+  algo-trader python main.py --interval 120
 
 # View logs
 docker logs -f trader
+
+# Stop
+docker stop trader && docker rm trader
 ```
+
+The Docker image uses:
+- Python 3.12-slim base
+- Non-root `trader` user (UID 1001)
+- Health check (30s interval)
+- Numba JIT cache redirected to writable directory
+- Persistent volumes recommended for `data_cache/`, `models/`, and `logs/`
+
+### Azure CI/CD (Production)
+
+The repository includes a GitHub Actions workflow (`.github/workflows/deploy.yml`) that:
+
+1. **Builds** the Docker image on every push to `main`
+2. **Pushes** to Azure Container Registry (`suezacr.azurecr.io`)
+3. **Deploys** to Azure Container Instances with:
+   - 1 CPU, 2 GB RAM
+   - Always-restart policy
+   - Secrets injected via secure environment variables
+   - Azure Log Analytics integration for observability
+4. **Verifies** the container reaches `Running` state
+
+Required GitHub Secrets:
+```
+ACR_USERNAME, ACR_PASSWORD          # Azure Container Registry credentials
+AZ_CREDENTIALS                      # Azure service principal JSON
+TRADING_MODE                        # paper or live
+ALPACA_PAPER_API_KEY, ALPACA_PAPER_SECRET_KEY
+ALPACA_LIVE_API_KEY, ALPACA_LIVE_SECRET_KEY
+TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+LOG_ANALYTICS_WORKSPACE_ID, LOG_ANALYTICS_WORKSPACE_KEY
+```
+
+---
+
+## Testing
+
+The test suite covers 50+ test files across all subsystems:
+
+```bash
+# Run all tests
+pytest
+
+# Run specific test file
+pytest tests/test_risk_engine.py
+
+# Run with verbose output
+pytest -v
+
+# Run tests matching a pattern
+pytest -k "test_intelligence"
+```
+
+Key test areas:
+- Event bus and subscribers
+- Risk engine (all 4 layers)
+- Strategy orchestrator
+- Intelligence layer (drift, scoring, routing)
+- ML lifecycle and governance
+- Configuration service and persistence
+- Telegram command handling
+- Portfolio reconciliation
+- Monte Carlo simulation determinism
+- Signal pipeline integration
 
 ---
 
@@ -900,11 +1370,42 @@ docker logs -f trader
 - ⚠️ **Always start with paper trading** — validate your strategy first
 - ⚠️ **Backtest thoroughly** before any live trading (use `/backtest`, `/walkforward`, `/montecarlo`)
 - ⚠️ **Never risk more than you can afford to lose**
-- The bot has built-in daily loss limits and circuit breakers
-- Live mode requires typing "YES" as confirmation on CLI
-- All trades are logged to SQLite for full audit trail
+- The bot has built-in daily loss limits, weekly drawdown limits, and multi-layer circuit breakers
+- Live mode requires typing "YES" as confirmation on CLI startup
+- All trades are logged to SQLite for full audit trail and forensic analysis
 - Use `/pause` on Telegram to immediately halt auto-trading
-- Use `/closeall` for emergency liquidation
+- Use `/closeall` for emergency liquidation (requires button confirmation)
 - Risk halts are automatic — the bot notifies you and stops trading
-- Model rollback (`/rollback`) lets you revert to known-good ML models
+- Model rollback (`/rollback`) lets you revert to known-good ML models instantly
 - The event store enables full crash recovery (`/recover`)
+- Portfolio reconciliation runs every 5 minutes to detect and fix state drift
+- The intelligence layer blocks low-quality trades even when the strategy fires a signal
+- Model promotion gates prevent deploying underperforming models to production
+- All Telegram commands are rate-limited (10 commands/minute per user)
+
+---
+
+## Tech Stack
+
+| Category | Technology |
+|----------|-----------|
+| Language | Python 3.12+ |
+| Trading API | Alpaca Markets (REST + WebSocket) |
+| ML Framework | XGBoost, scikit-learn |
+| Backtesting | Backtrader, VectorBT, custom engine |
+| Database | SQLite (SQLAlchemy + aiosqlite) |
+| Telegram Bot | aiogram 3.x (async) |
+| Configuration | Pydantic v2 + pydantic-settings |
+| Scheduling | APScheduler + custom DAG scheduler |
+| Logging | structlog (structured JSON) |
+| HTTP | httpx, aiohttp |
+| Visualization | matplotlib, plotly |
+| Deployment | Docker, Azure Container Instances |
+| CI/CD | GitHub Actions |
+| Monitoring | Azure Log Analytics |
+
+---
+
+## License
+
+Private repository. All rights reserved.
