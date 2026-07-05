@@ -64,7 +64,7 @@ Deployed on **Azure Container Instances** via GitHub Actions CI/CD pipeline.
 - ✅ **Counterfactual Engine** — what-if analysis on alternative trade decisions
 
 ### ML/AI
-- ✅ **XGBoost ML strategy** — 30+ engineered features, time-series cross-validation
+- ✅ **XGBoost ML strategy** — 120+ engineered features, time-series cross-validation
 - ✅ **Model governance** — version registry, lineage tracking (git hash, config hash, dataset hash), rollback
 - ✅ **A/B testing framework** — shadow, split-capital, and interleaved comparison with statistical significance
 - ✅ **Prediction registry** — full lifecycle tracking: prediction → outcome → quality grading
@@ -115,7 +115,7 @@ Deployed on **Azure Container Instances** via GitHub Actions CI/CD pipeline.
 ### Operations & Observability
 - ✅ **Full Telegram bot interface** — 50+ commands, inline buttons, real-time control
 - ✅ **Telegram audit forwarder** — ALL events + WARNING+ logs forwarded as rich HTML notifications
-- ✅ **Event-driven architecture** — 33+ domain event types, persistent event store, replay, crash recovery
+- ✅ **Event-driven architecture** — 35+ domain event types, persistent event store, replay, crash recovery
 - ✅ **CQRS read models** — incremental projections for fast dashboard queries
 - ✅ **State snapshotting** — periodic persistence for sub-second recovery
 - ✅ **Portfolio reconciliation** — periodic broker ↔ internal state sync with auto-fix
@@ -763,7 +763,7 @@ Statistical mean reversion:
 
 ### ML (XGBoost)
 Machine learning prediction:
-- 30+ engineered features (momentum, volatility, volume, pattern recognition)
+- 120+ engineered features (returns, trend, volatility, momentum, volume, candlestick, regime, statistical, time, cross-asset)
 - XGBoost multi-class classifier (BUY/HOLD/SELL)
 - Time-series cross-validation (prevents look-ahead bias)
 - Auto-retrain on schedule + drift-triggered
@@ -826,7 +826,7 @@ python main.py --strategy multi --strategies "momentum:AAPL,MSFT:1Hour:60:1.0;ml
 
 ### Event-Driven Core
 
-The system is built on a lightweight, thread-safe, in-process event bus with 33+ domain event types:
+The system is built on a lightweight, thread-safe, in-process event bus with 35+ domain event types:
 
 - **Signal & Order Events**: `SignalGenerated`, `OrderSubmitted`, `OrderFilled`, `OrderRejected`
 - **Trade Lifecycle**: `TradeOpened`, `TradeClosed`
@@ -1301,7 +1301,7 @@ algo-trader/
 │   │   └── market_state/
 │   │       └── engine.py              # Market fingerprint computation
 │   ├── ml/
-│   │   ├── features.py                # Feature engineering (30+ features)
+│   │   ├── features.py                # Feature engineering (120+ features)
 │   │   ├── feature_store.py           # Feature caching & schema versioning
 │   │   ├── predictor.py               # Model inference with double-buffered hot-swap
 │   │   ├── training_pipeline.py       # Full training pipeline with CV
@@ -1341,7 +1341,7 @@ algo-trader/
 │   │   ├── ops_commands.py            # Ops command handlers (health, latency, system)
 │   │   └── telemetry.py              # Telemetry & observability
 │   ├── core/
-│   │   ├── events.py                  # Domain events (33+ event types)
+│   │   ├── events.py                  # Domain events (35+ event types)
 │   │   ├── bus.py                     # Thread-safe event bus (pub/sub)
 │   │   ├── event_store.py             # Persistent SQLite event storage + replay
 │   │   ├── subscribers.py             # Default event subscribers (audit, journal, notifications)
@@ -1508,6 +1508,40 @@ Settings are loaded by Pydantic with validation, type coercion, and range checki
 | `MODEL_MAX_RETRIES` | `3` | Max training retries on failure |
 | `MODEL_RETRY_BACKOFF_SECONDS` | `60` | Base backoff between retries |
 | `MODEL_STALE_THRESHOLD_HOURS` | `168` | Trigger retraining if model older than this |
+| `MODEL_UNDERPERFORMANCE_WINDOW_HOURS` | `24` | Window for performance degradation detection |
+
+### Retraining Triggers
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `RETRAINING_MIN_OUTCOMES` | `500` | Minimum trade outcomes before retraining allowed |
+| `RETRAINING_DRIFT_THRESHOLD` | `0.15` | Concept drift magnitude to trigger retrain |
+| `RETRAINING_MAX_FREQUENCY_HOURS` | `48` | Minimum hours between retraining runs |
+
+### Portfolio Allocator
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PORTFOLIO_CORRELATION_THRESHOLD` | `0.70` | Max correlation before blocking new position |
+| `PORTFOLIO_MAX_SECTOR_CONCENTRATION` | `0.40` | Max fraction of capital in one sector |
+| `PORTFOLIO_CASH_RESERVE_MIN` | `0.10` | Minimum cash reserve percentage |
+| `PORTFOLIO_MAX_KELLY_FRACTION` | `0.25` | Kelly criterion cap (prevents over-betting) |
+
+### Shadow Deployment (A/B Testing)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SHADOW_MIN_PERIOD_HOURS` | `72` | Minimum shadow period before comparison |
+| `SHADOW_MIN_PREDICTIONS` | `100` | Minimum predictions before promotion decision |
+| `SHADOW_COMPARISON_THRESHOLD` | `0.05` | Minimum improvement to promote challenger |
+
+### Backtest Triggers
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `BACKTEST_TRIGGER_DATA_THRESHOLD` | `100` | New bars before auto-backtest triggers |
+| `BACKTEST_TRIGGER_PARAM_CHANGE` | `true` | Re-backtest on parameter change |
+| `BACKTEST_TRIGGER_DRIFT_THRESHOLD` | `0.12` | Drift magnitude triggering auto-backtest |
 
 ---
 
