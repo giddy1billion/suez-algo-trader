@@ -74,6 +74,25 @@ Deployed on **Azure Container Instances** via GitHub Actions CI/CD pipeline.
 - ✅ **Champion-challenger promotion** — automated model promotion with governance gates and audit trail
 - ✅ **Prediction calibration** — ECE/MCE/Brier score computation for confidence reliability analysis
 - ✅ **Model hot-swap** — zero-downtime double-buffered model loading with automatic fallback
+- ✅ **Online learning loop** — reward attribution, hard example mining, curated training sample selection between retrains
+
+### Decision Governance Engine
+- ✅ **Multi-dimensional confidence** — confidence as a first-class object (not a scalar), with comparison operators and full provenance
+- ✅ **7-stage confidence pipeline** — Signal Integrity → Data Quality → Model Health → Calibration → Decay → Regime Adjustment → Threshold
+- ✅ **Immutable DecisionContract** — frozen dataclass flowing through entire pipeline with integrity hash and veto authority
+- ✅ **Decision Orchestrator** — produces contracts from signal contexts; every decision passes through, no exceptions
+- ✅ **Contract Store (DuckDB)** — persistent storage of all contracts with replay, analytics, and outcome linkage
+- ✅ **Sizing Engine** — separates "Can I trade?" from "How much?"; confidence-weighted position sizing
+- ✅ **Uncertainty Estimation** — ensemble variance, bootstrap disagreement, Bayesian approximation for prediction uncertainty
+- ✅ **Feature Attribution** — per-prediction explanation of WHY (top contributing features with signed contributions)
+- ✅ **Portfolio Confidence** — correlation-aware discount; highly correlated signals penalized; concentration risk scoring
+- ✅ **Decision Lineage** — immutable trace IDs (D-YYYYMMDD-NNNNNN) linking prediction → risk → execution → trade → P&L → retraining
+- ✅ **Rejected Trade Learning** — counterfactual tracking of what rejected trades would have done; threshold sensitivity analysis
+- ✅ **Adaptive Thresholds** — per-regime EMA learning; thresholds evolve based on observed win rates by market condition
+- ✅ **Confidence Drift Monitor** — distribution shift detection; early warning before losses materialize
+- ✅ **Confidence Decay** — exponential/linear/step curves; signals lose validity over time with configurable half-life
+- ✅ **Market Regime Adjustment** — strategy-specific regime profiles; confidence discounted when regime doesn't match model strength
+- ✅ **Confidence Calibration** — binned outcome tracking, auto ECE correction, prevents systematic overconfidence
 
 ### Backtesting
 - ✅ **Backtrader engine** — event-driven backtesting with full analyzers
