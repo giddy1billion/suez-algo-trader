@@ -574,6 +574,18 @@ def cmd_run(
     def _on_trade_closed(event):
         """Record every trade close as a training sample with full context."""
         try:
+            # Look up contract decision/confidence from contract store
+            contract_decision = ""
+            contract_confidence = 0.0
+            if event.contract_id and contract_store:
+                try:
+                    replayed = contract_store.replay(event.contract_id)
+                    if replayed:
+                        contract_decision = replayed.get("decision", "")
+                        contract_confidence = replayed.get("final_confidence", 0.0)
+                except Exception:
+                    pass
+
             trade_result = {
                 "trade_id": event.trade_id,
                 "symbol": event.symbol,
@@ -589,6 +601,8 @@ def cmd_run(
                 "strategy_name": event.strategy_name,
                 "signal_package_id": event.signal_package_id,
                 "contract_id": event.contract_id,
+                "contract_decision": contract_decision,
+                "contract_confidence": contract_confidence,
             }
             post_trade_validator.validate_trade(trade_result)
 

@@ -683,3 +683,161 @@ class TestContractIdFlowsSystemWide:
             mgr.notify_trade({"symbol": "AAPL", "side": "BUY", "qty": 10, "price": 150.0, "signal_confidence": 0.7})
         assert len(sent) == 1
         assert "Contract" not in sent[0]  # No contract line when absent
+
+
+class TestContractRejectionOutcomes:
+    """Verify rejection paths record outcomes in contract store."""
+
+    def test_record_contract_rejection_helper(self):
+        """_record_contract_rejection stores outcome correctly."""
+        from src.execution.engine import ExecutionEngine
+        from src.intelligence.confidence.contract_store import ContractStore
+        import tempfile, shutil
+
+        test_dir = os.path.join(tempfile.gettempdir(), f"reject_test_{os.getpid()}")
+        if os.path.exists(test_dir):
+            shutil.rmtree(test_dir)
+
+        store = ContractStore(storage_path=test_dir)
+        try:
+            # Build and store a contract
+            builder = DecisionContractBuilder()
+            builder.set_symbol("BTC/USD")
+            builder.set_direction("sell")
+            builder.set_decision(Decision.EXECUTE)
+            builder.set_final_confidence(0.85)
+            builder.set_provenance(DecisionProvenance(model_version="v1"))
+            builder.add_stage(StageAssessment(stage="data_quality", score=0.9, passed=True, weight=0.15))
+            contract = builder.build()
+            store.store(contract)
+
+            # Create a minimal engine with contract store
+            mock_broker = MagicMock()
+            mock_broker.get_positions.return_value = []
+            mock_risk = MagicMock()
+            mock_risk.can_trade.return_value = (True, "")
+            mock_risk.daily_stats = MagicMock()
+
+            engine = ExecutionEngine(
+                strategies=[],
+                broker=mock_broker,
+                risk=mock_risk,
+            )
+            engine._contract_store = store
+
+            # Call the helper
+            engine._record_contract_rejection(contract, "BTC/USD", "risk_rejected")
+
+            # Verify outcome was recorded
+            replayed = store.replay(contract.contract_id)
+            assert replayed is not None
+            assert "_outcome" in replayed
+            assert replayed["_outcome"]["exit_reason"] == "risk_rejected"
+            assert replayed["_outcome"]["pnl"] == 0.0
+        finally:
+            store.close()
+            shutil.rmtree(test_dir, ignore_errors=True)
+
+    def test_post_trade_validator_extracts_contract_fields(self):
+        """PostTradeValidator populates contract fields from trade_result."""
+        from src.ml.feedback_loop import PostTradeValidator, ExperienceDatabase
+
+        test_dir = os.path.join(tempfile.gettempdir(), f"ptv_test_{os.getpid()}")
+        if os.path.exists(test_dir):
+            shutil.rmtree(test_dir)
+
+        db = ExperienceDatabase(storage_path=test_dir)
+        try:
+            validator = PostTradeValidator(experience_db=db)
+            trade_result = {
+                "trade_id": "T-999",
+                "symbol": "AAPL",
+                "side": "buy",
+                "entry_price": 150.0,
+                "exit_price": 155.0,
+                "pnl": 5.0,
+                "pnl_pct": 3.33,
+                "entry_time": "2024-01-15T10:00:00",
+                "exit_time": "2024-01-15T14:00:00",
+                "fees": 0.5,
+                "model_version": "v2.1",
+                "strategy": "momentum",
+                "contract_id": "dc_test_12345",
+                "contract_decision": "EXECUTE",
+                "contract_confidence": 0.87,
+            }
+            scorecard = validator.validate_trade(trade_result)
+            assert scorecard.contract_id == "dc_test_12345"
+            assert scorecard.contract_decision == "EXECUTE"
+            assert scorecard.contract_confidence == 0.87
+        finally:
+            db._conn.close()
+            shutil.rmtree(test_dir, ignore_errors=True)
+
+    def test_get_trades_includes_contract_id(self):
+        """DatabaseManager.get_trades() returns contract_id."""
+        from src.data.store import DatabaseManager
+
+        test_dir = os.path.join(tempfile.gettempdir(), f"store_test_{os.getpid()}")
+        if os.path.exists(test_dir):
+            shutil.rmtree(test_dir)
+        os.makedirs(test_dir, exist_ok=True)
+        db_path = os.path.join(test_dir, "test.db")
+
+        db = DatabaseManager(db_url=f"sqlite:///{db_path}")
+        try:
+            db.record_trade({
+                "symbol": "MSFT",
+                "side": "buy",
+                "qty": 5,
+                "price": 400.0,
+                "order_type": "market",
+                "status": "filled",
+                "order_id": "ORD-001",
+                "strategy": "momentum",
+                "signal_confidence": 0.8,
+                "contract_id": "dc_contract_xyz",
+            })
+            trades = db.get_trades(symbol="MSFT")
+            assert len(trades) >= 1
+            assert trades[0]["contract_id"] == "dc_contract_xyz"
+        finally:
+            shutil.rmtree(test_dir, ignore_errors=True)
+
+    def test_emergency_liquidation_includes_contract_id(self):
+        """Emergency liquidation publishes TradeClosed with contract_id."""
+        from src.execution.engine import ExecutionEngine
+        from src.core.events import TradeClosed
+
+        mock_broker = MagicMock()
+        mock_broker.cancel_all_orders.return_value = None
+        mock_broker.close_all_positions.return_value = None
+        mock_broker.get_positions.return_value = [
+            {"symbol": "AAPL", "unrealized_pl": -50, "current_price": 145.0,
+             "avg_entry_price": 150.0, "asset_id": "trade_001"}
+        ]
+
+        mock_risk = MagicMock()
+        mock_risk.daily_stats = MagicMock()
+        mock_risk.daily_stats.is_halted = False
+
+        engine = ExecutionEngine(
+            strategies=[],
+            broker=mock_broker,
+            risk=mock_risk,
+        )
+
+        # Simulate a trade context that has contract_id
+        engine._trade_context["trade_001"] = {
+            "contract_id": "dc_emergency_test",
+            "side": "buy",
+        }
+
+        published_events = []
+        engine._publish = lambda e: published_events.append(e)
+
+        engine.emergency_liquidate()
+
+        trade_closed_events = [e for e in published_events if isinstance(e, TradeClosed)]
+        assert len(trade_closed_events) == 1
+        assert trade_closed_events[0].contract_id == "dc_emergency_test"

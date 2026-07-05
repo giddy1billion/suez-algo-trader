@@ -828,6 +828,11 @@ class PostTradeValidator:
 
         trade_id = trade_result.get("trade_id", str(uuid.uuid4())[:12])
 
+        # Extract contract information from trade_result
+        contract_id = trade_result.get("contract_id", "")
+        contract_decision = trade_result.get("contract_decision", "")
+        contract_confidence = trade_result.get("contract_confidence", 0.0)
+
         scorecard = TradeScorecard(
             trade_id=trade_id,
             signal_id=signal_id,
@@ -863,6 +868,9 @@ class PostTradeValidator:
             timing_score=timing_score,
             exit_efficiency=exit_efficiency,
             overall_score=overall_score,
+            contract_id=contract_id,
+            contract_decision=contract_decision,
+            contract_confidence=contract_confidence,
         )
 
         self._db.record_trade(scorecard)

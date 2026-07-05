@@ -63,7 +63,7 @@ class NotificationManager:
         )
 
         if contract_id:
-            message += f"\nContract: {contract_id[:12]}"
+            message += f"\nContract: {contract_id[:20]}"
         if trade.get('stop_loss'):
             message += f"\nSL: ${trade['stop_loss']:.2f}"
         if trade.get('take_profit'):

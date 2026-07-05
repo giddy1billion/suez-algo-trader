@@ -532,6 +532,7 @@ class ExecutionEngine:
                     vetoed=decision_contract.vetoed,
                     signal_id=signal.signal_id,
                 )
+                self._record_contract_rejection(decision_contract, signal.symbol, "contract_rejected")
                 self._log_signal_v2(signal, executed=False)
                 return None
 
@@ -652,6 +653,7 @@ class ExecutionEngine:
         if not decision.approved:
             logger.info("engine.trade_rejected", symbol=signal.symbol, reasons=decision.reasons)
             self._log_signal_v2(signal, executed=False)
+            self._record_contract_rejection(decision_contract, signal.symbol, "risk_rejected")
             if trade_lifecycle:
                 trade_lifecycle.transition(TradeState.RISK_REJECTED, "; ".join(decision.reasons))
             return None
@@ -669,6 +671,7 @@ class ExecutionEngine:
         if self.dry_run:
             logger.info("engine.dry_run", symbol=signal.symbol, side=side, qty=final_qty,
                        price=observed_price, signal_strength=signal.signal_strength)
+            self._record_contract_rejection(decision_contract, signal.symbol, "dry_run")
             return {
                 "symbol": signal.symbol,
                 "side": side,
@@ -708,6 +711,7 @@ class ExecutionEngine:
                     reason=f"sim_rejected: {sim_result.get('rejection_reason', 'no_fill')}",
                     source="simulator",
                 ))
+                self._record_contract_rejection(decision_contract, signal.symbol, "sim_rejected")
                 if trade_lifecycle:
                     trade_lifecycle.transition(TradeState.CANCELLED, "sim_rejected")
                 return None
@@ -759,6 +763,7 @@ class ExecutionEngine:
                     reason=error_msg,
                     source="broker",
                 ))
+                self._record_contract_rejection(decision_contract, signal.symbol, "broker_rejected")
                 return None
 
             # Publish OrderSubmitted event
@@ -900,7 +905,28 @@ class ExecutionEngine:
             ))
             if trade_lifecycle:
                 trade_lifecycle.transition(TradeState.ERROR, f"order_failed: {str(e)[:80]}")
+            self._record_contract_rejection(decision_contract, signal.symbol, "order_exception")
             return None
+
+    def _record_contract_rejection(
+        self, contract, symbol: str, reason: str
+    ) -> None:
+        """Record a contract outcome for rejected/failed execution attempts."""
+        if contract and self._contract_store:
+            try:
+                self._contract_store.record_outcome(
+                    contract_id=contract.contract_id,
+                    trade_id="",
+                    symbol=symbol,
+                    side=contract.direction,
+                    entry_price=0.0,
+                    exit_price=0.0,
+                    pnl=0.0,
+                    pnl_pct=0.0,
+                    exit_reason=reason,
+                )
+            except Exception as e:
+                logger.debug("engine.contract_rejection_record_error", error=str(e))
 
     def _check_exits(self, strategy: BaseStrategy, positions: list[dict], data: dict) -> list[dict]:
         """Check if any open positions should be closed based on strategy logic."""
@@ -1117,8 +1143,9 @@ class ExecutionEngine:
             if entry_price and abs(entry_price) > 1e-8:
                 pnl_pct = (current_price - entry_price) / entry_price * 100
 
-            # Transition trade lifecycle
+            # Transition trade lifecycle and retrieve contract_id
             trade_id = pos.get('asset_id', '')
+            contract_id = ""
             if self._trade_manager:
                 active_trades = self._trade_manager.get_trades_by_symbol(symbol)
                 for t in active_trades:
@@ -1126,7 +1153,12 @@ class ExecutionEngine:
                         t.transition(TradeState.CLOSING, "emergency_liquidation")
                         t.transition(TradeState.CLOSED, "emergency_liquidation")
                         trade_id = t.trade_id
+                        contract_id = t.metadata.get("contract_id", "")
                         break
+
+            # Fallback: check _trade_context for contract_id
+            if not contract_id and trade_id and trade_id in self._trade_context:
+                contract_id = self._trade_context[trade_id].get("contract_id", "")
 
             self._publish(TradeClosed(
                 trade_id=trade_id,
@@ -1135,8 +1167,27 @@ class ExecutionEngine:
                 pnl=pnl,
                 pnl_pct=pnl_pct,
                 reason="emergency_liquidation",
+                contract_id=contract_id,
                 source="engine",
             ))
+
+            # Record outcome in contract store
+            if contract_id and self._contract_store:
+                try:
+                    side = self._trade_context.get(trade_id, {}).get("side", "buy")
+                    self._contract_store.record_outcome(
+                        contract_id=contract_id,
+                        trade_id=trade_id,
+                        symbol=symbol,
+                        side=side,
+                        entry_price=entry_price,
+                        exit_price=current_price,
+                        pnl=pnl,
+                        pnl_pct=pnl_pct,
+                        exit_reason="emergency_liquidation",
+                    )
+                except Exception as e:
+                    logger.debug("engine.emergency_outcome_record_error", error=str(e))
 
         self.risk.daily_stats.is_halted = True
         self.risk.daily_stats.halt_reason = "Emergency liquidation triggered"

@@ -225,6 +225,7 @@ class DatabaseManager:
                     "take_profit": t.take_profit, "pnl": t.pnl, "pnl_pct": t.pnl_pct,
                     "fees": t.fees, "created_at": str(t.created_at),
                     "filled_at": str(t.filled_at) if t.filled_at else None,
+                    "contract_id": getattr(t, 'contract_id', '') or '',
                 }
                 for t in trades
             ]
