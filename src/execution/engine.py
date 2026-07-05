@@ -603,6 +603,7 @@ class ExecutionEngine:
             trade_lifecycle = self._trade_manager.create_trade(signal.symbol, side)
             if not trade_lifecycle.transition(TradeState.PENDING_RISK, "risk evaluation"):
                 logger.warning("engine.invalid_transition", symbol=signal.symbol, state="PENDING_RISK")
+                self._record_contract_rejection(decision_contract, signal.symbol, "state_machine_error")
                 return None  # Abort: state machine inconsistency
 
         # Get account cash for risk evaluation
@@ -635,6 +636,7 @@ class ExecutionEngine:
         except Exception as e:
             logger.error("engine.risk_evaluation_exception", symbol=signal.symbol, error=str(e))
             self._log_signal_v2(signal, executed=False)
+            self._record_contract_rejection(decision_contract, signal.symbol, "risk_exception")
             if trade_lifecycle:
                 trade_lifecycle.transition(TradeState.RISK_REJECTED, f"risk_exception: {str(e)[:80]}")
             return None

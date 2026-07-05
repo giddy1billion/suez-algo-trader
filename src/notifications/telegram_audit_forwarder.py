@@ -149,10 +149,14 @@ def _format_trade_opened(event: TradeOpened) -> str:
 
 def _format_trade_closed(event: TradeClosed) -> str:
     emoji = "💰" if event.pnl >= 0 else "💸"
+    contract_line = ""
+    if event.contract_id:
+        contract_line = f"\nContract: <code>{event.contract_id[:20]}</code>"
     return (
         f"{emoji} <b>Trade Closed: {event.symbol}</b>\n"
         f"PnL: <code>${event.pnl:.2f} ({event.pnl_pct:.2f}%)</code>\n"
         f"Reason: <code>{event.reason}</code>"
+        f"{contract_line}"
     )
 
 

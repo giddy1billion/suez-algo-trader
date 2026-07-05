@@ -403,14 +403,25 @@ class ModelRegistry:
 
         If the registry manifest is missing but versioned .joblib files exist,
         reconstruct the registry and mark the newest as active.
+        Also includes latest_model.joblib if no versioned files found.
         This prevents the predictor.no_active_version warning after data loss.
         """
+        # Already recovered (race condition guard)
+        if os.path.exists(self.registry_path):
+            return
+
         model_files = sorted([
             f for f in os.listdir(self.models_dir)
             if f.startswith("v") and f.endswith(".joblib")
         ])
 
+        # If no versioned files but latest_model.joblib exists, include it
+        if not model_files and os.path.exists(self.latest_path):
+            model_files = ["latest_model.joblib"]
+
         if not model_files:
+            # Clean up any orphaned temp files from failed writes
+            self._cleanup_temp_files()
             return
 
         logger.warning(
@@ -423,7 +434,7 @@ class ModelRegistry:
             # Parse trained_at from filename pattern: v001_20260703_110304.joblib
             parts = filename.replace(".joblib", "").split("_")
             trained_at = datetime.now().isoformat()
-            if len(parts) >= 3:
+            if len(parts) >= 3 and parts[0].startswith("v"):
                 try:
                     date_str = parts[1]
                     time_str = parts[2]
@@ -448,11 +459,21 @@ class ModelRegistry:
             registry.append(entry)
 
         self._save_registry(registry)
+        self._cleanup_temp_files()
         logger.info(
             "ml.registry.recovery_complete",
             versions=len(registry),
             active=f"v{len(registry):03d}",
         )
+
+    def _cleanup_temp_files(self) -> None:
+        """Remove orphaned registry temp files from failed atomic writes."""
+        try:
+            for f in os.listdir(self.models_dir):
+                if f.startswith("registry_") and f.endswith(".json"):
+                    os.remove(os.path.join(self.models_dir, f))
+        except OSError:
+            pass
 
     def _get_features_for_entry(self, entry: dict) -> list[str]:
         """Load features list for a registry entry from the model file."""

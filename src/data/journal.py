@@ -380,6 +380,7 @@ class TradeJournal:
             "market_regime": entry.market_regime,
             "volatility_at_entry": entry.volatility_at_entry,
             "created_at": str(entry.created_at) if entry.created_at else None,
+            "contract_id": getattr(entry, 'contract_id', '') or '',
         }
 
     @staticmethod

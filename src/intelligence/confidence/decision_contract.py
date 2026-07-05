@@ -767,6 +767,12 @@ class DecisionContractBuilder:
             raise RuntimeError("DecisionContractBuilder already consumed. Call reset() first.")
         self._built = True
 
+        if not self._symbol or not self._direction:
+            raise ValueError(
+                f"DecisionContractBuilder requires symbol and direction. "
+                f"Got symbol='{self._symbol}', direction='{self._direction}'"
+            )
+
         now = datetime.now(timezone.utc)
         valid_until = now + timedelta(minutes=self._validity_minutes)
 

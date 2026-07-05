@@ -447,27 +447,32 @@ class ModelPredictor:
         """Load the currently active model from registry."""
         active_version = self._registry.get_active_version()
         if active_version is None:
-            # Attempt fallback: load latest_model.joblib directly
-            latest_path = self._registry.latest_path
-            if os.path.exists(latest_path):
-                try:
-                    import joblib
-                    artifact = joblib.load(latest_path)
-                    self._model = artifact["model"]
-                    self._features = artifact.get("features", [])
-                    self._version = "latest_fallback"
-                    self._loaded_at = datetime.now(timezone.utc)
-                    logger.warning(
-                        "predictor.loaded_from_fallback",
-                        path=latest_path,
-                        n_features=len(self._features),
-                    )
-                    return
-                except Exception as e:
-                    logger.error("predictor.fallback_load_failed", error=str(e))
+            # Attempt self-healing: trigger registry recovery if model files exist
+            self._registry._recover_orphaned_models()
+            active_version = self._registry.get_active_version()
 
-            logger.warning("predictor.no_active_version")
-            return
+            if active_version is None:
+                # Last resort: load latest_model.joblib directly
+                latest_path = self._registry.latest_path
+                if os.path.exists(latest_path):
+                    try:
+                        import joblib
+                        artifact = joblib.load(latest_path)
+                        self._model = artifact["model"]
+                        self._features = artifact.get("features", [])
+                        self._version = "v000_fallback"
+                        self._loaded_at = datetime.now(timezone.utc)
+                        logger.warning(
+                            "predictor.loaded_from_fallback",
+                            path=latest_path,
+                            n_features=len(self._features),
+                        )
+                        return
+                    except Exception as e:
+                        logger.error("predictor.fallback_load_failed", error=str(e))
+
+                logger.warning("predictor.no_active_version")
+                return
 
         if active_version == self._version:
             return  # Already loaded
