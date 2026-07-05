@@ -629,6 +629,10 @@ class TrainingPipeline:
         X = valid[feature_cols].values
         y = valid['target'].values
 
+        # Remap labels: -1→0 (sell/down), 0→1 (hold/flat), 1→2 (buy/up)
+        # XGBClassifier requires contiguous classes starting from 0
+        y = (y + 1).astype(int)
+
         # Time-series cross-validation
         tscv = TimeSeriesSplit(n_splits=5)
         cv_scores = []
