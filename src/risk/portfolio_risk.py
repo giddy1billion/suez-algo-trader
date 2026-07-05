@@ -186,7 +186,7 @@ class PortfolioRiskLayer:
         if request.side == "buy":
             new_net = (long_exposure + adjusted_qty * request.price - short_exposure) / portfolio_value
         else:
-            new_net = (long_exposure - short_exposure - adjusted_qty * request.price) / portfolio_value
+            new_net = (long_exposure - (short_exposure + adjusted_qty * request.price)) / portfolio_value
 
         if abs(new_net) > self.max_net_exposure_pct:
             return LayerDecision(

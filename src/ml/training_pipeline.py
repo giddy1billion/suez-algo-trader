@@ -474,20 +474,24 @@ class TrainingPipeline:
             df_copy['_symbol'] = symbol
             all_dfs.append(df_copy)
 
-        combined = pd.concat(all_dfs, ignore_index=True)
-
-        # Create target: forward return direction
+        # Compute target per-symbol BEFORE concatenation to avoid cross-symbol leakage
         forward_bars = 5
         threshold = 0.005
-        combined['future_return'] = combined['close'].shift(-forward_bars) / combined['close'] - 1
-        combined['target'] = np.where(
-            combined['future_return'] > threshold, 1,
-            np.where(combined['future_return'] < -threshold, -1, 0)
-        )
+        for df_copy in all_dfs:
+            df_copy['future_return'] = df_copy['close'].shift(-forward_bars) / df_copy['close'] - 1
+            df_copy['target'] = np.where(
+                df_copy['future_return'] > threshold, 1,
+                np.where(df_copy['future_return'] < -threshold, -1, 0)
+            )
+
+        combined = pd.concat(all_dfs, ignore_index=True)
 
         # Get feature columns (exclude meta and target)
         exclude_cols = {'target', 'future_return', '_symbol', 'open', 'high', 'low', 'close', 'volume'}
         feature_cols = [c for c in combined.columns if c not in exclude_cols]
+
+        # Drop forward-looking column to ensure no leakage into features
+        combined = combined.drop(columns=['future_return'], errors='ignore')
 
         # Drop NaN rows
         valid = combined.dropna(subset=feature_cols + ['target'])
@@ -504,6 +508,13 @@ class TrainingPipeline:
         cv_scores = []
 
         for train_idx, val_idx in tscv.split(X):
+            # Skip warmup bars at start of test fold to avoid cold-start bias
+            # (features like EMA with long lookback will have NaN at fold start)
+            embargo_bars = 100
+            val_idx = val_idx[embargo_bars:]
+            if len(val_idx) == 0:
+                continue
+
             X_train, X_val = X[train_idx], X[val_idx]
             y_train, y_val = y[train_idx], y[val_idx]
 

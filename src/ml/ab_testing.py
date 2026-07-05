@@ -363,24 +363,35 @@ class ABTestManager:
     # Routing
     # ──────────────────────────────────────────────────────────────────────
 
-    def should_use_challenger(self) -> bool:
+    def _get_assignment(self, prediction_id: str, test: "ABTest") -> str:
+        """Deterministic assignment based on prediction_id hash."""
+        import hashlib
+        hash_val = int(hashlib.md5(prediction_id.encode()).hexdigest(), 16)
+        if (hash_val % 100) < int(test.allocation_pct * 100):
+            return "challenger"
+        return "champion"
+
+    def should_use_challenger(self, prediction_id: Optional[str] = None) -> bool:
         """
         Determine if this prediction should use the challenger model.
 
         Used in SPLIT mode to route a fraction of decisions to challenger.
+        Uses deterministic hash-based assignment for consistency.
         """
         with self._lock:
             if not self._active_test or self._active_test.status != ABTestStatus.ACTIVE:
                 return False
             if self._active_test.mode != ABTestMode.SPLIT:
                 return False
-            return np.random.random() < self._active_test.allocation_pct
+            if prediction_id is None:
+                prediction_id = f"{time.time_ns()}"
+            return self._get_assignment(prediction_id, self._active_test) == "challenger"
 
-    def get_active_version_for_prediction(self) -> str:
+    def get_active_version_for_prediction(self, prediction_id: Optional[str] = None) -> str:
         """
         Get which model version to use for this prediction.
 
-        In SPLIT mode, randomly routes based on allocation.
+        In SPLIT mode, uses deterministic hash-based routing.
         In SHADOW mode, always returns champion (shadow runs separately).
         """
         with self._lock:
@@ -389,7 +400,9 @@ class ABTestManager:
 
             test = self._active_test
             if test.mode == ABTestMode.SPLIT:
-                if np.random.random() < test.allocation_pct:
+                if prediction_id is None:
+                    prediction_id = f"{time.time_ns()}"
+                if self._get_assignment(prediction_id, test) == "challenger":
                     return test.challenger_version
                 return test.champion_version
             elif test.mode == ABTestMode.INTERLEAVED:

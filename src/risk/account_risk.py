@@ -107,6 +107,11 @@ class AccountRiskLayer:
             if was_day_trade:
                 self._day_trades.append(date.today())
 
+    def initialize_equity(self, account_value: float) -> None:
+        """Set peak equity to the starting account value so drawdown protection is active immediately."""
+        with self._lock:
+            self._peak_equity = account_value
+
     def reset_halt(self) -> None:
         """Manually reset a halt condition (e.g., next trading day)."""
         with self._lock:
@@ -200,9 +205,11 @@ class AccountRiskLayer:
                 )
 
         # 3. Max drawdown from peak
+        equity = getattr(self, "_current_equity", portfolio_value)
+        if self._peak_equity == 0.0 and equity > 0:
+            self._peak_equity = equity
         if self._peak_equity > 0:
-            current_equity = getattr(self, "_current_equity", portfolio_value)
-            drawdown = (self._peak_equity - current_equity) / self._peak_equity
+            drawdown = (self._peak_equity - equity) / self._peak_equity
             if drawdown >= self.max_drawdown_pct:
                 self._is_halted = True
                 self._halt_reason = f"Max drawdown hit: {drawdown:.1%} from peak"

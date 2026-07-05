@@ -14,6 +14,7 @@ Architecture:
 Each slot runs on its own cadence (interval) and can be enabled/disabled at runtime.
 """
 
+import copy
 import threading
 import time
 from dataclasses import dataclass, field
@@ -194,13 +195,15 @@ class StrategyOrchestrator:
         all_results = []
         for slot in due:
             try:
-                # Temporarily set strategy symbols
-                slot.strategy.symbols = slot.symbols
-                slot.strategy.timeframe = slot.timeframe
+                # Create a shallow copy to avoid mutating shared strategy state
+                # (race condition if multiple slots share the same strategy instance)
+                strategy_instance = copy.copy(slot.strategy)
+                strategy_instance.symbols = slot.symbols
+                strategy_instance.timeframe = slot.timeframe
 
                 capital_weight = weights.get(slot.name, 1.0)
-                results = engine.run_cycle(slot.strategy, capital_weight=capital_weight)
-                signal_count = len(slot.strategy.symbols)  # approximate
+                results = engine.run_cycle(strategy_instance, capital_weight=capital_weight)
+                signal_count = len(slot.symbols)  # approximate
                 slot.record_cycle(signal_count, results)
 
                 # Tag results with strategy name for tracking

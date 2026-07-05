@@ -110,6 +110,27 @@ class ModelPredictor:
             if self._model is None:
                 raise RuntimeError("No model loaded. Train or register a model first.")
 
+            # Validate features before prediction
+            if features.ndim == 1:
+                features = features.reshape(1, -1)
+
+            if hasattr(self._model, 'n_features_in_'):
+                expected = self._model.n_features_in_
+                actual = features.shape[1]
+                if actual != expected:
+                    raise ValueError(
+                        f"Feature count mismatch: model expects {expected}, got {actual}"
+                    )
+
+            # Check for NaN/inf
+            nan_count = np.isnan(features).sum()
+            if nan_count > 0:
+                inf_count = np.isinf(features).sum()
+                if nan_count == features.size:
+                    raise ValueError("All features are NaN - cannot predict")
+                logger.warning("predictor.nan_features", nan_count=int(nan_count), inf_count=int(inf_count))
+                features = np.where(np.isnan(features) | np.isinf(features), 0.0, features)
+
             try:
                 predictions = self._model.predict(features)
                 self._prediction_count += 1
@@ -149,6 +170,27 @@ class ModelPredictor:
 
             if not hasattr(self._model, 'predict_proba'):
                 raise RuntimeError(f"Model {self._version} doesn't support predict_proba")
+
+            # Validate features before prediction
+            if features.ndim == 1:
+                features = features.reshape(1, -1)
+
+            if hasattr(self._model, 'n_features_in_'):
+                expected = self._model.n_features_in_
+                actual = features.shape[1]
+                if actual != expected:
+                    raise ValueError(
+                        f"Feature count mismatch: model expects {expected}, got {actual}"
+                    )
+
+            # Check for NaN/inf
+            nan_count = np.isnan(features).sum()
+            if nan_count > 0:
+                inf_count = np.isinf(features).sum()
+                if nan_count == features.size:
+                    raise ValueError("All features are NaN - cannot predict")
+                logger.warning("predictor.nan_features", nan_count=int(nan_count), inf_count=int(inf_count))
+                features = np.where(np.isnan(features) | np.isinf(features), 0.0, features)
 
             try:
                 proba = self._model.predict_proba(features)

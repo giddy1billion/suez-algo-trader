@@ -109,6 +109,11 @@ class ExecutionEngine:
             except Exception as e:
                 logger.warning("event_bus.publish_error", event_type=type(event).__name__, error=str(e))
 
+    def _has_trade_stream(self) -> bool:
+        """Check if broker has an active trade stream for fill confirmations."""
+        return getattr(self.broker, '_trade_stream_thread', None) is not None and \
+               getattr(self.broker, '_shutdown_flag', True) is False
+
     # ──────────────────────────────────────────────────────────────────────
     # Main Loop
     # ──────────────────────────────────────────────────────────────────────
@@ -464,6 +469,22 @@ class ExecutionEngine:
                     qty=final_qty,
                     side=side,
                 )
+
+            # Check for error response (e.g., broker rejection, insufficient funds)
+            if not order or order.get("error"):
+                error_msg = order.get("message", "Unknown order error") if order else "No response from broker"
+                logger.error("engine.order_rejected_by_broker",
+                            symbol=signal.symbol, error=error_msg, side=side)
+
+                if trade_lifecycle:
+                    trade_lifecycle.transition(TradeState.CANCELLED, f"broker_rejected: {error_msg}")
+
+                self._publish(OrderRejected(
+                    order_id="",
+                    reason=error_msg,
+                    source="broker",
+                ))
+                return None
 
             # Publish OrderSubmitted event
             self._publish(OrderSubmitted(

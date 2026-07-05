@@ -61,6 +61,35 @@ from src.core.runtime_state import RuntimeState
 
 logger = get_logger(__name__)
 
+# ──────────────────────────────────────────────────────────────────────────
+# Per-user command rate limiter
+# ──────────────────────────────────────────────────────────────────────────
+
+from collections import defaultdict
+import time as _time
+
+
+class _CommandRateLimiter:
+    """Per-user token bucket rate limiter."""
+
+    def __init__(self, max_commands: int = 10, window_seconds: float = 60.0):
+        self._max = max_commands
+        self._window = window_seconds
+        self._timestamps: dict[int, list[float]] = defaultdict(list)
+
+    def is_allowed(self, user_id: int) -> bool:
+        """Check if user is within rate limit."""
+        now = _time.time()
+        timestamps = self._timestamps[user_id]
+        self._timestamps[user_id] = [t for t in timestamps if now - t < self._window]
+        if len(self._timestamps[user_id]) >= self._max:
+            return False
+        self._timestamps[user_id].append(now)
+        return True
+
+
+_rate_limiter = _CommandRateLimiter(max_commands=10, window_seconds=60.0)
+
 router = Router()
 
 # These get set during bot initialization
@@ -474,6 +503,9 @@ async def cmd_signals(message: Message):
 async def cmd_buy(message: Message):
     if not _is_authorized(message) or not _broker:
         return
+    if not _rate_limiter.is_allowed(message.from_user.id):
+        await message.answer("⚠️ Rate limit exceeded. Please wait before sending more commands.")
+        return
 
     parts = message.text.split()
     if len(parts) < 3:
@@ -504,6 +536,9 @@ async def cmd_buy(message: Message):
 async def cmd_sell(message: Message):
     if not _is_authorized(message) or not _broker:
         return
+    if not _rate_limiter.is_allowed(message.from_user.id):
+        await message.answer("⚠️ Rate limit exceeded. Please wait before sending more commands.")
+        return
 
     parts = message.text.split()
     if len(parts) < 3:
@@ -533,6 +568,9 @@ async def cmd_sell(message: Message):
 async def cmd_close(message: Message):
     if not _is_authorized(message) or not _broker:
         return
+    if not _rate_limiter.is_allowed(message.from_user.id):
+        await message.answer("⚠️ Rate limit exceeded. Please wait before sending more commands.")
+        return
 
     parts = message.text.split()
     if len(parts) < 2:
@@ -555,6 +593,9 @@ async def cmd_close(message: Message):
 @router.message(Command("closeall"))
 async def cmd_closeall(message: Message):
     if not _is_authorized(message) or not _broker:
+        return
+    if not _rate_limiter.is_allowed(message.from_user.id):
+        await message.answer("⚠️ Rate limit exceeded. Please wait before sending more commands.")
         return
 
     kb = InlineKeyboardMarkup(inline_keyboard=[

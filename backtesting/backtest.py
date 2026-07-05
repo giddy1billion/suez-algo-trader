@@ -216,7 +216,9 @@ class Backtester:
                         hold_bars=i - position['entry_bar'],
                     )
                     trades.append(trade)
-                    capital += trade.pnl - (trade.pnl * self.commission_pct)
+                    # Commission on exit notional (entry commission already deducted at entry)
+                    exit_commission = trade.qty * exit_price * self.commission_pct
+                    capital += trade.pnl - exit_commission
                     position = None
 
             # Enter new position (only if no existing position)
@@ -243,6 +245,10 @@ class Backtester:
                 # Apply slippage to entry
                 entry_price = current_price * (1 + self.slippage_pct) if side == 'buy' else current_price * (1 - self.slippage_pct)
 
+                # Deduct entry commission from capital (based on entry notional)
+                entry_commission = qty * entry_price * self.commission_pct
+                capital -= entry_commission
+
                 position = {
                     'side': side,
                     'entry_price': entry_price,
@@ -251,6 +257,7 @@ class Backtester:
                     'take_profit': signal.take_profit,
                     'entry_time': current_time,
                     'entry_bar': i,
+                    'entry_commission': entry_commission,
                 }
 
             # Track equity
@@ -277,7 +284,9 @@ class Backtester:
                 hold_bars=len(data) - position['entry_bar'],
             )
             trades.append(trade)
-            capital += trade.pnl
+            # Commission on exit notional (entry commission already deducted at entry)
+            exit_commission = trade.qty * last_price * self.commission_pct
+            capital += trade.pnl - exit_commission
 
         # Calculate metrics
         return self._calculate_metrics(symbol, data, capital, trades, equity_curve)

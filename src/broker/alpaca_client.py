@@ -195,6 +195,8 @@ class AlpacaBroker:
         # Trade update stream (initialized on demand)
         self._trade_stream: Optional[TradingStream] = None
         self._trade_stream_thread: Optional[threading.Thread] = None
+        self._trade_stream_handler = None
+        self._shutdown_flag: bool = False
 
         logger.info("broker.initialized", paper=paper, data_feed=data_feed, timeout=timeout)
 
@@ -764,14 +766,17 @@ class AlpacaBroker:
 
     def _order_to_dict(self, order) -> dict:
         """Convert an Alpaca order object to a clean dict."""
+        qty = float(order.qty) if order.qty else 0
+        filled_qty = float(order.filled_qty) if order.filled_qty else 0
         return {
             "id": str(order.id),
             "symbol": order.symbol,
             "side": order.side.value if order.side else None,
             "type": order.type.value if order.type else None,
-            "qty": float(order.qty) if order.qty else None,
+            "qty": qty or None,
             "notional": float(order.notional) if getattr(order, 'notional', None) else None,
-            "filled_qty": float(order.filled_qty) if order.filled_qty else 0,
+            "filled_qty": filled_qty,
+            "remaining_qty": qty - filled_qty,
             "filled_avg_price": float(order.filled_avg_price) if getattr(order, 'filled_avg_price', None) else None,
             "limit_price": float(order.limit_price) if order.limit_price else None,
             "stop_price": float(order.stop_price) if order.stop_price else None,
@@ -779,6 +784,16 @@ class AlpacaBroker:
             "created_at": str(order.created_at) if order.created_at else None,
             "filled_at": str(order.filled_at) if order.filled_at else None,
         }
+
+    @_retry()
+    def get_order_status(self, order_id: str) -> dict:
+        """Query current order state from broker by order ID."""
+        try:
+            order = self._call(self.trading_client.get_order_by_id, order_id)
+            return self._order_to_dict(order)
+        except Exception as exc:
+            logger.error("order.get_status_failed", order_id=order_id, error=str(exc))
+            raise
 
     # ──────────────────────────────────────────────────────────────────────
     # Trade Update Stream (real-time order fills/cancellations)
@@ -810,20 +825,39 @@ class AlpacaBroker:
         async def _handler_wrapper(data):
             """Normalize trade update data and invoke user handler."""
             try:
+                order_data = getattr(data, 'order', None)
+                is_dict = isinstance(order_data, dict)
+
+                filled_qty = float(
+                    order_data.get('filled_qty', '0') if is_dict
+                    else getattr(order_data, 'filled_qty', '0')
+                ) if order_data else 0
+                total_qty = float(
+                    order_data.get('qty', '0') if is_dict
+                    else getattr(order_data, 'qty', '0')
+                ) if order_data else 0
+
                 update = {
                     "event": data.event if hasattr(data, 'event') else str(data.get('event', '')),
                     "order": {
-                        "id": str(data.order.get('id', '')) if hasattr(data, 'order') and isinstance(data.order, dict) else str(getattr(data.order, 'id', '')),
-                        "symbol": data.order.get('symbol', '') if isinstance(getattr(data, 'order', None), dict) else getattr(data.order, 'symbol', ''),
-                        "side": data.order.get('side', '') if isinstance(getattr(data, 'order', None), dict) else getattr(data.order, 'side', ''),
-                        "qty": data.order.get('qty', '') if isinstance(getattr(data, 'order', None), dict) else getattr(data.order, 'qty', ''),
-                        "filled_qty": data.order.get('filled_qty', '0') if isinstance(getattr(data, 'order', None), dict) else getattr(data.order, 'filled_qty', '0'),
-                        "filled_avg_price": data.order.get('filled_avg_price', None) if isinstance(getattr(data, 'order', None), dict) else getattr(data.order, 'filled_avg_price', None),
-                        "status": data.order.get('status', '') if isinstance(getattr(data, 'order', None), dict) else getattr(data.order, 'status', ''),
-                        "type": data.order.get('type', '') if isinstance(getattr(data, 'order', None), dict) else getattr(data.order, 'type', ''),
+                        "id": str(order_data.get('id', '')) if is_dict else str(getattr(order_data, 'id', '')),
+                        "symbol": order_data.get('symbol', '') if is_dict else getattr(order_data, 'symbol', ''),
+                        "side": order_data.get('side', '') if is_dict else getattr(order_data, 'side', ''),
+                        "qty": total_qty,
+                        "filled_qty": filled_qty,
+                        "remaining_qty": total_qty - filled_qty,
+                        "filled_avg_price": (
+                            order_data.get('filled_avg_price', None) if is_dict
+                            else getattr(order_data, 'filled_avg_price', None)
+                        ),
+                        "status": order_data.get('status', '') if is_dict else getattr(order_data, 'status', ''),
+                        "type": order_data.get('type', '') if is_dict else getattr(order_data, 'type', ''),
                     },
                     "timestamp": str(data.timestamp) if hasattr(data, 'timestamp') else None,
                 }
+
+                # Reset backoff on successful message receipt
+                self._stream_backoff = 1.0
 
                 if asyncio.iscoroutinefunction(handler):
                     await handler(update)
@@ -832,16 +866,14 @@ class AlpacaBroker:
             except Exception as e:
                 logger.error("trade_stream.handler_error", error=str(e))
 
+        self._trade_stream_handler = _handler_wrapper
         self._trade_stream.subscribe_trade_updates(_handler_wrapper)
 
-        def _run_stream():
-            try:
-                self._trade_stream.run()
-            except Exception as e:
-                logger.error("trade_stream.disconnected", error=str(e))
+        self._stream_backoff = 1.0
+        self._shutdown_flag = False
 
         self._trade_stream_thread = threading.Thread(
-            target=_run_stream,
+            target=self._trade_stream_runner,
             name="trade-stream",
             daemon=True,
         )
@@ -849,8 +881,43 @@ class AlpacaBroker:
         logger.info("trade_stream.started")
         return self._trade_stream_thread
 
+    def _trade_stream_runner(self):
+        """Run trade stream with automatic reconnection on failure."""
+        backoff = 1.0
+        max_backoff = 60.0
+        while not self._shutdown_flag:
+            try:
+                logger.info("trade_stream.connecting")
+                self._trade_stream.run()
+            except Exception as e:
+                if self._shutdown_flag:
+                    break
+                logger.error("trade_stream.disconnected", error=str(e), reconnect_in=backoff)
+                time.sleep(backoff)
+                backoff = min(backoff * 2, max_backoff)
+                # Re-create stream for fresh connection
+                try:
+                    self._trade_stream = TradingStream(
+                        self.api_key,
+                        self.secret_key,
+                        paper=self.paper,
+                    )
+                    if self._trade_stream_handler:
+                        self._trade_stream.subscribe_trade_updates(self._trade_stream_handler)
+                except Exception as reinit_err:
+                    logger.error("trade_stream.reinit_failed", error=str(reinit_err))
+            else:
+                # Clean exit (no exception) — reset backoff
+                backoff = 1.0
+                if not self._shutdown_flag:
+                    # Unexpected clean exit, try reconnecting
+                    logger.warning("trade_stream.unexpected_exit", reconnect_in=backoff)
+                    time.sleep(backoff)
+        logger.info("trade_stream.shutdown")
+
     def stop_trade_stream(self):
-        """Stop the trade update stream."""
+        """Stop the trade update stream and signal the reconnection loop to exit."""
+        self._shutdown_flag = True
         if self._trade_stream:
             try:
                 self._trade_stream.stop()
