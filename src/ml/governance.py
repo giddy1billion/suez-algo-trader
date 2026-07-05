@@ -21,11 +21,44 @@ import subprocess
 import threading
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+from enum import Enum
 from typing import Any, Optional
 
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Model Status Enum
+# ---------------------------------------------------------------------------
+
+
+class ModelStatus(str, Enum):
+    """Model promotion lifecycle status."""
+    CANDIDATE = "candidate"
+    VALIDATING = "validating"
+    REJECTED = "rejected"
+    APPROVED = "approved"
+    DEPLOYED = "deployed"
+    RETIRED = "retired"
+
+
+# ---------------------------------------------------------------------------
+# Validation Result
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ValidationResult:
+    """Structured result from model validation with per-check details."""
+    is_valid: bool = False
+    checks: list = field(default_factory=list)  # list of {"check": str, "passed": bool, "detail": str}
+    issues: list = field(default_factory=list)
+    model_status: str = ""
+
+    def to_dict(self) -> dict:
+        return asdict(self)
 
 
 # ---------------------------------------------------------------------------
@@ -292,9 +325,33 @@ class ModelGovernance:
         """
         Validate whether a model is ready for deployment.
 
+        Uses configurable thresholds from settings when available,
+        falling back to sensible defaults.
+
         Returns (is_valid, list_of_issues).
         """
+        try:
+            from config.settings import settings
+            min_cv_accuracy = settings.model_min_cv_accuracy
+            min_walk_forward_sharpe = settings.model_min_walk_forward_sharpe
+            min_monte_carlo_prob_profit = settings.model_min_monte_carlo_prob_profit
+            min_sharpe_ratio = settings.model_min_sharpe_ratio
+            max_drawdown_pct = settings.model_max_drawdown_pct
+            min_expectancy = settings.model_min_expectancy
+            min_precision = settings.model_min_precision
+            min_backtest_trades = settings.model_min_backtest_trades
+        except Exception:
+            min_cv_accuracy = 0.52
+            min_walk_forward_sharpe = 0.0
+            min_monte_carlo_prob_profit = 0.50
+            min_sharpe_ratio = 0.5
+            max_drawdown_pct = 0.20
+            min_expectancy = 0.0
+            min_precision = 0.50
+            min_backtest_trades = 30
+
         issues = []
+        checks = []
         all_lineage = self._load_all_lineage()
         entry = self._find_lineage(all_lineage, version)
 
@@ -303,31 +360,52 @@ class ModelGovernance:
 
         lineage = ModelLineage.from_dict(entry)
 
-        # Check required fields
-        if not lineage.git_commit:
-            issues.append("Missing git commit hash")
-        if not lineage.feature_names:
-            issues.append("Missing feature schema")
-        if not lineage.training_dataset_hash:
-            issues.append("Missing dataset hash")
-        if lineage.n_features == 0:
-            issues.append("Zero features recorded")
-        if lineage.training_dataset_rows == 0:
-            issues.append("Zero training rows recorded")
+        def _check(name: str, passed: bool, detail: str):
+            checks.append({"check": name, "passed": passed, "detail": detail})
+            if not passed:
+                issues.append(detail)
 
-        # Check minimum scores
-        if lineage.cv_accuracy < 0.5:
-            issues.append(f"CV accuracy below 50%: {lineage.cv_accuracy:.3f}")
-        if lineage.walk_forward_sharpe < 0.0:
-            issues.append(f"Walk-forward Sharpe negative: {lineage.walk_forward_sharpe:.3f}")
-        if lineage.monte_carlo_prob_profit < 0.5:
-            issues.append(f"Monte Carlo prob_profit below 50%: {lineage.monte_carlo_prob_profit:.3f}")
+        # Required provenance fields
+        _check("git_commit", bool(lineage.git_commit),
+               "Missing git commit hash" if not lineage.git_commit else "OK")
+        _check("feature_schema", bool(lineage.feature_names),
+               "Missing feature schema" if not lineage.feature_names else "OK")
+        _check("dataset_hash", bool(lineage.training_dataset_hash),
+               "Missing dataset hash" if not lineage.training_dataset_hash else "OK")
+        _check("n_features", lineage.n_features > 0,
+               "Zero features recorded" if lineage.n_features == 0 else "OK")
+        _check("dataset_rows", lineage.training_dataset_rows > 0,
+               "Zero training rows recorded" if lineage.training_dataset_rows == 0 else "OK")
+        _check("hyperparameters", bool(lineage.hyperparameters),
+               "Hyperparameters not recorded" if not lineage.hyperparameters else "OK")
 
-        # Check hyperparameters recorded
-        if not lineage.hyperparameters:
-            issues.append("Hyperparameters not recorded")
+        # Performance thresholds
+        _check("cv_accuracy",
+               lineage.cv_accuracy >= min_cv_accuracy,
+               f"CV accuracy {lineage.cv_accuracy:.3f} below threshold {min_cv_accuracy}")
+        _check("walk_forward_sharpe",
+               lineage.walk_forward_sharpe >= min_walk_forward_sharpe,
+               f"Walk-forward Sharpe {lineage.walk_forward_sharpe:.3f} below threshold {min_walk_forward_sharpe}")
+        _check("monte_carlo_prob_profit",
+               lineage.monte_carlo_prob_profit >= min_monte_carlo_prob_profit,
+               f"Monte Carlo prob_profit {lineage.monte_carlo_prob_profit:.3f} below threshold {min_monte_carlo_prob_profit}")
+        _check("sharpe_ratio",
+               lineage.sharpe_ratio >= min_sharpe_ratio,
+               f"Sharpe ratio {lineage.sharpe_ratio:.3f} below threshold {min_sharpe_ratio}")
+        _check("max_drawdown",
+               lineage.max_drawdown <= max_drawdown_pct,
+               f"Max drawdown {lineage.max_drawdown:.3f} exceeds threshold {max_drawdown_pct}")
+        _check("min_backtest_trades",
+               lineage.n_trades_backtest >= min_backtest_trades,
+               f"Backtest trades {lineage.n_trades_backtest} below minimum {min_backtest_trades}")
 
         is_valid = len(issues) == 0
+        self._last_validation_result = ValidationResult(
+            is_valid=is_valid,
+            checks=checks,
+            issues=issues,
+            model_status=ModelStatus.APPROVED.value if is_valid else ModelStatus.REJECTED.value,
+        )
         return is_valid, issues
 
     def audit_report(self) -> dict:

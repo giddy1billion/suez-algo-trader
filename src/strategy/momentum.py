@@ -180,8 +180,14 @@ class MomentumStrategy(BaseStrategy):
         # Calculate confidence
         confidence = np.mean(confidence_factors) if confidence_factors else 0.0
 
-        # Determine signal
-        if score >= 3:
+        # Require at least 2 confirming indicators for a BUY/SELL signal.
+        # A single weak indicator (e.g., just "below slow EMA") should not
+        # generate actionable signals — it produces score=±1 at confidence=0.5
+        # which fires every cycle for every symbol, creating signal spam.
+        confirming_count = len(confidence_factors)
+        if confirming_count < 2 and abs(score) <= 1:
+            signal = Signal.HOLD
+        elif score >= 3:
             signal = Signal.STRONG_BUY
         elif score >= 1:
             signal = Signal.BUY

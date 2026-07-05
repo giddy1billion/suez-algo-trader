@@ -18,6 +18,12 @@ logger = get_logger(__name__)
 _VBT_AVAILABLE = False
 try:
     import vectorbt as vbt
+    # Disable numba caching to prevent "no locator available for file" errors
+    # in Docker/overlay filesystems where numba can't reliably stat module files.
+    try:
+        vbt.settings.caching['disable_machinery'] = True
+    except (AttributeError, KeyError, TypeError):
+        pass
     _VBT_AVAILABLE = True
 except (ImportError, OSError):
     logger.debug("vbt.unavailable", msg="Using pure numpy fallback")

@@ -206,6 +206,22 @@ class Settings(BaseSettings):
     enable_execution_simulator: bool = True     # Enable realistic execution simulation
     execution_simulator_preset: str = "realistic"  # "realistic", "conservative", or "ideal"
 
+    # --- Model Promotion Gate ---
+    model_min_sharpe_ratio: float = 0.5
+    model_max_drawdown_pct: float = 0.20
+    model_min_expectancy: float = 0.0           # Positive expectancy required
+    model_min_precision: float = 0.50
+    model_min_cv_accuracy: float = 0.52
+    model_min_walk_forward_sharpe: float = 0.0
+    model_min_monte_carlo_prob_profit: float = 0.50
+    model_min_backtest_trades: int = 30
+
+    # --- Self-Healing ---
+    model_max_retries: int = 3                  # Max training retries on failure
+    model_retry_backoff_seconds: float = 60.0   # Base backoff between retries
+    model_stale_threshold_hours: float = 168.0  # 7 days — trigger retraining if older
+    model_underperformance_window_hours: float = 24.0  # Window to detect underperformance after promotion
+
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 
     # --- Computed Properties ---

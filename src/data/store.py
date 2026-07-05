@@ -33,6 +33,9 @@ class Trade(Base):
     pnl_pct = Column(Float)
     fees = Column(Float, default=0.0)
     notes = Column(Text)
+    # Audit trail: links trade → prediction → model
+    prediction_id = Column(String(64), index=True)
+    model_version = Column(String(64))
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
     filled_at = Column(DateTime)
     closed_at = Column(DateTime)

@@ -221,7 +221,17 @@ class MLStrategy(BaseStrategy):
         """Generate ML-based signals. Thread-safe model access."""
         if self.model is None:
             logger.warning("ml.no_model", msg="Train model first")
-            return []
+            # Return NO_SIGNAL for each symbol so the state is visible in logs/events
+            return [
+                TradeSignal(
+                    symbol=symbol,
+                    signal=Signal.NO_SIGNAL,
+                    confidence=0.0,
+                    price=0.0,
+                    reason="PREDICTION_UNAVAILABLE: no active validated model",
+                )
+                for symbol in data.keys()
+            ]
 
         signals = []
         feature_cols = self._feature_columns or self.get_feature_columns()

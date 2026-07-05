@@ -18,6 +18,7 @@ class Signal(Enum):
     HOLD = 0
     SELL = -1
     STRONG_SELL = -2
+    NO_SIGNAL = -99
 
 
 @dataclass
@@ -38,7 +39,7 @@ class TradeSignal:
 
     @property
     def is_actionable(self) -> bool:
-        return self.signal != Signal.HOLD and self.confidence >= 0.5
+        return self.signal not in (Signal.HOLD, Signal.NO_SIGNAL) and self.confidence > 0.5
 
 
 class BaseStrategy(ABC):

@@ -36,6 +36,13 @@ class PredictionRecord:
     model_version: str = ""
     strategy: str = ""
     features_snapshot_hash: str = ""
+    # Provenance metadata
+    training_timestamp: str = ""
+    dataset_version: str = ""
+    feature_set_version: str = ""
+    validation_metrics: dict = field(default_factory=dict)
+    probability_distribution: list = field(default_factory=list)
+    feature_importance: Optional[dict] = None
     # Outcome fields (filled when resolved)
     outcome_timestamp: Optional[str] = None
     actual_return: Optional[float] = None
@@ -43,6 +50,16 @@ class PredictionRecord:
     absolute_error: Optional[float] = None
     quality_grade: Optional[str] = None  # "excellent" | "good" | "fair" | "poor"
     resolved: bool = False
+
+    def has_required_provenance(self) -> bool:
+        """Check whether all required provenance metadata is present."""
+        return bool(
+            self.model_version
+            and self.training_timestamp
+            and self.dataset_version
+            and self.feature_set_version
+            and self.validation_metrics
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -96,8 +113,14 @@ class PredictionRegistry:
         model_version: str = "",
         strategy: str = "",
         features_hash: str = "",
-    ) -> PredictionRecord:
-        """Register a new prediction."""
+        training_timestamp: str = "",
+        dataset_version: str = "",
+        feature_set_version: str = "",
+        validation_metrics: Optional[dict] = None,
+        probability_distribution: Optional[list] = None,
+        feature_importance: Optional[dict] = None,
+    ) -> Optional[PredictionRecord]:
+        """Register a new prediction. Returns None if required provenance is missing."""
         horizon = expected_horizon or settings.prediction_default_horizon_bars
 
         record = PredictionRecord(
@@ -109,7 +132,24 @@ class PredictionRegistry:
             model_version=model_version,
             strategy=strategy,
             features_snapshot_hash=features_hash,
+            training_timestamp=training_timestamp,
+            dataset_version=dataset_version,
+            feature_set_version=feature_set_version,
+            validation_metrics=validation_metrics or {},
+            probability_distribution=probability_distribution or [],
+            feature_importance=feature_importance,
         )
+
+        if not record.has_required_provenance():
+            logger.warning(
+                "prediction.missing_provenance",
+                asset=asset,
+                model_version=model_version,
+                training_timestamp=training_timestamp,
+                dataset_version=dataset_version,
+                feature_set_version=feature_set_version,
+            )
+            return None
 
         with self._lock:
             self._active[record.prediction_id] = record

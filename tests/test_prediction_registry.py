@@ -45,6 +45,15 @@ class TestPredictionRecord:
 class TestPredictionRegistry:
     """Test prediction registry lifecycle."""
 
+    # Default provenance kwargs for all register() calls
+    _PROV = {
+        "model_version": "v001",
+        "training_timestamp": "2026-01-01T00:00:00+00:00",
+        "dataset_version": "ds001",
+        "feature_set_version": "fs001",
+        "validation_metrics": {"cv_accuracy": 0.65},
+    }
+
     @pytest.fixture
     def registry(self, tmp_path):
         return PredictionRegistry(storage_path=str(tmp_path / "predictions"))
@@ -54,9 +63,20 @@ class TestPredictionRegistry:
             asset="AAPL",
             direction="long",
             confidence=0.80,
+            **self._PROV,
         )
         assert record.prediction_id
         assert registry.active_count == 1
+
+    def test_register_missing_provenance_returns_none(self, registry):
+        """Predictions without required provenance should be rejected."""
+        record = registry.register(
+            asset="AAPL",
+            direction="long",
+            confidence=0.80,
+        )
+        assert record is None
+        assert registry.active_count == 0
 
     def test_record_outcome(self, registry):
         record = registry.register(
@@ -64,6 +84,7 @@ class TestPredictionRegistry:
             direction="long",
             confidence=0.80,
             expected_return=0.02,
+            **self._PROV,
         )
         result = registry.record_outcome(record.prediction_id, actual_return=0.015)
         assert result is not None
@@ -78,6 +99,7 @@ class TestPredictionRegistry:
             asset="AAPL",
             direction="long",
             confidence=0.80,
+            **self._PROV,
         )
         result = registry.record_outcome(record.prediction_id, actual_return=-0.05)
         assert result.direction_correct is False
@@ -88,9 +110,9 @@ class TestPredictionRegistry:
         assert result is None
 
     def test_get_active_predictions(self, registry):
-        registry.register(asset="AAPL", direction="long", confidence=0.80)
-        registry.register(asset="MSFT", direction="short", confidence=0.70)
-        registry.register(asset="AAPL", direction="long", confidence=0.60)
+        registry.register(asset="AAPL", direction="long", confidence=0.80, **self._PROV)
+        registry.register(asset="MSFT", direction="short", confidence=0.70, **self._PROV)
+        registry.register(asset="AAPL", direction="long", confidence=0.60, **self._PROV)
 
         all_active = registry.get_active_predictions()
         assert len(all_active) == 3
@@ -99,8 +121,8 @@ class TestPredictionRegistry:
         assert len(aapl_active) == 2
 
     def test_get_resolved_predictions(self, registry):
-        r1 = registry.register(asset="AAPL", direction="long", confidence=0.80)
-        r2 = registry.register(asset="MSFT", direction="short", confidence=0.70)
+        r1 = registry.register(asset="AAPL", direction="long", confidence=0.80, **self._PROV)
+        r2 = registry.register(asset="MSFT", direction="short", confidence=0.70, **self._PROV)
         registry.record_outcome(r1.prediction_id, actual_return=0.02)
 
         resolved = registry.get_resolved_predictions()
@@ -108,7 +130,7 @@ class TestPredictionRegistry:
         assert resolved[0].asset == "AAPL"
 
     def test_summary(self, registry):
-        r = registry.register(asset="AAPL", direction="long", confidence=0.80)
+        r = registry.register(asset="AAPL", direction="long", confidence=0.80, **self._PROV)
         registry.record_outcome(r.prediction_id, actual_return=0.01)
 
         summary = registry.get_summary()
@@ -116,7 +138,7 @@ class TestPredictionRegistry:
         assert summary["accuracy"] == 1.0
 
     def test_persist_active(self, registry):
-        registry.register(asset="AAPL", direction="long", confidence=0.80)
+        registry.register(asset="AAPL", direction="long", confidence=0.80, **self._PROV)
         registry.persist_active()
         # Verify file was created
         active_file = registry._storage_path / "active.json"

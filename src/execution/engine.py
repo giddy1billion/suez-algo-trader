@@ -71,12 +71,15 @@ class ExecutionEngine:
         trade_manager=None,
         execution_simulator=None,
         intelligence_orchestrator: Optional[AdaptiveIntelligenceOrchestrator] = None,
+        min_signal_confidence: float = 0.55,
+        circuit_breaker=None,
     ):
         self.broker = broker
         self.risk = risk_manager
         self.db = db
         self.dry_run = dry_run
         self.risk_engine = risk_engine or RiskEngine()
+        self.min_signal_confidence = min_signal_confidence
         self._last_cycle_time: Optional[datetime] = None
         self._current_strategy_name: str = "unknown"
         self._cycle_count: int = 0
@@ -86,6 +89,7 @@ class ExecutionEngine:
         self._trade_manager = trade_manager
         self._simulator = execution_simulator  # None = no simulation (direct broker)
         self.intelligence_orchestrator = intelligence_orchestrator
+        self._circuit_breaker = circuit_breaker
 
     # ──────────────────────────────────────────────────────────────────────
     # Event Publishing Helpers
@@ -115,6 +119,12 @@ class ExecutionEngine:
         self._last_cycle_time = datetime.now()
         self._current_strategy_name = strategy.name
         results = []
+
+        # 0. Check circuit breaker
+        if self._circuit_breaker and not self._circuit_breaker.is_trading_allowed():
+            cb_reasons = self._circuit_breaker.active_reasons
+            logger.warning("engine.circuit_breaker_active", reasons=cb_reasons)
+            return []
 
         # 1. Check if trading is allowed
         can_trade, reason = self.risk.can_trade()
@@ -190,6 +200,20 @@ class ExecutionEngine:
     def _process_signal(self, signal: TradeSignal, portfolio_value: float,
                         positions: list[dict], market_data: dict = None) -> Optional[dict]:
         """Process a single trade signal through risk engine and execution."""
+
+        # Hard confidence gate — reject signals below minimum threshold.
+        # This prevents placeholder/fallback signals (e.g., default 0.5 confidence)
+        # from reaching the risk engine or generating orders.
+        if signal.confidence < self.min_signal_confidence:
+            logger.info(
+                "engine.low_confidence_rejected",
+                symbol=signal.symbol,
+                confidence=round(signal.confidence, 3),
+                threshold=self.min_signal_confidence,
+                strategy=self._current_strategy_name,
+            )
+            self._log_signal(signal, executed=False)
+            return None
 
         # Determine side
         if signal.signal in (Signal.BUY, Signal.STRONG_BUY):
