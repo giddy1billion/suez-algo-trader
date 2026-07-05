@@ -19,6 +19,8 @@ from src.risk.models import TradeRequest, RiskDecision
 from src.strategy.base import BaseStrategy, TradeSignal, Signal
 from src.data.store import DatabaseManager
 from src.intelligence.orchestrator import AdaptiveIntelligenceOrchestrator
+from src.intelligence.confidence.gate import ConfidenceGate, SignalContext
+from src.intelligence.confidence.models import ConfidenceScore, SignalIntegrity
 from src.utils.logger import get_logger
 from src.core.runtime_state import RuntimeState
 
@@ -83,6 +85,7 @@ class ExecutionEngine:
         runtime_state: Optional[RuntimeState] = None,
         signal_gate: Optional[SignalValidationGate] = None,
         signal_bridge_config: Optional[SignalBridgeConfig] = None,
+        confidence_gate: Optional[ConfidenceGate] = None,
     ):
         self.broker = broker
         self.risk = risk_manager
@@ -101,6 +104,7 @@ class ExecutionEngine:
         self._simulator = execution_simulator  # None = no simulation (direct broker)
         self.intelligence_orchestrator = intelligence_orchestrator
         self._circuit_breaker = circuit_breaker
+        self._confidence_gate = confidence_gate
         
         # Runtime state — allows pause/resume to suppress signals
         self._runtime_state = runtime_state or RuntimeState()
@@ -384,6 +388,29 @@ class ExecutionEngine:
                 return None
 
         # Build TradeRequest for the new risk engine
+        confidence_score = None
+        effective_confidence = intelligence_decision.adjusted_confidence if intelligence_decision else signal.confidence
+
+        # If confidence gate is available, produce rich ConfidenceScore
+        if self._confidence_gate:
+            import numpy as np
+            signal_ctx = SignalContext(
+                symbol=signal.symbol,
+                strategy=self._current_strategy_name,
+                raw_confidence=effective_confidence,
+                signal_integrity=SignalIntegrity.REAL,
+                signal_generated_at=datetime.now(timezone.utc),
+                bars_available=len(market_data.get(signal.symbol, [])) if market_data else 0,
+                spread_available=True,
+                model_version=getattr(signal, 'model_version', ''),
+                current_trend=getattr(intelligence_decision, 'market_trend', '') if intelligence_decision else '',
+                current_volatility=getattr(intelligence_decision, 'market_volatility', '') if intelligence_decision else '',
+                current_stress=getattr(intelligence_decision, 'market_stress', '') if intelligence_decision else '',
+                fingerprint_confidence=getattr(intelligence_decision, 'fingerprint_confidence', 1.0) if intelligence_decision else 1.0,
+            )
+            confidence_score = self._confidence_gate.evaluate(signal_ctx)
+            effective_confidence = confidence_score.value
+
         trade_request = TradeRequest(
             symbol=signal.symbol,
             side=side,
@@ -392,7 +419,8 @@ class ExecutionEngine:
             stop_loss=signal.stop_loss,
             take_profit=signal.take_profit,
             strategy=self._current_strategy_name,
-            confidence=intelligence_decision.adjusted_confidence if intelligence_decision else signal.confidence,
+            confidence=effective_confidence,
+            confidence_score=confidence_score,
         )
 
         # Create trade lifecycle if TradeManager available

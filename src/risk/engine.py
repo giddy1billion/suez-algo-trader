@@ -98,17 +98,36 @@ class RiskEngine:
         reasons: list[str] = []
 
         # Pre-check: reject signals with insufficient confidence.
-        # Signals at or below 0.5 confidence are likely placeholder/fallback
-        # values from strategies that failed to compute real predictions
-        # (e.g., no active ML model, missing features, exception branches).
-        if request.confidence <= 0.5:
-            return self._build_decision(
-                approved=False,
-                adjusted_qty=0.0,
-                reasons=[f"Confidence {request.confidence:.2f} below minimum threshold (>0.5 required)"],
-                layer_decisions=layer_decisions,
-                request=request,
-            )
+        # If a ConfidenceScore object is attached, it has already been evaluated
+        # by the full confidence gate pipeline (data quality, model health,
+        # calibration, decay, regime adjustment). Trust its verdict.
+        # Otherwise, fall back to the legacy scalar confidence floor.
+        if request.confidence_score is not None:
+            if not request.confidence_score.approved:
+                return self._build_decision(
+                    approved=False,
+                    adjusted_qty=0.0,
+                    reasons=[
+                        f"Confidence gate rejected: {request.confidence_score.rejection_reason}"
+                    ],
+                    layer_decisions=layer_decisions,
+                    request=request,
+                )
+            # Use the evaluated confidence for downstream scoring
+            effective_confidence = request.confidence_score.value
+        else:
+            # Legacy path: simple scalar confidence check.
+            # Signals at or below 0.5 confidence are likely placeholder/fallback
+            # values from strategies that failed to compute real predictions.
+            effective_confidence = request.confidence
+            if effective_confidence <= 0.5:
+                return self._build_decision(
+                    approved=False,
+                    adjusted_qty=0.0,
+                    reasons=[f"Confidence {effective_confidence:.2f} below minimum threshold (>0.5 required)"],
+                    layer_decisions=layer_decisions,
+                    request=request,
+                )
 
         # Layer 1: Account Risk
         account_decision = self.account_layer.evaluate(
@@ -291,11 +310,15 @@ class RiskEngine:
             "approved": approved,
             "risk_score": risk_score,
             "reasons": reasons,
+            "confidence": request.effective_confidence,
             "layers": {
                 name: {"action": d.action.value, "reason": d.reason}
                 for name, d in layer_decisions.items()
             },
         }
+        # Include rich confidence provenance when available
+        if request.confidence_score is not None:
+            log_entry["confidence_breakdown"] = request.confidence_score.breakdown.to_dict()
 
         with self._lock:
             self._decision_log.append(log_entry)
@@ -339,10 +362,19 @@ class RiskEngine:
                 score += 15
 
         # Confidence adjustment (low confidence = higher risk)
-        if request.confidence < 0.3:
+        effective_conf = request.effective_confidence
+        if effective_conf < 0.3:
             score += 20
-        elif request.confidence < 0.5:
+        elif effective_conf < 0.5:
             score += 10
+
+        # Rich confidence: factor in model health and data quality
+        if request.confidence_score is not None:
+            cs = request.confidence_score
+            if cs.model_health.health_score < 0.6:
+                score += 10  # Degraded model increases risk
+            if cs.data_quality.overall_score < 0.7:
+                score += 5  # Lower data quality increases risk
 
         # Stop loss presence
         if request.stop_loss is None:

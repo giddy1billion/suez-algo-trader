@@ -7,7 +7,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Optional
+from typing import TYPE_CHECKING, Optional, Union
+
+if TYPE_CHECKING:
+    from src.intelligence.confidence.models import ConfidenceScore
 
 
 class RiskAction(str, Enum):
@@ -29,6 +32,16 @@ class TradeRequest:
     strategy: str = "unknown"
     confidence: float = 0.0
     urgency: float = 0.5  # 0.0 = low urgency, 1.0 = immediate
+
+    # Rich confidence object (optional — backward-compatible)
+    confidence_score: Optional[ConfidenceScore] = None
+
+    @property
+    def effective_confidence(self) -> float:
+        """Return the best available confidence value."""
+        if self.confidence_score is not None:
+            return self.confidence_score.value
+        return self.confidence
 
     @property
     def notional_value(self) -> float:
