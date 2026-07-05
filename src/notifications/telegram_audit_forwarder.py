@@ -260,6 +260,8 @@ class TelegramAuditForwarder:
         self._events_sent = 0
         self._events_dropped = 0
         self._events_suppressed = 0
+        # Track last health status per component to suppress repeated identical notifications
+        self._last_health_status: dict[str, str] = {}
 
     def handle(self, event: Event) -> None:
         """Handle any event — format and enqueue for Telegram delivery.
@@ -275,6 +277,13 @@ class TelegramAuditForwarder:
                                     TradeOpened, TradeClosed)):
                     self._events_suppressed += 1
                     return  # Skip this event
+
+            # Suppress repeated health events (only notify on status CHANGE)
+            if isinstance(event, SystemHealth):
+                prev = self._last_health_status.get(event.component)
+                self._last_health_status[event.component] = event.status
+                if prev == event.status:
+                    return  # Same status as last time — suppress
             
             formatter = _FORMATTERS.get(type(event), _format_generic)
             message = formatter(event)
