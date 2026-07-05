@@ -814,3 +814,78 @@ class TestContractRejectionOutcomes:
         )
         assert event.contract_id == "dc_emergency_test"
         assert event.reason == "emergency_liquidation"
+
+
+class TestModelRegistryRecovery:
+    """Verify the ModelRegistry self-heals when registry.json is missing."""
+
+    def test_recovery_creates_registry_from_orphaned_files(self):
+        """ModelRegistry auto-recovers from orphaned .joblib files."""
+        import joblib
+
+        test_dir = os.path.join(tempfile.gettempdir(), f"reg_recovery_{os.getpid()}")
+        if os.path.exists(test_dir):
+            shutil.rmtree(test_dir)
+        os.makedirs(test_dir)
+
+        try:
+            # Create orphaned model files (no registry.json)
+            for fname in ["v001_20260101_120000.joblib", "v002_20260201_120000.joblib"]:
+                joblib.dump({"model": "mock", "features": ["a", "b"]}, os.path.join(test_dir, fname))
+
+            from src.ml.model_registry import ModelRegistry
+            reg = ModelRegistry(models_dir=test_dir)
+
+            # Registry should be auto-created
+            assert os.path.exists(os.path.join(test_dir, "registry.json"))
+            assert reg.get_active_version() == "v002"
+            assert len(reg.list_versions()) == 2
+        finally:
+            shutil.rmtree(test_dir, ignore_errors=True)
+
+    def test_no_recovery_when_no_model_files(self):
+        """No recovery attempted when models dir is empty."""
+        test_dir = os.path.join(tempfile.gettempdir(), f"reg_empty_{os.getpid()}")
+        if os.path.exists(test_dir):
+            shutil.rmtree(test_dir)
+
+        try:
+            from src.ml.model_registry import ModelRegistry
+            reg = ModelRegistry(models_dir=test_dir)
+
+            # No registry, no models = no active version
+            assert reg.get_active_version() is None
+            assert not os.path.exists(os.path.join(test_dir, "registry.json"))
+        finally:
+            shutil.rmtree(test_dir, ignore_errors=True)
+
+    def test_predictor_fallback_loads_latest_model(self):
+        """ModelPredictor falls back to latest_model.joblib when no active version."""
+        import joblib
+        import numpy as np
+
+        test_dir = os.path.join(tempfile.gettempdir(), f"pred_fallback_{os.getpid()}")
+        if os.path.exists(test_dir):
+            shutil.rmtree(test_dir)
+        os.makedirs(test_dir)
+
+        try:
+            # Create only latest_model.joblib (no versioned files, no registry)
+            from sklearn.tree import DecisionTreeClassifier
+            model = DecisionTreeClassifier()
+            model.fit(np.array([[1, 2], [3, 4]]), [0, 1])
+            joblib.dump({"model": model, "features": ["f1", "f2"]}, os.path.join(test_dir, "latest_model.joblib"))
+
+            from src.ml.model_registry import ModelRegistry
+            from src.ml.predictor import ModelPredictor
+
+            reg = ModelRegistry(models_dir=test_dir)
+            predictor = ModelPredictor(registry=reg, auto_reload=False)
+
+            assert predictor.is_loaded
+            assert predictor.current_version == "latest_fallback"
+            predictor.stop()
+        except ImportError:
+            pytest.skip("sklearn not installed")
+        finally:
+            shutil.rmtree(test_dir, ignore_errors=True)

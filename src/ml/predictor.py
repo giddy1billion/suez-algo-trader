@@ -10,6 +10,7 @@ Provides:
 - Shadow mode for testing new models without affecting trading
 """
 
+import os
 import threading
 import time
 from datetime import datetime, timezone
@@ -446,6 +447,25 @@ class ModelPredictor:
         """Load the currently active model from registry."""
         active_version = self._registry.get_active_version()
         if active_version is None:
+            # Attempt fallback: load latest_model.joblib directly
+            latest_path = self._registry.latest_path
+            if os.path.exists(latest_path):
+                try:
+                    import joblib
+                    artifact = joblib.load(latest_path)
+                    self._model = artifact["model"]
+                    self._features = artifact.get("features", [])
+                    self._version = "latest_fallback"
+                    self._loaded_at = datetime.now(timezone.utc)
+                    logger.warning(
+                        "predictor.loaded_from_fallback",
+                        path=latest_path,
+                        n_features=len(self._features),
+                    )
+                    return
+                except Exception as e:
+                    logger.error("predictor.fallback_load_failed", error=str(e))
+
             logger.warning("predictor.no_active_version")
             return
 

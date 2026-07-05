@@ -80,6 +80,18 @@ class Settings(BaseSettings):
     momentum_atr_sl_mult: float = 2.0
     momentum_atr_tp_mult: float = 3.0
 
+    # --- Strategy Parameters (Crypto Momentum) ---
+    # Crypto requires different parameters due to 24/7 trading, higher volatility
+    crypto_momentum_fast_ema: int = 21
+    crypto_momentum_slow_ema: int = 55
+    crypto_momentum_rsi_oversold: int = 25
+    crypto_momentum_rsi_overbought: int = 75
+    crypto_momentum_atr_sl_mult: float = 2.5
+    crypto_momentum_atr_tp_mult: float = 4.0
+    crypto_timeframe: str = "15Min"
+    crypto_lookback_bars: int = 500
+    crypto_min_confirming_indicators: int = 1
+
     # --- Strategy Parameters (Mean Reversion) ---
     mean_rev_bb_period: int = 20
     mean_rev_bb_std: float = 2.0

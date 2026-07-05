@@ -36,6 +36,10 @@ class ModelRegistry:
         self.latest_path = os.path.join(models_dir, "latest_model.joblib")
         os.makedirs(models_dir, exist_ok=True)
 
+        # Self-heal: recover orphaned models if registry is missing
+        if not os.path.exists(self.registry_path):
+            self._recover_orphaned_models()
+
     # ──────────────────────────────────────────────────────────────────────
     # Public API
     # ──────────────────────────────────────────────────────────────────────
@@ -379,7 +383,8 @@ class ModelRegistry:
                     os.replace(tmp_path, self.registry_path)
                 else:
                     os.rename(tmp_path, self.registry_path)
-            except Exception:
+            except Exception as e:
+                logger.error("ml.registry.save_failed", error=str(e))
                 # Clean up temp file on failure
                 if os.path.exists(tmp_path):
                     os.remove(tmp_path)
@@ -391,6 +396,63 @@ class ModelRegistry:
             if entry["version"] == version_str:
                 return entry
         raise KeyError(f"Version not found in registry: {version_str}")
+
+    def _recover_orphaned_models(self) -> None:
+        """
+        Auto-recover registry.json from orphaned model files on disk.
+
+        If the registry manifest is missing but versioned .joblib files exist,
+        reconstruct the registry and mark the newest as active.
+        This prevents the predictor.no_active_version warning after data loss.
+        """
+        model_files = sorted([
+            f for f in os.listdir(self.models_dir)
+            if f.startswith("v") and f.endswith(".joblib")
+        ])
+
+        if not model_files:
+            return
+
+        logger.warning(
+            "ml.registry.recovering_orphaned_models",
+            count=len(model_files),
+        )
+
+        registry = []
+        for i, filename in enumerate(model_files, 1):
+            # Parse trained_at from filename pattern: v001_20260703_110304.joblib
+            parts = filename.replace(".joblib", "").split("_")
+            trained_at = datetime.now().isoformat()
+            if len(parts) >= 3:
+                try:
+                    date_str = parts[1]
+                    time_str = parts[2]
+                    trained_at = (
+                        f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]}"
+                        f"T{time_str[:2]}:{time_str[2:4]}:{time_str[4:]}"
+                    )
+                except (IndexError, ValueError):
+                    pass
+
+            entry = {
+                "version": f"v{i:03d}",
+                "filename": filename,
+                "trained_at": trained_at,
+                "metrics": {"recovered": True},
+                "symbols": [],
+                "n_features": 0,
+                "n_samples": 0,
+                "note": f"Auto-recovered from orphaned file: {filename}",
+                "is_active": (i == len(model_files)),
+            }
+            registry.append(entry)
+
+        self._save_registry(registry)
+        logger.info(
+            "ml.registry.recovery_complete",
+            versions=len(registry),
+            active=f"v{len(registry):03d}",
+        )
 
     def _get_features_for_entry(self, entry: dict) -> list[str]:
         """Load features list for a registry entry from the model file."""
