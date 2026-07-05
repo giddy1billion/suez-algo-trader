@@ -57,6 +57,7 @@ from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, C
 from aiogram.enums import ParseMode
 
 from src.utils.logger import get_logger
+from src.core.runtime_state import RuntimeState
 
 logger = get_logger(__name__)
 
@@ -68,8 +69,9 @@ _engine = None
 _risk_manager = None
 _strategy = None
 _db = None
-_bot_paused = False
+_runtime_state: Optional[RuntimeState] = None  # Thread-safe pause state
 _authorized_users: set[int] = set()
+_AUTH_PIN = os.environ.get("TELEGRAM_AUTH_PIN", "")
 _health_monitor = None
 _live_metrics = None
 _scheduler = None
@@ -119,11 +121,12 @@ def get_runtime_changes() -> dict:
 
 def set_components(broker, engine, risk_manager, strategy, db=None, authorized_chat_ids: list[int] = None,
                    health_monitor=None, live_metrics=None, scheduler=None,
-                   event_bus=None, trade_manager=None, reconciler=None, ops_handler=None):
+                   event_bus=None, trade_manager=None, reconciler=None, ops_handler=None,
+                   runtime_state: Optional[RuntimeState] = None):
     """Inject trading components into the bot module."""
     global _broker, _engine, _risk_manager, _strategy, _db, _authorized_users
     global _health_monitor, _live_metrics, _scheduler, _event_bus, _trade_manager
-    global _reconciler, _ops_handler
+    global _reconciler, _ops_handler, _runtime_state
     _broker = broker
     _engine = engine
     _risk_manager = risk_manager
@@ -145,12 +148,22 @@ def set_components(broker, engine, risk_manager, strategy, db=None, authorized_c
         _reconciler = reconciler
     if ops_handler:
         _ops_handler = ops_handler
+    if runtime_state:
+        _runtime_state = runtime_state
+    else:
+        # Create default RuntimeState if not provided
+        _runtime_state = RuntimeState()
 
 
 def _is_authorized(message: Message) -> bool:
     """Check if user is authorized to use the bot. Deny-by-default."""
     if not _authorized_users:
-        # No authorized users configured — deny all until /start auto-registers first user
+        # If no users registered and no PIN, check TELEGRAM_CHAT_ID
+        chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
+        if chat_id and str(message.chat.id) == chat_id:
+            _authorized_users.add(message.from_user.id)
+            return True
+        logger.warning("telegram.unauthorized_attempt", user_id=message.from_user.id, username=getattr(message.from_user, 'username', 'unknown'))
         return False
     return message.from_user.id in _authorized_users
 
@@ -159,17 +172,38 @@ def _is_authorized(message: Message) -> bool:
 # Command Handlers
 # ──────────────────────────────────────────────────────────────────────────
 
+@router.message(Command("auth"))
+async def cmd_auth(message: Message):
+    """Authenticate with PIN code."""
+    if not _AUTH_PIN:
+        await message.answer("⚠️ No AUTH_PIN configured. Using chat ID auth.")
+        return
+
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Usage: /auth <PIN>")
+        return
+
+    pin = parts[1].strip()
+    # Delete message immediately (contains PIN)
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    if pin == _AUTH_PIN:
+        _authorized_users.add(message.from_user.id)
+        logger.warning("telegram.user_authorized", user_id=message.from_user.id, username=message.from_user.username)
+        await message.answer("✅ Authenticated successfully.")
+    else:
+        logger.warning("telegram.auth_failed", user_id=message.from_user.id, username=message.from_user.username)
+        await message.answer("❌ Invalid PIN.")
+
+
 @router.message(CommandStart())
 async def cmd_start(message: Message):
-    # Auto-register first user if no chat IDs are configured
-    global _authorized_users
-    if not _authorized_users:
-        _authorized_users.add(message.from_user.id)
-        logger.info("telegram.auto_registered", user_id=message.from_user.id,
-                    username=message.from_user.username)
-
     if not _is_authorized(message):
-        await message.answer("Unauthorized.")
+        await message.answer("Unauthorized. Use /auth <PIN> to authenticate.")
         return
 
     text = (
@@ -181,7 +215,7 @@ async def cmd_start(message: Message):
         "/pnl - Today's P&L\n"
         "/trades - Recent trades\n"
         "/help - All commands\n\n"
-        f"<i>Mode: {'PAUSED' if _bot_paused else 'ACTIVE'}</i>"
+        f"<i>Mode: {'PAUSED' if _runtime_state and _runtime_state.is_paused() else 'ACTIVE'}</i>"
     )
     await message.answer(text, parse_mode=ParseMode.HTML)
 
@@ -280,7 +314,7 @@ async def cmd_status(message: Message):
         pnl_pct = (pnl / account['last_equity'] * 100) if account['last_equity'] > 0 else 0
 
         text = (
-            f"<b>Account Status</b> {'[PAUSED]' if _bot_paused else '[ACTIVE]'}\n"
+            f"<b>Account Status</b> {'[PAUSED]' if _runtime_state and _runtime_state.is_paused() else '[ACTIVE]'}\n"
             f"{'=' * 30}\n"
             f"Equity:       <code>${account['equity']:>12,.2f}</code>\n"
             f"Cash:         <code>${account['cash']:>12,.2f}</code>\n"
@@ -556,8 +590,9 @@ async def cmd_cancelall(message: Message):
 async def cmd_pause(message: Message):
     if not _is_authorized(message):
         return
-    global _bot_paused
-    _bot_paused = True
+    global _runtime_state
+    if _runtime_state:
+        _runtime_state.pause()
     await message.answer("Bot PAUSED. Auto-trading disabled.\nUse /resume to restart.")
 
 
@@ -565,8 +600,9 @@ async def cmd_pause(message: Message):
 async def cmd_resume(message: Message):
     if not _is_authorized(message):
         return
-    global _bot_paused
-    _bot_paused = False
+    global _runtime_state
+    if _runtime_state:
+        _runtime_state.resume()
     if _risk_manager:
         _risk_manager.daily_stats.is_halted = False
         _risk_manager.daily_stats.halt_reason = ""
@@ -2245,7 +2281,7 @@ async def cmd_uptime(message: Message):
             uptime_str = f"{minutes}m"
 
         start_time = _health_monitor._start_time.strftime("%Y-%m-%d %H:%M UTC") if _health_monitor else "unknown"
-        paused_str = "PAUSED" if _bot_paused else "ACTIVE"
+        paused_str = "PAUSED" if _runtime_state and _runtime_state.is_paused() else "ACTIVE"
 
         text = (
             f"<b>Bot Uptime</b>\n"
@@ -3165,4 +3201,4 @@ class TelegramBotManager:
 
     def is_paused(self) -> bool:
         """Check if bot is paused via Telegram command."""
-        return _bot_paused
+        return _runtime_state.is_paused() if _runtime_state else False

@@ -20,6 +20,7 @@ from src.strategy.base import BaseStrategy, TradeSignal, Signal
 from src.data.store import DatabaseManager
 from src.intelligence.orchestrator import AdaptiveIntelligenceOrchestrator
 from src.utils.logger import get_logger
+from src.core.runtime_state import RuntimeState
 
 # Event types — imported at top for reliability
 from src.core.events import (
@@ -73,6 +74,7 @@ class ExecutionEngine:
         intelligence_orchestrator: Optional[AdaptiveIntelligenceOrchestrator] = None,
         min_signal_confidence: float = 0.55,
         circuit_breaker=None,
+        runtime_state: Optional[RuntimeState] = None,
     ):
         self.broker = broker
         self.risk = risk_manager
@@ -91,6 +93,9 @@ class ExecutionEngine:
         self._simulator = execution_simulator  # None = no simulation (direct broker)
         self.intelligence_orchestrator = intelligence_orchestrator
         self._circuit_breaker = circuit_breaker
+        
+        # Runtime state — allows pause/resume to suppress signals
+        self._runtime_state = runtime_state or RuntimeState()
 
     # ──────────────────────────────────────────────────────────────────────
     # Event Publishing Helpers
@@ -159,9 +164,14 @@ class ExecutionEngine:
         actionable_count = len([s for s in signals if s.is_actionable])
         logger.info("engine.signals", count=len(signals), actionable=actionable_count)
 
-        # Publish signal events
+        # Publish signal events (respecting pause state)
         for sig in signals:
             if sig.is_actionable:
+                # Skip signal publishing if bot is paused
+                if self._runtime_state.is_paused():
+                    logger.info("engine.signal_suppressed_paused", symbol=sig.symbol, signal=sig.signal.name)
+                    continue
+                
                 self._publish(SignalGenerated(
                     symbol=sig.symbol,
                     signal=sig.signal.name,
@@ -466,39 +476,55 @@ class ExecutionEngine:
                 source="engine",
             ))
 
-            # Transition lifecycle: ACCEPTED → FILLED → ACTIVE
+            # Transition lifecycle: ACCEPTED, then either immediate fill (sim/no-stream)
+            # or wait for trade stream fill confirmation
             # Use trade lifecycle ID as the canonical trade_id for event correlation
             trade_id = trade_lifecycle.trade_id if trade_lifecycle else order.get("id", "")
             if trade_lifecycle:
                 trade_lifecycle.transition(TradeState.ACCEPTED, "broker accepted")
-                trade_lifecycle.transition(TradeState.FILLED, f"filled qty={final_qty}")
-                trade_lifecycle.transition(TradeState.ACTIVE, "position active")
                 # Store order_id in lifecycle metadata for exit correlation
                 trade_lifecycle.metadata['order_id'] = order.get("id", "")
                 trade_lifecycle.metadata['symbol'] = signal.symbol
+                trade_lifecycle.metadata['total_qty'] = final_qty
 
-            # Publish OrderFilled
+            # Determine fill mode: immediate (simulation or no trade stream) vs deferred
+            use_immediate_fill = bool(sim_result) or not self._has_trade_stream()
+
             fill_price = sim_result['avg_price'] if sim_result else signal.price
             fill_fees = sim_result['fees'] if sim_result else 0.0
-            self._publish(OrderFilled(
-                order_id=order.get("id", ""),
-                fill_price=fill_price,
-                fill_qty=final_qty,
-                fees=fill_fees,
-                source="engine",
-            ))
 
-            # Publish TradeOpened with consistent trade_id
-            self._publish(TradeOpened(
-                trade_id=trade_id,
-                symbol=signal.symbol,
-                side=side,
-                entry_price=fill_price,
-                qty=final_qty,
-                stop_loss=signal.stop_loss or 0.0,
-                take_profit=signal.take_profit or 0.0,
-                source="engine",
-            ))
+            if use_immediate_fill:
+                # Immediate fill — transition straight through to ACTIVE
+                if trade_lifecycle:
+                    trade_lifecycle.transition(TradeState.FILLED, f"filled qty={final_qty}")
+                    trade_lifecycle.transition(TradeState.ACTIVE, "position active")
+
+                # Publish OrderFilled
+                self._publish(OrderFilled(
+                    order_id=order.get("id", ""),
+                    fill_price=fill_price,
+                    fill_qty=final_qty,
+                    fees=fill_fees,
+                    source="engine",
+                ))
+
+                # Publish TradeOpened with consistent trade_id
+                self._publish(TradeOpened(
+                    trade_id=trade_id,
+                    symbol=signal.symbol,
+                    side=side,
+                    entry_price=fill_price,
+                    qty=final_qty,
+                    stop_loss=signal.stop_loss or 0.0,
+                    take_profit=signal.take_profit or 0.0,
+                    source="engine",
+                ))
+            else:
+                # Deferred fill — stay in ACCEPTED, trade stream will confirm
+                if trade_lifecycle:
+                    trade_lifecycle.metadata['pending_fill'] = True
+                    trade_lifecycle.metadata['expected_qty'] = final_qty
+                logger.info("engine.pending_fill", order_id=order.get("id", ""), qty=final_qty)
 
             # Record trade to database
             self.db.record_trade({

@@ -5,8 +5,9 @@ Subscribes to ALL events on the event bus and forwards them to Telegram
 in real-time. Also provides a Python logging handler that sends WARNING+
 level logs to Telegram.
 
-Design: Nothing is held back. Every audit event, system alert, error,
-warning, and operational log reaches the user's Telegram immediately.
+Design: Forward all events to Telegram, except when trading is paused.
+Trading-related events (signals, orders, trades) are suppressed when paused,
+but system events (health, errors) are still sent.
 """
 
 import asyncio
@@ -33,6 +34,7 @@ from src.core.events import (
     TradeClosed,
     TradeOpened,
 )
+from src.core.runtime_state import RuntimeState
 
 logger = logging.getLogger(__name__)
 
@@ -196,21 +198,28 @@ class TelegramAuditForwarder:
     """
     Subscribes to ALL event bus events and forwards them to Telegram.
 
-    Nothing is held back. Every signal, order, fill, risk decision, health
-    check, and system alert is sent immediately.
+    Trading-related events (signals, orders, trades) are suppressed when paused.
+    System events (health, errors, scheduler) are always forwarded.
 
     Uses a background sender thread with a queue to avoid blocking the
     main trading loop on Telegram API latency.
     """
 
-    def __init__(self, send_func: Callable[[str], None]) -> None:
+    def __init__(
+        self,
+        send_func: Callable[[str], None],
+        runtime_state: Optional[RuntimeState] = None,
+    ) -> None:
         """
         Args:
             send_func: Synchronous callable that sends an HTML-formatted
                        message to Telegram (e.g., NotificationManager._send_telegram
                        or telegram_bot.send_sync).
+            runtime_state: RuntimeState for checking pause state (optional).
+                          If not provided, never suppresses events.
         """
         self._send = send_func
+        self._runtime_state = runtime_state or RuntimeState()
         self._queue: queue.Queue = queue.Queue(maxsize=5000)
         self._running = True
         self._sender_thread = threading.Thread(
@@ -221,10 +230,23 @@ class TelegramAuditForwarder:
         self._sender_thread.start()
         self._events_sent = 0
         self._events_dropped = 0
+        self._events_suppressed = 0
 
     def handle(self, event: Event) -> None:
-        """Handle any event — format and enqueue for Telegram delivery."""
+        """Handle any event — format and enqueue for Telegram delivery.
+        
+        Suppresses trading-related events (signals, orders, trades) when paused,
+        but always forwards system events.
+        """
         try:
+            # Suppress trading events when paused
+            if self._runtime_state.is_paused():
+                if isinstance(event, (SignalGenerated, OrderSubmitted, OrderAccepted, 
+                                    OrderFilled, OrderPartialFill, OrderRejected, 
+                                    TradeOpened, TradeClosed)):
+                    self._events_suppressed += 1
+                    return  # Skip this event
+            
             formatter = _FORMATTERS.get(type(event), _format_generic)
             message = formatter(event)
 
@@ -270,6 +292,7 @@ class TelegramAuditForwarder:
         return {
             "events_sent": self._events_sent,
             "events_dropped": self._events_dropped,
+            "events_suppressed": self._events_suppressed,
             "queue_size": self._queue.qsize(),
             "running": self._running,
         }
@@ -368,6 +391,7 @@ def _escape_html(text: str) -> str:
 def setup_telegram_full_audit(
     event_bus: EventBus,
     send_func: Callable[[str], None],
+    runtime_state: Optional[RuntimeState] = None,
     attach_log_handler: bool = True,
 ) -> dict[str, Any]:
     """
@@ -376,18 +400,19 @@ def setup_telegram_full_audit(
     This function:
     1. Creates a TelegramAuditForwarder (wildcard event subscriber)
     2. Optionally creates a TelegramLogHandler (WARNING+ to Telegram)
-    3. Registers both so NOTHING is held back
+    3. Registers both so system events are forwarded (trading events suppressed when paused)
 
     Args:
         event_bus: The application event bus.
         send_func: Callable that sends HTML-formatted text to Telegram.
+        runtime_state: RuntimeState for pause checking (optional).
         attach_log_handler: Whether to also send WARNING+ logs to Telegram.
 
     Returns:
         Dict with the forwarder and handler instances for lifecycle management.
     """
-    # 1. Event bus → Telegram (all events)
-    forwarder = TelegramAuditForwarder(send_func)
+    # 1. Event bus → Telegram (all events, respecting pause state)
+    forwarder = TelegramAuditForwarder(send_func, runtime_state=runtime_state)
     forwarder.register(event_bus)
     logger.info("telegram_audit.forwarder_registered")
 

@@ -34,6 +34,7 @@ from src.strategy.momentum import MomentumStrategy
 from src.strategy.mean_reversion import MeanReversionStrategy
 from src.strategy.ml_strategy import MLStrategy
 from src.execution.engine import ExecutionEngine
+from src.core.runtime_state import RuntimeState
 from src.data.store import DatabaseManager
 from src.intelligence.orchestrator import AdaptiveIntelligenceOrchestrator
 from src.notifications.alerts import NotificationManager
@@ -502,6 +503,9 @@ def cmd_run(
         ),
     )
 
+    # Create shared RuntimeState for pause/resume state management
+    runtime_state = RuntimeState()
+
     engine = ExecutionEngine(
         broker=broker,
         risk_manager=risk,
@@ -511,6 +515,7 @@ def cmd_run(
         event_bus=event_bus,
         trade_manager=trade_manager,
         execution_simulator=execution_simulator,
+        runtime_state=runtime_state,
         intelligence_orchestrator=AdaptiveIntelligenceOrchestrator(
             min_trade_score=settings.intelligence_min_trade_score,
             drift_window=settings.intelligence_drift_window,
@@ -560,6 +565,7 @@ def cmd_run(
         telegram_audit_components = setup_telegram_full_audit(
             event_bus=event_bus,
             send_func=_telegram_html_sender,
+            runtime_state=runtime_state,
             attach_log_handler=True,
         )
         logger.info("telegram_audit.full_forwarding_enabled")
@@ -705,20 +711,22 @@ def cmd_run(
 
     # Start WebSocket streaming if enabled
     _stream_data = {}  # Shared dict: symbol -> latest bar data
+    _stream_lock = threading.Lock()
     if enable_streaming:
         import asyncio as _asyncio
 
         async def _bar_handler(bar):
             """Store incoming bar data from WebSocket."""
             symbol = bar.symbol
-            _stream_data[symbol] = {
-                "timestamp": bar.timestamp,
-                "open": float(bar.open),
-                "high": float(bar.high),
-                "low": float(bar.low),
-                "close": float(bar.close),
-                "volume": float(bar.volume),
-            }
+            with _stream_lock:
+                _stream_data[symbol] = {
+                    "timestamp": bar.timestamp,
+                    "open": float(bar.open),
+                    "high": float(bar.high),
+                    "low": float(bar.low),
+                    "close": float(bar.close),
+                    "volume": float(bar.volume),
+                }
 
         def _run_stream():
             loop = _asyncio.new_event_loop()
@@ -1032,7 +1040,8 @@ def cmd_run(
                               event_bus=event_bus,
                               trade_manager=trade_manager,
                               reconciler=reconciler,
-                              ops_handler=ops_handler)
+                              ops_handler=ops_handler,
+                              runtime_state=runtime_state)
 
     # Cache crypto-only strategy to avoid re-creating each cycle
     crypto_only = [s for s in symbols if "/" in s]
@@ -1258,6 +1267,20 @@ def cmd_run(
         _scheduler.shutdown(wait=False)
     broker.stop_trade_stream()
     notifier.notify_daily_summary(risk.get_daily_summary())
+
+    # Close database connections
+    try:
+        if event_store:
+            event_store.close()
+    except Exception as e:
+        logger.error("shutdown.event_store_close_failed", error=str(e))
+
+    try:
+        if snapshot_store:
+            snapshot_store.close()
+    except Exception as e:
+        logger.error("shutdown.snapshot_store_close_failed", error=str(e))
+
     if telegram_bot:
         import asyncio
         try:
