@@ -31,6 +31,7 @@ Deployed on **Azure Container Instances** via GitHub Actions CI/CD pipeline.
 - [Strategies](#strategies)
 - [Architecture](#architecture)
 - [Adaptive Intelligence Layer](#adaptive-intelligence-layer)
+- [Decision Governance Engine](#decision-governance-engine)
 - [Risk Management](#risk-management)
 - [Configuration System](#configuration-system)
 - [CLI Options](#cli-options)
@@ -842,19 +843,43 @@ The system is built on a lightweight, thread-safe, in-process event bus with 33+
 
 ### Signal Pipeline
 
-Every trade signal passes through a validation pipeline before execution:
+Every trade signal passes through the full decision governance pipeline before execution:
 
 ```
-Strategy Signal → Signal Package → Validation Gate → Intelligence Layer → Risk Engine → Execution
-                   (completeness)   (confidence ≥0.5,  (regime, score,     (4-layer     (broker
-                                    risk/reward,        drift, routing,     sequential    + simulator)
-                                    provenance)         allocation)         checks)
+Strategy Signal
+    ↓
+Signal Package (completeness, provenance)
+    ↓
+Decision Orchestrator
+    │
+    ├── Signal Integrity Gate (placeholder/status detection)
+    ├── Data Quality Gate (feature freshness, volume, spread, bar sufficiency)
+    ├── Model Health Gate (accuracy drift, calibration ECE, age, volume)
+    ├── Confidence Calibration (binned outcome correction)
+    ├── Confidence Decay (exponential/linear/step, half-life invalidation)
+    ├── Market Regime Adjustment (strategy-specific compatibility scoring)
+    └── Threshold Profile (conservative/balanced/aggressive/paper modes)
+    ↓
+Immutable DecisionContract (frozen, integrity-hashed, veto authority)
+    ↓
+Intelligence Layer (regime routing, trade quality scoring, capital allocation)
+    ↓
+Risk Engine (4-layer sequential: Account → Portfolio → Exposure → Execution)
+    ↓
+Sizing Engine (confidence-weighted position sizing, uncertainty adjustment)
+    ↓
+Execution Engine (broker orders + simulator)
+    ↓
+Contract Store (DuckDB persistence, outcome linkage, replay)
 ```
 
 - **Signal Package**: Comprehensive execution package with entry zone, stop loss, take profit levels, holding period, confidence decay schedule, and model provenance
-- **Validation Gate**: Blocks incomplete signals from execution (configurable strictness); hard floor at 0.5 confidence
+- **Decision Orchestrator**: Produces an immutable DecisionContract for every signal — no signal bypasses the governance pipeline
+- **DecisionContract**: Frozen dataclass with integrity hash, veto authority per stage, full provenance, and expiration (5-min TTL)
 - **Intelligence Layer**: Scores trade quality, checks regime compatibility, allocates capital
 - **Risk Engine**: 4 sequential risk layers evaluate every order (Account → Portfolio → Exposure → Execution)
+- **Sizing Engine**: Separates approval from sizing — moderate-confidence trades execute at reduced size instead of being rejected
+- **Contract Store**: Every contract (executed, rejected, expired) persisted to DuckDB for audit, replay, and analytics
 
 ---
 
@@ -886,9 +911,169 @@ INTELLIGENCE_DRIFT_ALERT_DROP=0.12    # Accuracy drop threshold for alert
 
 ---
 
+## Decision Governance Engine
+
+The platform implements an **institutional-grade decision governance system** where confidence is a rich, multi-dimensional, auditable object — not a single float. Every trading decision flows through a unified pipeline that produces an immutable `DecisionContract` with full provenance and lineage.
+
+### Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         Decision Governance Engine                            │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Signal Context                                                              │
+│       │                                                                      │
+│       ▼                                                                      │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │                    7-Stage Confidence Pipeline                         │   │
+│  │                                                                       │   │
+│  │  ① Signal Integrity ──▶ ② Data Quality ──▶ ③ Model Health            │   │
+│  │         │                      │                    │                  │   │
+│  │         ▼                      ▼                    ▼                  │   │
+│  │  ④ Calibration ──▶ ⑤ Confidence Decay ──▶ ⑥ Regime Adjustment        │   │
+│  │         │                                           │                  │   │
+│  │         ▼                                           ▼                  │   │
+│  │  ⑦ Threshold Profile (conservative/balanced/aggressive/paper)         │   │
+│  └──────────────────────────────────────────────────────────────────────┘   │
+│       │                                                                      │
+│       ▼                                                                      │
+│  DecisionContract (immutable, integrity-hashed, with veto authority)         │
+│       │                                                                      │
+│       ├───▶ Sizing Engine (confidence-weighted position sizing)              │
+│       ├───▶ Uncertainty Estimator (ensemble variance quantification)         │
+│       ├───▶ Feature Attribution (per-prediction WHY explanation)             │
+│       ├───▶ Portfolio Confidence (correlation-aware discount)                │
+│       ├───▶ Adaptive Thresholds (per-regime EMA learning)                   │
+│       ├───▶ Confidence Drift Monitor (distribution shift alerting)           │
+│       └───▶ Decision Lineage Registry (D-YYYYMMDD-NNNNNN trace IDs)        │
+│       │                                                                      │
+│       ▼                                                                      │
+│  Contract Store (DuckDB) ──▶ Rejected Trade Tracker (counterfactual)        │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Confidence as a First-Class Object
+
+Instead of `confidence = 0.78`, every signal produces a rich `ConfidenceScore`:
+
+```python
+ConfidenceScore(
+    value=0.73,
+    integrity=SignalIntegrity.REAL,
+    approved=True,
+    breakdown=ConfidenceBreakdown(
+        raw_model_probability=0.82,
+        calibration_adjustment=-0.03,
+        data_quality_factor=0.97,
+        model_health_factor=0.99,
+        regime_compatibility_factor=0.86,
+        temporal_decay_factor=0.95,
+        feature_freshness_factor=1.00,
+        final_confidence=0.73,
+    ),
+    data_quality=DataQuality(...),
+    model_health=ModelHealth(...),
+    strategy="momentum",
+    symbol="AAPL",
+)
+```
+
+The `ConfidenceScore` implements comparison operators (`__float__`, `__lt__`, `__gt__`, etc.) for full backward compatibility — existing code using `if confidence > 0.5` continues to work unchanged.
+
+### The 7 Gates
+
+| Gate | What It Checks | Failure Mode |
+|------|---------------|--------------|
+| **Signal Integrity** | Is this a real signal or placeholder? 10 states: REAL, PLACEHOLDER, MODEL_UNAVAILABLE, FEATURES_MISSING, etc. | Immediate reject |
+| **Data Quality** | Feature completeness, candle freshness, volume staleness, spread width, bar sufficiency | Reject or discount |
+| **Model Health** | Accuracy drift from baseline, calibration ECE, model age, prediction volume | Reject or discount |
+| **Calibration** | Binned historical outcomes vs predicted probability; auto ECE correction (max ±0.15 per bin) | Adjust confidence |
+| **Decay** | Signal age vs configured half-life; exponential/linear/step curves | Invalidate if stale |
+| **Regime Adjustment** | Strategy-specific regime profiles; 8-dimension compatibility scoring | Discount confidence |
+| **Threshold** | Profile-based minimum confidence (conservative=0.72, balanced=0.65, aggressive=0.58, paper=0.40) | Final reject |
+
+### Immutable DecisionContract
+
+Every decision produces a frozen, integrity-hashed contract:
+
+```python
+DecisionContract(
+    contract_id="DC-a1b2c3d4",
+    decision=Decision.EXECUTE,          # EXECUTE | REJECT | REDUCE | DEFER
+    confidence_score=0.73,
+    signal_integrity="REAL",
+    stages=[                            # Per-stage assessments
+        StageAssessment(name="data_quality", verdict="pass", score=0.97),
+        StageAssessment(name="model_health", verdict="pass", score=0.99),
+        ...
+    ],
+    provenance=DecisionProvenance(
+        model_version="v012",
+        git_hash="abc123",
+        feature_schema_version=3,
+        training_dataset_hash="sha256:...",
+    ),
+    veto_authority=VetoAuthority.RISK_ENGINE,
+    valid_until=datetime(...),          # 5-minute TTL
+    integrity_hash="sha256:...",        # Tamper detection
+)
+```
+
+The contract flows through **Risk → Sizing → Execution → Trade → P&L → Retraining** — every downstream artifact references it.
+
+### Governance Modules
+
+| Module | Purpose |
+|--------|---------|
+| **SizingEngine** | Separates "Can I trade?" from "How much should I trade?" — lower confidence = smaller position, not rejection |
+| **UncertaintyEstimator** | Estimates confidence-in-the-confidence via ensemble variance, bootstrap disagreement |
+| **FeatureAttribution** | Stores top contributing features with signed contribution values (e.g., RSI +0.11, Volatility -0.05) |
+| **PortfolioConfidenceEngine** | Discounts confidence for signals correlated with existing positions; tracks concentration risk |
+| **LineageRegistry** | Assigns immutable trace IDs (D-YYYYMMDD-NNNNNN); links every artifact back to originating decision |
+| **RejectedTradeTracker** | Records counterfactual outcomes for rejected trades; identifies if thresholds are too strict |
+| **AdaptiveThresholdEngine** | Learns per-regime thresholds via EMA of observed win rates; thresholds evolve automatically |
+| **ConfidenceDriftMonitor** | Detects distribution shift in confidence scores; alerts before losses materialize |
+| **ContractStore** | DuckDB persistence for all contracts; replay capability; accuracy and stage-level diagnostics |
+| **OnlineLearningLoop** | Reward attribution, hard example mining, curated sample selection for next batch retrain |
+
+### Decision Lineage
+
+Every decision receives a unique trace ID enabling full lifecycle traceability:
+
+```
+D-20260705-000234
+    ├── Prediction (model v012, features sha256:...)
+    ├── Confidence Gates (7 stages, all verdicts)
+    ├── Risk Assessment (4 layers)
+    ├── Sizing Decision (25% normal)
+    ├── Execution (fill price, slippage)
+    ├── Trade P&L (+2.3%)
+    ├── Online Learning (reward attribution)
+    └── Next Retrain (weighted sample inclusion)
+```
+
+Months later, answer: *Which model generated this trade? Which gates modified it? Which features were used? Which calibration table was active?*
+
+### Threshold Profiles
+
+The system supports multiple operational modes with distinct confidence thresholds:
+
+| Profile | Min Confidence | Use Case |
+|---------|---------------|----------|
+| **Conservative** | 0.72 | High-value accounts, low tolerance for losses |
+| **Balanced** | 0.65 | Default production mode |
+| **Aggressive** | 0.58 | Momentum markets, higher trade frequency |
+| **Paper** | 0.40 | Paper trading, maximum signal exploration |
+
+Thresholds are further adjusted by the AdaptiveThresholdEngine based on per-regime observed outcomes.
+
+---
+
 ## Risk Management
 
-The platform implements a **4-layer risk engine** where every order must pass all enabled layers in sequence. Signals below 0.5 confidence are rejected outright before layer evaluation.
+The platform implements a **4-layer risk engine** where every order must pass all enabled layers in sequence. The DecisionContract takes priority: contracts that are expired or vetoed are immediately rejected. When no contract is present, the legacy 0.5 confidence hard floor applies.
 
 **Evaluation order:** Account → Portfolio → Exposure → Execution
 
@@ -1071,6 +1256,28 @@ algo-trader/
 │   ├── intelligence/
 │   │   ├── orchestrator.py            # Top-level adaptive intelligence coordinator
 │   │   ├── models.py                  # Intelligence decision data models
+│   │   ├── confidence/                # ═══ Decision Governance Engine ═══
+│   │   │   ├── __init__.py            # Package exports (all public APIs)
+│   │   │   ├── models.py             # ConfidenceScore, SignalIntegrity, ThresholdProfile, DataQuality, ModelHealth
+│   │   │   ├── gate.py               # 7-stage ConfidenceGate orchestrator (core pipeline)
+│   │   │   ├── decision_contract.py  # Immutable DecisionContract, Builder, Provenance, VetoAuthority
+│   │   │   ├── orchestrator.py       # DecisionOrchestrator (produces contracts from signals)
+│   │   │   ├── contract_store.py     # DuckDB persistence, replay, analytics, outcome linkage
+│   │   │   ├── data_quality_gate.py  # Feature completeness, candle freshness, volume, spread
+│   │   │   ├── model_health_gate.py  # Accuracy drift, calibration ECE, model age
+│   │   │   ├── calibrator.py         # Binned outcome tracking, auto ECE correction
+│   │   │   ├── decay.py              # Exponential/linear/step curves, half-life invalidation
+│   │   │   ├── regime_adjuster.py    # Strategy-specific regime profiles, compatibility scoring
+│   │   │   └── governance/           # ═══ Advanced Governance Modules ═══
+│   │   │       ├── __init__.py       # Governance package exports
+│   │   │       ├── sizing.py         # SizingEngine (approval vs sizing separation)
+│   │   │       ├── uncertainty.py    # UncertaintyEstimator (ensemble variance, bootstrap)
+│   │   │       ├── attribution.py    # FeatureAttribution (per-prediction explanation)
+│   │   │       ├── portfolio_confidence.py  # Correlation-aware confidence discount
+│   │   │       ├── lineage.py        # DecisionLineage (D-YYYYMMDD-NNNNNN trace IDs)
+│   │   │       ├── rejected_trades.py # Counterfactual tracking of rejected signals
+│   │   │       ├── adaptive_thresholds.py  # Per-regime EMA threshold learning
+│   │   │       └── confidence_drift.py     # Distribution shift detection & alerting
 │   │   ├── regime/
 │   │   │   └── classifier.py          # Multi-dimensional regime classifier
 │   │   ├── scoring/
@@ -1103,6 +1310,7 @@ algo-trader/
 │   │   ├── governance.py              # Model governance, lineage, promotion gates
 │   │   ├── ab_testing.py              # A/B testing framework (shadow, split, interleaved modes)
 │   │   ├── feedback_loop.py           # Closed-loop learning (scorecards, experience DB, calibration)
+│   │   ├── online_learning.py         # Online learning loop (reward attribution, sample curation)
 │   │   ├── promotion_engine.py        # Champion-challenger auto-promotion with governance gates
 │   │   └── retraining_trigger.py      # Drift-triggered + scheduled retraining
 │   ├── risk/
@@ -1193,7 +1401,7 @@ algo-trader/
 │   ├── runner.py                      # Backtest runner orchestration
 │   └── param_validator.py             # Parameter validation for backtests
 ├── models/                            # Saved ML models (versioned .joblib)
-├── data_cache/                        # SQLite DB + cached data + events + snapshots
+├── data_cache/                        # SQLite DB + DuckDB contract store + cached data + events + snapshots
 ├── logs/                              # Application logs (structlog JSON)
 ├── tests/                             # Comprehensive test suite (50+ test files)
 ├── .github/
@@ -1385,6 +1593,12 @@ pytest -v
 
 # Run tests matching a pattern
 pytest -k "test_intelligence"
+
+# Run confidence governance tests
+pytest tests/test_confidence_system.py
+
+# Run decision contract integration tests
+pytest tests/test_contract_integration.py
 ```
 
 Key test areas:
@@ -1392,6 +1606,8 @@ Key test areas:
 - Risk engine (all 4 layers)
 - Strategy orchestrator
 - Intelligence layer (drift, scoring, routing)
+- **Decision governance** (7 confidence gates, threshold profiles, decay, calibration, regime adjustment)
+- **Decision contracts** (immutable contracts, contract store, pipeline integration)
 - ML lifecycle and governance
 - Configuration service and persistence
 - Telegram command handling
@@ -1409,6 +1625,11 @@ Key test areas:
 - The bot has built-in daily loss limits, weekly drawdown limits, and multi-layer circuit breakers
 - Live mode requires typing "YES" as confirmation on CLI startup
 - All trades are logged to SQLite for full audit trail and forensic analysis
+- Every decision is governed by an immutable DecisionContract with integrity hash and full provenance
+- Confidence must pass 7 independent gates before a trade is approved — fail at any gate = immediate reject
+- Data quality is verified before confidence is even evaluated (stale candles, missing volume = blocked)
+- Model health is continuously monitored — degrading accuracy automatically reduces confidence
+- Confidence decays over time — stale signals are invalidated before they reach execution
 - Use `/pause` on Telegram to immediately halt auto-trading
 - Use `/closeall` for emergency liquidation (requires button confirmation)
 - Risk halts are automatic — the bot notifies you and stops trading
@@ -1417,6 +1638,7 @@ Key test areas:
 - Portfolio reconciliation runs every 5 minutes to detect and fix state drift
 - The intelligence layer blocks low-quality trades even when the strategy fires a signal
 - Model promotion gates prevent deploying underperforming models to production
+- Rejected trades are tracked counterfactually to ensure thresholds aren't too conservative
 - All Telegram commands are rate-limited (10 commands/minute per user)
 
 ---
@@ -1427,9 +1649,10 @@ Key test areas:
 |----------|-----------|
 | Language | Python 3.12+ |
 | Trading API | Alpaca Markets (REST + WebSocket) |
-| ML Framework | XGBoost, scikit-learn |
+| ML Framework | XGBoost, scikit-learn, NumPy, SciPy |
 | Backtesting | Backtrader, VectorBT, custom engine |
-| Database | SQLite (SQLAlchemy + aiosqlite) |
+| Database | SQLite (SQLAlchemy + aiosqlite), DuckDB (contract store + analytics) |
+| Decision Engine | Custom confidence governance pipeline + immutable contracts |
 | Telegram Bot | aiogram 3.x (async) |
 | Configuration | Pydantic v2 + pydantic-settings |
 | Scheduling | APScheduler + custom DAG scheduler |
