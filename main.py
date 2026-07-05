@@ -40,6 +40,7 @@ from src.intelligence.orchestrator import AdaptiveIntelligenceOrchestrator
 from src.notifications.alerts import NotificationManager
 from src.monitoring.health import HealthMonitor
 from src.monitoring.metrics import LiveMetrics
+from src.config.initializer import initialize_configuration_service
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -1343,6 +1344,28 @@ Examples:
     # Setup logging
     setup_logging(settings.log_level, settings.log_file)
     logger = get_logger("main")
+
+    # Initialize configuration service (load persisted DB configs)
+    logger.info("main.initializing_configuration_service")
+    try:
+        config_service = initialize_configuration_service(
+            database_url=settings.database_url,
+            seed_from_env=True,  # On first run, overlay env vars over defaults
+            auto_refresh=True,
+        )
+        logger.info(
+            "main.configuration_service_initialized",
+            cache_entries=len(config_service._cache) if config_service._cache else 0,
+        )
+    except Exception as e:
+        logger.error(
+            "main.configuration_service_initialization_failed",
+            error=str(e),
+        )
+        # Non-fatal: continue with env-based settings
+        config_service = None
+        logger.warning("main.continuing_with_env_based_config")
+
 
     # Determine trading mode
     if args.live:
