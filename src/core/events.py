@@ -383,6 +383,50 @@ class OperationalModeChanged(Event):
 
 
 # ---------------------------------------------------------------------------
+# ML Lifecycle Hardening Events
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class PredictionUnavailable(Event):
+    """Emitted when a prediction cannot be generated."""
+
+    symbol: str = ""
+    reason: str = ""
+
+
+@dataclass(frozen=True)
+class ModelRejected(Event):
+    """Emitted when a model fails promotion validation."""
+
+    version: str = ""
+    reasons: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class CircuitBreakerTripped(Event):
+    """Emitted when the trading circuit breaker trips."""
+
+    state: str = ""  # "SAFE_MODE" | "HALTED"
+    reasons: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class CircuitBreakerReset(Event):
+    """Emitted when the trading circuit breaker resets."""
+
+    previous_state: str = ""
+
+
+@dataclass(frozen=True)
+class ModelAutoRollback(Event):
+    """Emitted when a model is automatically rolled back."""
+
+    from_version: str = ""
+    to_version: str = ""
+    reason: str = ""
+
+
+# ---------------------------------------------------------------------------
 # Event Bus
 # ---------------------------------------------------------------------------
 

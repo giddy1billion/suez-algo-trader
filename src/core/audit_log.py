@@ -9,11 +9,43 @@ import json
 import logging
 import os
 import threading
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class TradeAuditTrail:
+    """
+    Full audit trail linking a trade through its entire ML lifecycle.
+
+    Provides complete traceability:
+    trade → signal → prediction → model → training run → dataset → features
+    """
+    trade_id: str = ""
+    signal_id: str = ""
+    prediction_id: str = ""
+    model_version: str = ""
+    training_run_id: str = ""
+    backtest_run_id: str = ""
+    dataset_snapshot_hash: str = ""
+    feature_snapshot_hash: str = ""
+    timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    def is_complete(self) -> bool:
+        """Check if the audit trail has all required links."""
+        return bool(self.trade_id and self.prediction_id and self.model_version)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "TradeAuditTrail":
+        known_fields = {f.name for f in cls.__dataclass_fields__.values()}
+        return cls(**{k: v for k, v in data.items() if k in known_fields})
 
 
 class AuditLogger:

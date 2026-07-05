@@ -115,6 +115,17 @@ class TrainingPipeline:
         self._auto_deploy = auto_deploy
         self._min_samples = min_training_samples
 
+        # Recovery settings (loaded from config when available)
+        try:
+            from config.settings import settings
+            self._max_retries = settings.model_max_retries
+            self._retry_backoff_seconds = settings.model_retry_backoff_seconds
+            self._stale_threshold_hours = settings.model_stale_threshold_hours
+        except Exception:
+            self._max_retries = 3
+            self._retry_backoff_seconds = 60.0
+            self._stale_threshold_hours = 168.0
+
         # State
         self._current: Optional[PipelineProgress] = None
         self._history: list[PipelineProgress] = []
@@ -361,7 +372,7 @@ class TrainingPipeline:
         progress.validation_issues = issues
         progress.steps_completed = 5
 
-        # Step 6: Auto-deploy if valid
+        # Step 6: Auto-deploy if valid, reject otherwise
         progress.status = PipelineStatus.DEPLOYING
         progress.current_step = "Deploying model"
 
@@ -378,6 +389,14 @@ class TrainingPipeline:
                 version=version,
                 issues=issues,
             )
+            # Publish ModelRejected event
+            if self._event_bus:
+                from src.core.events import ModelRejected
+                self._event_bus.publish(ModelRejected(
+                    version=version,
+                    reasons=issues,
+                    source="training_pipeline",
+                ))
         progress.steps_completed = 6
 
         # Complete
@@ -534,3 +553,117 @@ class TrainingPipeline:
         }
 
         return final_model, metrics, feature_cols
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Self-Healing & Recovery
+    # ──────────────────────────────────────────────────────────────────────
+
+    def train_with_retry(
+        self,
+        symbols: list[str],
+        timeframe: str = "1Hour",
+        lookback_bars: int = 1000,
+        trigger: str = "auto_retry",
+        data_override: Optional[dict[str, pd.DataFrame]] = None,
+    ) -> Optional[str]:
+        """
+        Train with automatic retry on failure.
+
+        Uses exponential backoff between retries.
+
+        Returns:
+            pipeline_id of successful run, or None if all retries exhausted.
+        """
+        last_error = None
+        for attempt in range(1, self._max_retries + 1):
+            try:
+                progress = self.train_sync(
+                    symbols=symbols,
+                    timeframe=timeframe,
+                    lookback_bars=lookback_bars,
+                    data_override=data_override,
+                )
+                if progress.status == PipelineStatus.COMPLETED:
+                    logger.info(
+                        "training_pipeline.retry_succeeded",
+                        attempt=attempt,
+                        pipeline_id=progress.pipeline_id,
+                    )
+                    return progress.pipeline_id
+                last_error = progress.error or "Unknown failure"
+            except Exception as e:
+                last_error = str(e)
+
+            if attempt < self._max_retries:
+                backoff = self._retry_backoff_seconds * (2 ** (attempt - 1))
+                logger.warning(
+                    "training_pipeline.retry_backoff",
+                    attempt=attempt,
+                    next_attempt=attempt + 1,
+                    backoff_seconds=backoff,
+                    error=last_error,
+                )
+                time.sleep(backoff)
+
+        logger.error(
+            "training_pipeline.all_retries_exhausted",
+            max_retries=self._max_retries,
+            last_error=last_error,
+        )
+        return None
+
+    def check_stale_model(self) -> bool:
+        """
+        Check if the deployed model is stale (older than threshold).
+
+        Returns True if the model is stale and retraining should be triggered.
+        """
+        try:
+            deployed = self._governance.get_deployed_model()
+            if deployed is None:
+                return True  # No model at all — definitely stale
+
+            if not deployed.training_timestamp:
+                return True
+
+            training_time = datetime.fromisoformat(deployed.training_timestamp)
+            age_hours = (datetime.now(timezone.utc) - training_time).total_seconds() / 3600
+            if age_hours > self._stale_threshold_hours:
+                logger.info(
+                    "training_pipeline.stale_model_detected",
+                    model_version=deployed.version,
+                    age_hours=round(age_hours, 1),
+                    threshold_hours=self._stale_threshold_hours,
+                )
+                return True
+        except Exception as e:
+            logger.warning("training_pipeline.stale_check_error", error=str(e))
+        return False
+
+    def auto_rollback(self, reason: str = "") -> bool:
+        """
+        Roll back to the previous model version if available.
+
+        Returns True if rollback was successful.
+        """
+        try:
+            previous = self._registry.rollback()
+            if previous:
+                # Publish rollback event
+                if self._event_bus:
+                    from src.core.events import ModelAutoRollback
+                    self._event_bus.publish(ModelAutoRollback(
+                        from_version=getattr(previous, 'from_version', ''),
+                        to_version=getattr(previous, 'to_version', str(previous)),
+                        reason=reason,
+                        source="training_pipeline",
+                    ))
+                logger.info(
+                    "training_pipeline.auto_rollback",
+                    to_version=str(previous),
+                    reason=reason,
+                )
+                return True
+        except Exception as e:
+            logger.error("training_pipeline.rollback_failed", error=str(e))
+        return False

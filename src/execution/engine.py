@@ -73,6 +73,7 @@ class ExecutionEngine:
         execution_simulator=None,
         intelligence_orchestrator: Optional[AdaptiveIntelligenceOrchestrator] = None,
         min_signal_confidence: float = 0.55,
+        circuit_breaker=None,
     ):
         self.broker = broker
         self.risk = risk_manager
@@ -90,6 +91,7 @@ class ExecutionEngine:
         self._trade_manager = trade_manager
         self._simulator = execution_simulator  # None = no simulation (direct broker)
         self.intelligence_orchestrator = intelligence_orchestrator
+        self._circuit_breaker = circuit_breaker
 
     # ──────────────────────────────────────────────────────────────────────
     # Event Publishing Helpers
@@ -125,6 +127,12 @@ class ExecutionEngine:
         self._current_strategy_name = strategy.name
         self._current_capital_weight = max(0.0, min(1.0, capital_weight))
         results = []
+
+        # 0. Check circuit breaker
+        if self._circuit_breaker and not self._circuit_breaker.is_trading_allowed():
+            cb_reasons = self._circuit_breaker.active_reasons
+            logger.warning("engine.circuit_breaker_active", reasons=cb_reasons)
+            return []
 
         # 1. Check if trading is allowed
         can_trade, reason = self.risk.can_trade()
