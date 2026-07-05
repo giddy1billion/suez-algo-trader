@@ -645,15 +645,29 @@ class AlpacaBroker:
     }
 
     def _detect_candle_gaps(self, df, symbol: str, timeframe: str) -> None:
-        """Detect and log missing candle gaps in bar data."""
-        import pandas as pd
+        """Detect and log missing candle gaps in bar data.
 
+        For stocks: accounts for weekends (65h), holidays (up to 4-day closures ~97h).
+        For crypto: trades 24/7, so any gap beyond 3x interval is flagged.
+        """
         expected_seconds = self._TF_EXPECTED_DELTA.get(timeframe)
         if expected_seconds is None:
-            return  # Unknown timeframe — skip
+            return  # Unknown timeframe - skip
 
-        # Allow 2x the expected interval before flagging (accounts for weekends/holidays)
-        threshold = expected_seconds * 3
+        is_crypto = "/" in symbol  # e.g. BTC/USD, ETH/USD
+
+        if is_crypto:
+            # Crypto trades 24/7 — any gap > 3x interval is suspicious
+            threshold = expected_seconds * 3
+        else:
+            # Stocks have weekends + holidays. Max normal closure:
+            # 4-day weekend (Fri close 4pm → Tue open 9:30am) = ~113h
+            # For daily bars, allow 5 days; for intraday allow 120h
+            if timeframe == "1Day":
+                threshold = 86400 * 5  # 5 calendar days
+            else:
+                threshold = 120 * 3600  # 120 hours (covers 4-day weekends)
+
         deltas = df.index.to_series().diff().dt.total_seconds().dropna()
         gaps = deltas[deltas > threshold]
 
