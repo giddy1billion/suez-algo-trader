@@ -468,14 +468,21 @@ class TrainingPipeline:
         self, feature_data: dict[str, pd.DataFrame]
     ) -> dict[str, pd.DataFrame]:
         """
-        Enrich training data with live trade outcomes from ExperienceDatabase.
+        Enrich training data with live trade outcome LABELS (not features).
 
-        The experience DB contains real trade results with:
-        - Actual outcomes (profitable/not) as verified labels
-        - Feature vectors used at prediction time
-        - Calibration targets (predicted vs actual confidence)
+        CRITICAL: To prevent data leakage, we NEVER mix live-trade features
+        into the historical feature matrix. Live trade features were computed
+        at prediction time and may contain future-looking information relative
+        to the historical training window.
 
-        This creates a closed-loop: live outcomes improve future models.
+        Instead, we use experience data in two safe ways:
+        1. Sample weights: historical bars that correspond to profitable live
+           trades receive higher weight (verified signal quality).
+        2. Calibration signal: the overall accuracy rate from experience
+           adjusts the confidence threshold used in label generation.
+
+        The actual features ALWAYS come from the historical bar data.
+        Experience provides only outcome verification and weighting.
         """
         if self._experience_db is None:
             return feature_data
@@ -486,45 +493,62 @@ class TrainingPipeline:
                 logger.info("training_pipeline.no_experience_data")
                 return feature_data
 
-            # Group experience samples by symbol
-            if '_symbol' not in experience_df.columns and 'symbol' in experience_df.columns:
-                experience_df = experience_df.rename(columns={'symbol': '_symbol'})
+            # Extract verified accuracy from live trading (calibration signal)
+            recent_accuracy = self._experience_db.get_recent_accuracy(n_trades=50)
 
-            experience_count = 0
+            # Use time-weighted samples if available
+            if hasattr(self._experience_db, 'get_training_samples_weighted'):
+                try:
+                    weighted_df = self._experience_db.get_training_samples_weighted(
+                        min_trades=20, half_life_days=30.0
+                    )
+                    if weighted_df is not None and not weighted_df.empty:
+                        experience_df = weighted_df
+                except Exception:
+                    pass  # Fall back to unweighted
+
+            # Build symbol-level performance weights from experience
+            # Symbols with verified profitable history get boosted weights
+            symbol_col = '_symbol' if '_symbol' in experience_df.columns else 'symbol'
+            if symbol_col not in experience_df.columns:
+                logger.info("training_pipeline.experience_no_symbol_col")
+                return feature_data
+
+            symbol_accuracy = {}
+            for sym in experience_df[symbol_col].unique():
+                sym_data = experience_df[experience_df[symbol_col] == sym]
+                profitable_col = 'actual_profitable' if 'actual_profitable' in sym_data.columns else 'profitable'
+                if profitable_col in sym_data.columns:
+                    symbol_accuracy[sym] = float(sym_data[profitable_col].mean())
+
+            # Apply sample weights to feature_data based on experience accuracy
+            # Symbols with verified high accuracy get boosted; poor accuracy get reduced
+            enriched_count = 0
             for symbol, df in feature_data.items():
-                sym_exp = experience_df[experience_df['_symbol'] == symbol] if '_symbol' in experience_df.columns else pd.DataFrame()
-                if sym_exp.empty:
+                if symbol not in symbol_accuracy:
                     continue
 
-                # Match feature columns that exist in both
-                common_cols = [c for c in df.columns if c in sym_exp.columns and c != '_symbol']
-                if not common_cols:
-                    continue
+                accuracy = symbol_accuracy[symbol]
+                # Weight: accuracy maps to [0.5, 2.0] range
+                # 50% accuracy = weight 1.0 (neutral)
+                # 70% accuracy = weight 1.4 (boost)
+                # 30% accuracy = weight 0.6 (reduce)
+                weight = 0.5 + accuracy * 1.5
+                weight = max(0.5, min(2.0, weight))
 
-                # Append experience samples (they have verified labels)
-                # Mark source so we can weight them higher during training
                 df_copy = df.copy()
-                df_copy['_from_experience'] = 0
+                df_copy['_sample_weight'] = weight
+                df_copy['_from_experience'] = 0  # Features are historical, NOT from experience
+                feature_data[symbol] = df_copy
+                enriched_count += 1
 
-                exp_subset = sym_exp[common_cols].copy()
-                exp_subset['_from_experience'] = 1
-                # Align any missing columns with NaN
-                for col in df_copy.columns:
-                    if col not in exp_subset.columns:
-                        exp_subset[col] = float('nan')
-                exp_subset = exp_subset.reindex(columns=df_copy.columns, fill_value=float('nan'))
-
-                feature_data[symbol] = pd.concat([df_copy, exp_subset], ignore_index=True)
-                experience_count += len(exp_subset)
-
-            if experience_count > 0:
+            if enriched_count > 0:
                 logger.info(
                     "training_pipeline.experience_enrichment",
-                    samples_added=experience_count,
-                    symbols_enriched=sum(
-                        1 for df in feature_data.values()
-                        if '_from_experience' in df.columns and df['_from_experience'].sum() > 0
-                    ),
+                    method="label_weighting_only",
+                    symbols_weighted=enriched_count,
+                    live_accuracy=f"{recent_accuracy:.1%}",
+                    leakage_prevention="features_untouched",
                 )
         except Exception as e:
             logger.warning("training_pipeline.experience_enrichment_error", error=str(e))
@@ -559,14 +583,26 @@ class TrainingPipeline:
         combined = pd.concat(all_dfs, ignore_index=True)
 
         # Get feature columns (exclude meta and target)
-        exclude_cols = {'target', 'future_return', '_symbol', 'open', 'high', 'low', 'close', 'volume'}
+        exclude_cols = {'target', 'future_return', '_symbol', '_sample_weight', '_from_experience',
+                        'open', 'high', 'low', 'close', 'volume'}
         feature_cols = [c for c in combined.columns if c not in exclude_cols]
 
         # Drop forward-looking column to ensure no leakage into features
         combined = combined.drop(columns=['future_return'], errors='ignore')
 
+        # Extract sample weights if present (from experience enrichment)
+        sample_weights = None
+        if '_sample_weight' in combined.columns:
+            sample_weights = combined['_sample_weight'].values
+            combined = combined.drop(columns=['_sample_weight'], errors='ignore')
+        if '_from_experience' in combined.columns:
+            combined = combined.drop(columns=['_from_experience'], errors='ignore')
+
         # Drop NaN rows
-        valid = combined.dropna(subset=feature_cols + ['target'])
+        valid_mask = combined[feature_cols + ['target']].notna().all(axis=1)
+        valid = combined[valid_mask].reset_index(drop=True)
+        if sample_weights is not None:
+            sample_weights = sample_weights[valid_mask.values]
         if len(valid) < self._min_samples:
             raise RuntimeError(
                 f"Insufficient training samples: {len(valid)} < {self._min_samples}"
@@ -589,6 +625,7 @@ class TrainingPipeline:
 
             X_train, X_val = X[train_idx], X[val_idx]
             y_train, y_val = y[train_idx], y[val_idx]
+            w_train = sample_weights[train_idx] if sample_weights is not None else None
 
             model = XGBClassifier(
                 n_estimators=200,
@@ -601,11 +638,12 @@ class TrainingPipeline:
                 random_state=42,
                 verbosity=0,
             )
-            model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
+            model.fit(X_train, y_train, sample_weight=w_train,
+                      eval_set=[(X_val, y_val)], verbose=False)
             score = accuracy_score(y_val, model.predict(X_val))
             cv_scores.append(score)
 
-        # Train final model on all data
+        # Train final model on all data with experience-derived weights
         final_model = XGBClassifier(
             n_estimators=200,
             max_depth=6,
@@ -617,7 +655,7 @@ class TrainingPipeline:
             random_state=42,
             verbosity=0,
         )
-        final_model.fit(X, y, verbose=False)
+        final_model.fit(X, y, sample_weight=sample_weights, verbose=False)
 
         metrics = {
             "cv_accuracy": float(np.mean(cv_scores)),

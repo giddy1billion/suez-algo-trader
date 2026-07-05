@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import threading
+import uuid
 from dataclasses import dataclass, field, asdict
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -101,13 +103,19 @@ class ModelPromotionEngine:
         challenger_returns = [t.get("pnl_pct", t.get("return", 0.0)) for t in challenger_trades]
 
         gates: list[PromotionGate] = [
+            # Critical gates (1-6)
             self._check_gate_sample_size(challenger_trades),
             self._check_gate_significance(champion_returns, challenger_returns),
             self._check_gate_sharpe(champion_metrics, challenger_metrics),
             self._check_gate_drawdown(champion_metrics, challenger_metrics),
             self._check_gate_win_rate(champion_metrics, challenger_metrics),
+            self._check_gate_cvar(champion_trades, challenger_trades),
+            # Optional gates (7-12)
             self._check_gate_calibration(champion_metrics, challenger_metrics),
+            self._check_gate_brier_score(champion_metrics, challenger_metrics),
+            self._check_gate_return_stability(champion_trades, challenger_trades),
             self._check_gate_regime_stability(challenger_trades),
+            self._check_gate_feature_drift(challenger_metrics),
             self._check_gate_latency(champion_metrics, challenger_metrics),
         ]
 
@@ -341,7 +349,7 @@ class ModelPromotionEngine:
     def _check_gate_latency(
         self, champion_metrics: dict, challenger_metrics: dict
     ) -> PromotionGate:
-        """Gate 8: No latency degradation."""
+        """Gate: No latency degradation."""
         champ_latency = champion_metrics.get("avg_latency_ms", 0.0)
         chall_latency = challenger_metrics.get("avg_latency_ms", 0.0)
         # Allow up to 20% latency increase
@@ -356,24 +364,129 @@ class ModelPromotionEngine:
             details=f"Latency {champ_latency:.1f}ms -> {chall_latency:.1f}ms",
         )
 
+    def _check_gate_cvar(
+        self, champion_trades: list, challenger_trades: list
+    ) -> PromotionGate:
+        """Gate: Conditional Value at Risk (Expected Shortfall).
+        Challenger's CVaR-5% must not be worse than champion's.
+        CVaR = average of worst 5% of returns."""
+        champ_returns = [t.get("pnl_pct", t.get("return", 0.0)) for t in champion_trades]
+        chall_returns = [t.get("pnl_pct", t.get("return", 0.0)) for t in challenger_trades]
+
+        champ_cvar = self._compute_cvar(champ_returns)
+        chall_cvar = self._compute_cvar(chall_returns)
+
+        # Challenger CVaR must not be worse (more negative) than champion's
+        passed = chall_cvar >= champ_cvar
+        return PromotionGate(
+            name="cvar",
+            passed=passed,
+            metric_name="cvar_5pct",
+            threshold=champ_cvar,
+            actual_value=chall_cvar,
+            details=f"CVaR-5% {champ_cvar:.4f} -> {chall_cvar:.4f}",
+        )
+
+    def _check_gate_return_stability(
+        self, champion_trades: list, challenger_trades: list
+    ) -> PromotionGate:
+        """Gate: Return variance/stability.
+        Challenger's return std must be <= 1.5x champion's."""
+        champ_returns = [t.get("pnl_pct", t.get("return", 0.0)) for t in champion_trades]
+        chall_returns = [t.get("pnl_pct", t.get("return", 0.0)) for t in challenger_trades]
+
+        champ_std = float(np.std(champ_returns)) if len(champ_returns) > 1 else 0.0
+        chall_std = float(np.std(chall_returns)) if len(chall_returns) > 1 else 0.0
+
+        threshold = champ_std * 1.5 if champ_std > 0 else float("inf")
+        passed = chall_std <= threshold
+        return PromotionGate(
+            name="return_stability",
+            passed=passed,
+            metric_name="return_std",
+            threshold=threshold,
+            actual_value=chall_std,
+            details=f"Std {champ_std:.4f} -> {chall_std:.4f} (max: {threshold:.4f})",
+        )
+
+    def _check_gate_brier_score(
+        self, champion_metrics: dict, challenger_metrics: dict
+    ) -> PromotionGate:
+        """Gate: Brier score (prediction probability accuracy).
+        Challenger's Brier score must be <= champion's.
+        Brier = mean((predicted_prob - actual_outcome)^2)"""
+        champ_brier = champion_metrics.get("brier_score", 1.0)
+        chall_brier = challenger_metrics.get("brier_score", 1.0)
+
+        passed = chall_brier <= champ_brier
+        return PromotionGate(
+            name="brier_score",
+            passed=passed,
+            metric_name="brier_score",
+            threshold=champ_brier,
+            actual_value=chall_brier,
+            details=f"Brier {champ_brier:.4f} -> {chall_brier:.4f}",
+        )
+
+    def _check_gate_feature_drift(self, challenger_metrics: dict) -> PromotionGate:
+        """Gate: Feature drift (PSI).
+        If PSI > 0.25 for >20% of features, reject promotion
+        (model trained on drifted data is unreliable)."""
+        psi_values = challenger_metrics.get("feature_psi", {})
+
+        if not psi_values:
+            # No PSI data available, pass by default
+            return PromotionGate(
+                name="feature_drift",
+                passed=True,
+                metric_name="psi_drift_pct",
+                threshold=20.0,
+                actual_value=0.0,
+                details="No PSI data available, gate passes by default",
+            )
+
+        total_features = len(psi_values)
+        drifted_features = sum(1 for v in psi_values.values() if v > 0.25)
+        drift_pct = (drifted_features / total_features) * 100 if total_features > 0 else 0.0
+
+        passed = drift_pct <= 20.0
+        return PromotionGate(
+            name="feature_drift",
+            passed=passed,
+            metric_name="psi_drift_pct",
+            threshold=20.0,
+            actual_value=drift_pct,
+            details=f"{drifted_features}/{total_features} features drifted (PSI>0.25): {drift_pct:.1f}%",
+        )
+
+    def _compute_cvar(self, returns: list[float], percentile: float = 5.0) -> float:
+        """Conditional Value at Risk (Expected Shortfall).
+        Average of the worst `percentile`% of returns."""
+        if not returns:
+            return 0.0
+        sorted_returns = sorted(returns)
+        cutoff_idx = max(1, int(len(sorted_returns) * percentile / 100))
+        return float(np.mean(sorted_returns[:cutoff_idx]))
+
     def should_promote(self, report: PromotionReport) -> bool:
         """
         Final decision: promote if all critical gates pass + majority of optional gates.
 
-        Critical gates (indices 0-4): sample_size, significance, sharpe, drawdown, win_rate
-        Optional gates (indices 5-7): calibration, regime_stability, latency
-        Promote if all critical pass AND at least 1 optional passes.
+        Critical gates (indices 0-5): sample_size, significance, sharpe, drawdown, win_rate, cvar
+        Optional gates (indices 6-11): calibration, brier_score, return_stability,
+                                       regime_stability, feature_drift, latency
+        Promote if all critical pass AND at least 3 of 6 optional gates pass.
         """
-        if len(report.gates) < 5:
+        if len(report.gates) < 6:
             return False
 
-        critical_gates = report.gates[:5]
-        optional_gates = report.gates[5:]
+        critical_gates = report.gates[:6]
+        optional_gates = report.gates[6:]
 
         all_critical_pass = all(g.passed for g in critical_gates)
         optional_passed = sum(1 for g in optional_gates if g.passed)
 
-        return all_critical_pass and optional_passed >= 1
+        return all_critical_pass and optional_passed >= 3
 
     def get_latest_report(self) -> Optional[PromotionReport]:
         """Get most recent promotion report."""
@@ -499,3 +612,377 @@ class CanaryDeployment:
 
         logger.info("canary_evaluated", **result)
         return result
+
+
+class ModelRollbackMonitor:
+    """
+    Monitors live model performance and auto-rollbacks if degradation detected.
+
+    Rollback triggers:
+    - Rolling Sharpe drops below threshold
+    - Drawdown exceeds maximum
+    - Win rate drops below minimum
+    - Consecutive losses exceed limit
+    - Calibration drift exceeds tolerance
+    """
+
+    def __init__(
+        self,
+        min_sharpe: float = -0.5,
+        max_drawdown_pct: float = 15.0,
+        min_win_rate: float = 0.35,
+        max_consecutive_losses: int = 8,
+        evaluation_window: int = 20,
+        cooldown_hours: float = 24.0,
+    ):
+        self._min_sharpe = min_sharpe
+        self._max_drawdown_pct = max_drawdown_pct
+        self._min_win_rate = min_win_rate
+        self._max_consecutive_losses = max_consecutive_losses
+        self._evaluation_window = evaluation_window
+        self._cooldown_hours = cooldown_hours
+
+        self._trades: list[dict] = []
+        self._max_trades: int = 500
+        self._current_model: Optional[str] = None
+        self._previous_model: Optional[str] = None
+        self._last_rollback: Optional[datetime] = None
+        self._rollback_history: list[dict] = []
+        self._lock = threading.Lock()
+
+    def set_models(self, current: str, previous: str) -> None:
+        """Set current and previous model versions for rollback target."""
+        with self._lock:
+            self._current_model = current
+            self._previous_model = previous
+
+    def record_trade(self, trade_result: dict) -> None:
+        """Record a live trade result. Check if rollback needed."""
+        with self._lock:
+            self._trades.append(trade_result)
+            if len(self._trades) > self._max_trades:
+                self._trades = self._trades[-self._max_trades:]
+
+    def check_rollback(self) -> Optional[dict]:
+        """
+        Evaluate if rollback is needed.
+        Returns None if OK, or dict with rollback details.
+        """
+        with self._lock:
+            if self._in_cooldown():
+                return None
+
+            if not self._trades:
+                return None
+
+            # Consecutive losses checked regardless of evaluation window
+            consecutive_losses = self._compute_consecutive_losses()
+            if consecutive_losses > self._max_consecutive_losses:
+                reason = (
+                    f"Consecutive losses {consecutive_losses} exceed limit "
+                    f"{self._max_consecutive_losses}"
+                )
+                result = {
+                    "should_rollback": True,
+                    "reason": reason,
+                    "current_model": self._current_model,
+                    "rollback_to": self._previous_model,
+                    "metrics": {
+                        "rolling_sharpe": self._compute_rolling_sharpe(),
+                        "current_drawdown": self._compute_current_drawdown(),
+                        "recent_win_rate": 0.0,
+                        "consecutive_losses": consecutive_losses,
+                    },
+                }
+                logger.warning(
+                    "rollback_triggered",
+                    reason=reason,
+                    current_model=self._current_model,
+                    rollback_to=self._previous_model,
+                )
+                return result
+
+            if len(self._trades) < self._evaluation_window:
+                return None
+
+            recent_trades = self._trades[-self._evaluation_window:]
+            rolling_sharpe = self._compute_rolling_sharpe()
+            current_drawdown = self._compute_current_drawdown()
+
+            # Compute recent win rate
+            wins = sum(
+                1 for t in recent_trades
+                if t.get("pnl_pct", t.get("pnl", 0.0)) > 0
+            )
+            recent_win_rate = wins / len(recent_trades) if recent_trades else 0.0
+
+            # Check triggers
+            reason = None
+            if rolling_sharpe < self._min_sharpe:
+                reason = f"Rolling Sharpe {rolling_sharpe:.3f} below threshold {self._min_sharpe}"
+            elif current_drawdown > self._max_drawdown_pct:
+                reason = f"Drawdown {current_drawdown:.2f}% exceeds max {self._max_drawdown_pct}%"
+            elif recent_win_rate < self._min_win_rate:
+                reason = f"Win rate {recent_win_rate:.3f} below minimum {self._min_win_rate}"
+
+            if reason is None:
+                return None
+
+            result = {
+                "should_rollback": True,
+                "reason": reason,
+                "current_model": self._current_model,
+                "rollback_to": self._previous_model,
+                "metrics": {
+                    "rolling_sharpe": rolling_sharpe,
+                    "current_drawdown": current_drawdown,
+                    "recent_win_rate": recent_win_rate,
+                    "consecutive_losses": consecutive_losses,
+                },
+            }
+
+            logger.warning(
+                "rollback_triggered",
+                reason=reason,
+                current_model=self._current_model,
+                rollback_to=self._previous_model,
+            )
+
+            return result
+
+    def _compute_rolling_sharpe(self) -> float:
+        """Compute Sharpe ratio over evaluation window."""
+        recent = self._trades[-self._evaluation_window:]
+        returns = [t.get("pnl_pct", t.get("pnl", 0.0)) for t in recent]
+        if len(returns) < 2:
+            return 0.0
+        mean_ret = np.mean(returns)
+        std_ret = np.std(returns, ddof=1)
+        if std_ret == 0:
+            return 0.0
+        return float(mean_ret / std_ret)
+
+    def _compute_current_drawdown(self) -> float:
+        """Current drawdown from peak equity (in %)."""
+        returns = [t.get("pnl_pct", t.get("pnl", 0.0)) for t in self._trades]
+        if not returns:
+            return 0.0
+        cumulative = np.cumsum(returns)
+        peak = np.maximum.accumulate(cumulative)
+        drawdowns = peak - cumulative
+        return float(drawdowns[-1]) if len(drawdowns) > 0 else 0.0
+
+    def _compute_consecutive_losses(self) -> int:
+        """Count of most recent consecutive losing trades."""
+        count = 0
+        for trade in reversed(self._trades):
+            pnl = trade.get("pnl_pct", trade.get("pnl", 0.0))
+            if pnl < 0:
+                count += 1
+            else:
+                break
+        return count
+
+    def _in_cooldown(self) -> bool:
+        """True if a rollback happened recently (prevent rapid oscillation)."""
+        if self._last_rollback is None:
+            return False
+        elapsed = datetime.now(timezone.utc) - self._last_rollback
+        return elapsed < timedelta(hours=self._cooldown_hours)
+
+    def acknowledge_rollback(self) -> None:
+        """Record that rollback was executed. Start cooldown."""
+        with self._lock:
+            self._last_rollback = datetime.now(timezone.utc)
+            self._rollback_history.append({
+                "timestamp": self._last_rollback.isoformat(),
+                "from_model": self._current_model,
+                "to_model": self._previous_model,
+            })
+            logger.info(
+                "rollback_acknowledged",
+                from_model=self._current_model,
+                to_model=self._previous_model,
+            )
+
+    @property
+    def rollback_count(self) -> int:
+        """Total rollbacks performed."""
+        return len(self._rollback_history)
+
+    def get_status(self) -> dict:
+        """Current monitoring status."""
+        with self._lock:
+            return {
+                "current_model": self._current_model,
+                "previous_model": self._previous_model,
+                "total_trades": len(self._trades),
+                "rollback_count": self.rollback_count,
+                "in_cooldown": self._in_cooldown(),
+                "last_rollback": (
+                    self._last_rollback.isoformat() if self._last_rollback else None
+                ),
+            }
+
+
+class ShadowTrader:
+    """
+    Runs challenger model predictions on live market data without execution.
+    Records virtual trades for fair performance comparison.
+    """
+
+    def __init__(self, challenger_version: str, max_shadow_trades: int = 200):
+        self._challenger = challenger_version
+        self._max_shadow_trades = max_shadow_trades
+        self._shadow_trades: list[dict] = []
+        self._pending_signals: dict[str, dict] = {}
+        self._lock = threading.Lock()
+
+    def record_shadow_signal(
+        self,
+        symbol: str,
+        direction: str,
+        confidence: float,
+        entry_price: float,
+        stop_loss: float,
+        take_profit: float,
+    ) -> str:
+        """Record a shadow prediction. Returns shadow_trade_id."""
+        trade_id = f"shadow_{uuid.uuid4().hex[:12]}"
+        signal = {
+            "trade_id": trade_id,
+            "symbol": symbol,
+            "direction": direction,
+            "confidence": confidence,
+            "entry_price": entry_price,
+            "stop_loss": stop_loss,
+            "take_profit": take_profit,
+            "entry_time": datetime.now(timezone.utc).isoformat(),
+        }
+        with self._lock:
+            self._pending_signals[symbol] = signal
+
+        logger.debug(
+            "shadow_signal_recorded",
+            trade_id=trade_id,
+            symbol=symbol,
+            direction=direction,
+        )
+        return trade_id
+
+    def update_prices(self, symbol: str, current_price: float) -> list[dict]:
+        """
+        Update pending shadow trades with current prices.
+        Close trades that hit SL/TP or expire.
+        Returns list of completed shadow trades.
+        """
+        completed: list[dict] = []
+
+        with self._lock:
+            if symbol not in self._pending_signals:
+                return completed
+
+            signal = self._pending_signals[symbol]
+            direction = signal["direction"]
+            entry_price = signal["entry_price"]
+            stop_loss = signal["stop_loss"]
+            take_profit = signal["take_profit"]
+
+            hit_tp = False
+            hit_sl = False
+
+            if direction == "long":
+                hit_tp = current_price >= take_profit
+                hit_sl = current_price <= stop_loss
+            elif direction == "short":
+                hit_tp = current_price <= take_profit
+                hit_sl = current_price >= stop_loss
+
+            if hit_tp or hit_sl:
+                # Calculate PnL
+                if direction == "long":
+                    pnl_pct = ((current_price - entry_price) / entry_price) * 100
+                else:
+                    pnl_pct = ((entry_price - current_price) / entry_price) * 100
+
+                trade_result = {
+                    **signal,
+                    "exit_price": current_price,
+                    "exit_time": datetime.now(timezone.utc).isoformat(),
+                    "pnl_pct": pnl_pct,
+                    "exit_reason": "take_profit" if hit_tp else "stop_loss",
+                    "won": hit_tp,
+                }
+
+                self._shadow_trades.append(trade_result)
+                del self._pending_signals[symbol]
+                completed.append(trade_result)
+
+                # Cap total stored trades
+                if len(self._shadow_trades) > self._max_shadow_trades:
+                    self._shadow_trades = self._shadow_trades[-self._max_shadow_trades:]
+
+                logger.debug(
+                    "shadow_trade_closed",
+                    trade_id=signal["trade_id"],
+                    pnl_pct=pnl_pct,
+                    reason=trade_result["exit_reason"],
+                )
+
+        return completed
+
+    def get_shadow_performance(self) -> dict:
+        """Return shadow performance metrics."""
+        with self._lock:
+            trades = self._shadow_trades
+
+        if not trades:
+            return {
+                "total_trades": 0,
+                "win_rate": 0.0,
+                "avg_return": 0.0,
+                "sharpe": 0.0,
+                "max_drawdown": 0.0,
+                "vs_champion": 0.0,
+            }
+
+        returns = [t["pnl_pct"] for t in trades]
+        wins = sum(1 for t in trades if t.get("won", False))
+        win_rate = wins / len(trades)
+        avg_return = float(np.mean(returns))
+
+        # Sharpe
+        std_ret = float(np.std(returns, ddof=1)) if len(returns) > 1 else 0.0
+        sharpe = avg_return / std_ret if std_ret > 0 else 0.0
+
+        # Max drawdown
+        cumulative = np.cumsum(returns)
+        peak = np.maximum.accumulate(cumulative)
+        drawdowns = peak - cumulative
+        max_drawdown = float(np.max(drawdowns)) if len(drawdowns) > 0 else 0.0
+
+        return {
+            "total_trades": len(trades),
+            "win_rate": win_rate,
+            "avg_return": avg_return,
+            "sharpe": sharpe,
+            "max_drawdown": max_drawdown,
+            "vs_champion": 0.0,  # Set externally when comparing
+        }
+
+    def get_comparison_trades(self) -> list[dict]:
+        """Return completed shadow trades for promotion evaluation."""
+        with self._lock:
+            return list(self._shadow_trades)
+
+    @property
+    def is_active(self) -> bool:
+        """True if shadow trader is active (has pending signals or trades)."""
+        with self._lock:
+            return len(self._pending_signals) > 0 or len(self._shadow_trades) > 0
+
+    @property
+    def trade_count(self) -> int:
+        """Total completed shadow trades."""
+        with self._lock:
+            return len(self._shadow_trades)

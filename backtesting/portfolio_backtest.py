@@ -5,7 +5,7 @@ Tests strategy performance across correlated assets with realistic constraints.
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -162,13 +162,30 @@ class PortfolioBacktester:
         fees: float = 0.001,
         max_exposure: float = 0.8,
         max_single_pct: float = 0.15,
+        per_symbol_fees: Optional[dict[str, float]] = None,
+        use_asset_class_params: bool = True,
     ):
         self.initial_cash = initial_cash
         self.max_positions = max_positions
         self.risk_per_trade = risk_per_trade
-        self.fees = fees
+        self.fees = fees  # fallback when per-symbol fee unavailable
         self.max_exposure = max_exposure
         self.max_single_pct = max_single_pct
+        self.per_symbol_fees = per_symbol_fees or {}
+        self.use_asset_class_params = use_asset_class_params
+
+    def _get_fee_for_symbol(self, symbol: str) -> float:
+        """Resolve fee for a specific symbol using per-symbol lookup or asset-class config."""
+        if symbol in self.per_symbol_fees:
+            return self.per_symbol_fees[symbol]
+        if self.use_asset_class_params:
+            try:
+                from src.config.backtest_params import get_backtest_config
+                config = get_backtest_config(symbol)
+                return config.get("commission_pct", self.fees)
+            except Exception:
+                pass
+        return self.fees
 
     def run(self, data: dict[str, pd.DataFrame], fast_ema: int = 12, slow_ema: int = 26) -> dict:
         """
@@ -280,7 +297,8 @@ class PortfolioBacktester:
             for symbol in exit_symbols:
                 pos = positions[symbol]
                 exit_price = close_prices[symbol][bar_idx]
-                exit_fee = exit_price * pos.qty * self.fees
+                sym_fee = self._get_fee_for_symbol(symbol)
+                exit_fee = exit_price * pos.qty * sym_fee
                 proceeds = exit_price * pos.qty - exit_fee
 
                 trade = PortfolioTrade(
@@ -292,7 +310,7 @@ class PortfolioBacktester:
                     entry_time=common_index[pos.entry_bar],
                     exit_time=common_index[bar_idx],
                     hold_bars=bar_idx - pos.entry_bar,
-                    fees_paid=(pos.entry_price * pos.qty * self.fees) + exit_fee,
+                    fees_paid=(pos.entry_price * pos.qty * sym_fee) + exit_fee,
                 )
                 all_trades.append(trade)
                 cash += proceeds
@@ -333,8 +351,9 @@ class PortfolioBacktester:
                 if alloc <= 0 or price <= 0:
                     continue
 
-                # Calculate quantity and apply entry fee
-                entry_fee = alloc * self.fees
+                # Calculate quantity and apply per-symbol entry fee
+                sym_fee = self._get_fee_for_symbol(symbol)
+                entry_fee = alloc * sym_fee
                 invest_amount = alloc - entry_fee
                 qty = invest_amount / price
 
@@ -389,7 +408,7 @@ class PortfolioBacktester:
                 else:
                     exit_price = pos.entry_price
 
-            exit_fee = exit_price * pos.qty * self.fees
+            exit_fee = exit_price * pos.qty * self._get_fee_for_symbol(symbol)
             trade = PortfolioTrade(
                 symbol=symbol,
                 side=pos.side,
@@ -399,7 +418,7 @@ class PortfolioBacktester:
                 entry_time=common_index[pos.entry_bar],
                 exit_time=common_index[final_bar],
                 hold_bars=final_bar - pos.entry_bar,
-                fees_paid=(pos.entry_price * pos.qty * self.fees) + exit_fee,
+                fees_paid=(pos.entry_price * pos.qty * self._get_fee_for_symbol(symbol)) + exit_fee,
             )
             all_trades.append(trade)
 
@@ -407,12 +426,21 @@ class PortfolioBacktester:
         final_value = equity_curve[final_bar] if equity_curve[final_bar] > 0 else equity_curve[equity_curve > 0][-1]
         total_return = (final_value / self.initial_cash) - 1
 
-        # Sharpe ratio (annualized)
+        # Sharpe ratio (annualized, using appropriate factor for asset mix)
         valid_equity = equity_curve[slow_ema:]
         daily_returns = np.diff(valid_equity) / np.where(valid_equity[:-1] == 0, 1, valid_equity[:-1])
         sharpe_ratio = 0.0
         if len(daily_returns) > 1 and np.std(daily_returns) > 0:
-            sharpe_ratio = (np.mean(daily_returns) / np.std(daily_returns)) * np.sqrt(252)
+            # Determine annualization: if any symbol is crypto (365d), use 365; else 252
+            ann_periods = 252
+            if self.use_asset_class_params:
+                try:
+                    from src.config.backtest_params import get_backtest_config
+                    ann_values = [get_backtest_config(s).get("annualization_periods", 252) for s in symbols]
+                    ann_periods = max(ann_values)  # conservative: use highest for mixed
+                except Exception:
+                    pass
+            sharpe_ratio = (np.mean(daily_returns) / np.std(daily_returns)) * np.sqrt(ann_periods)
 
         # Max drawdown
         running_max = np.maximum.accumulate(valid_equity)
@@ -499,6 +527,8 @@ def portfolio_backtest(
     initial_cash: float = 10000.0,
     max_positions: int = 10,
     fees: float = 0.001,
+    per_symbol_fees: Optional[dict[str, float]] = None,
+    use_asset_class_params: bool = True,
 ) -> dict:
     """
     Convenience function to run a portfolio-level backtest with default risk parameters.
@@ -509,7 +539,9 @@ def portfolio_backtest(
         slow_ema: Slow EMA period.
         initial_cash: Starting capital.
         max_positions: Max concurrent positions.
-        fees: Trading fee fraction.
+        fees: Fallback trading fee fraction when per-symbol fee unavailable.
+        per_symbol_fees: Optional dict mapping symbol -> fee fraction for per-instrument costs.
+        use_asset_class_params: If True, auto-resolve fees from asset-class config.
 
     Returns:
         Backtest results dict (see PortfolioBacktester.run for full schema).
@@ -518,6 +550,8 @@ def portfolio_backtest(
         initial_cash=initial_cash,
         max_positions=max_positions,
         fees=fees,
+        per_symbol_fees=per_symbol_fees,
+        use_asset_class_params=use_asset_class_params,
     )
     return bt.run(data, fast_ema=fast_ema, slow_ema=slow_ema)
 
