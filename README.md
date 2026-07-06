@@ -76,6 +76,11 @@ Deployed on **Azure Container Instances** via GitHub Actions CI/CD pipeline.
 - ✅ **Prediction calibration** — ECE/MCE/Brier score computation for confidence reliability analysis
 - ✅ **Model hot-swap** — zero-downtime double-buffered model loading with automatic fallback
 - ✅ **Online learning loop** — reward attribution, hard example mining, curated training sample selection between retrains
+- ✅ **Auto-rollback** — automatic model rollback on performance degradation with governance logging
+- ✅ **Dataset registry** — versioned CSV dataset snapshots with integrity hashing for reproducibility
+- ✅ **Centralized label encoding** — single source of truth for direction encoding (trading ↔ model classes)
+- ✅ **Multi-target prediction** — simultaneous price, volatility, and regime predictions
+- ✅ **Model explainability** — SHAP-style feature importance for prediction transparency
 
 ### Decision Governance Engine
 - ✅ **Multi-dimensional confidence** — confidence as a first-class object (not a scalar), with comparison operators and full provenance
@@ -114,7 +119,8 @@ Deployed on **Azure Container Instances** via GitHub Actions CI/CD pipeline.
 
 ### Operations & Observability
 - ✅ **Full Telegram bot interface** — 50+ commands, inline buttons, real-time control
-- ✅ **Telegram audit forwarder** — ALL events + WARNING+ logs forwarded as rich HTML notifications
+- ✅ **Telegram audit forwarder** — ALL events + WARNING+ logs forwarded as rich HTML notifications with dedup suppression
+- ✅ **Signal deduplication** — suppresses repeated identical notifications; only alerts on new signals or significant strength changes
 - ✅ **Event-driven architecture** — 35+ domain event types, persistent event store, replay, crash recovery
 - ✅ **CQRS read models** — incremental projections for fast dashboard queries
 - ✅ **State snapshotting** — periodic persistence for sub-second recovery
@@ -832,6 +838,7 @@ The system is built on a lightweight, thread-safe, in-process event bus with 35+
 - **Trade Lifecycle**: `TradeOpened`, `TradeClosed`
 - **Risk Events**: `RiskHalt`, `CircuitBreakerTripped`, `CircuitBreakerReset`
 - **ML Events**: `ModelSwapped`, `ModelTrainingStarted`, `ModelTrainingCompleted`, `ModelAutoRollback`, `ModelRejected`, `ABTestStarted`, `ABTestCompleted`, `DriftDetected`
+- **Governance Events**: `DecisionContractCreated`, `OperationalModeChanged`
 - **Backtest Events**: `BacktestStarted`, `BacktestCompleted`, `BacktestTriggered`
 - **Infrastructure Events**: `EnvironmentSwitched`, `BrokerSwitched`, `DataIngested`, `SchedulerEvent`
 - **Event Store**: Persistent SQLite-backed event log with session tracking
@@ -846,9 +853,11 @@ The system is built on a lightweight, thread-safe, in-process event bus with 35+
 Every trade signal passes through the full decision governance pipeline before execution:
 
 ```
-Strategy Signal
+Strategy Signal (TradeSignal — frozen, minimal proposal)
     ↓
-Signal Package (completeness, provenance)
+Signal Adapter (legacy → frozen format conversion if needed)
+    ↓
+Signal Deduplication (suppress repeated identical signals)
     ↓
 Decision Orchestrator
     │
@@ -873,7 +882,8 @@ Execution Engine (broker orders + simulator)
 Contract Store (DuckDB persistence, outcome linkage, replay)
 ```
 
-- **Signal Package**: Comprehensive execution package with entry zone, stop loss, take profit levels, holding period, confidence decay schedule, and model provenance
+- **TradeSignal**: Frozen, minimal proposal — contains only what the strategy knows (symbol, side, strength, evidence)
+- **Signal Adapter**: Bridges legacy mutable signals to the new frozen `TradeSignal` format transparently
 - **Decision Orchestrator**: Produces an immutable DecisionContract for every signal — no signal bypasses the governance pipeline
 - **DecisionContract**: Frozen dataclass with integrity hash, veto authority per stage, full provenance, and expiration (5-min TTL)
 - **Intelligence Layer**: Scores trade quality, checks regime compatibility, allocates capital
@@ -1244,7 +1254,7 @@ algo-trader/
 │   │   ├── paper.py                   # Paper trading broker implementation
 │   │   └── replay_broker.py          # Replay broker for backtesting
 │   ├── strategy/
-│   │   ├── base.py                    # Abstract strategy interface + TradeSignal
+│   │   ├── base.py                    # Abstract strategy interface + TradeSignal (frozen) + LegacyTradeSignal
 │   │   ├── momentum.py                # Momentum (EMA/RSI/MACD/ATR)
 │   │   ├── mean_reversion.py          # Mean reversion (BB/Z-score/RSI)
 │   │   ├── ml_strategy.py             # ML/XGBoost strategy wrapper
@@ -1252,6 +1262,7 @@ algo-trader/
 │   │   ├── orchestrator.py            # Multi-strategy concurrent orchestrator
 │   │   ├── signal_package.py          # Trade signal package with validation gate
 │   │   ├── signal_bridge.py           # Bridge raw signals → full signal packages
+│   │   ├── signal_adapter.py          # Legacy → frozen TradeSignal adapter
 │   │   └── strategy_store.py          # User-defined strategy persistence
 │   ├── intelligence/
 │   │   ├── orchestrator.py            # Top-level adaptive intelligence coordinator
@@ -1306,11 +1317,18 @@ algo-trader/
 │   │   ├── predictor.py               # Model inference with double-buffered hot-swap
 │   │   ├── training_pipeline.py       # Full training pipeline with CV
 │   │   ├── dataset_builder.py         # Training dataset construction
+│   │   ├── dataset_registry.py        # Dataset version registry (CSV snapshots, hashing)
+│   │   ├── label_encoder.py           # Centralized direction encoding (trading ↔ model classes)
+│   │   ├── multi_target.py            # Multi-target prediction (price, volatility, regime)
 │   │   ├── model_registry.py          # Model version management
+│   │   ├── model_health.py            # Model health monitoring (accuracy, drift, age)
 │   │   ├── governance.py              # Model governance, lineage, promotion gates
+│   │   ├── explainability.py          # Model explainability (SHAP-style feature importance)
 │   │   ├── ab_testing.py              # A/B testing framework (shadow, split, interleaved modes)
 │   │   ├── feedback_loop.py           # Closed-loop learning (scorecards, experience DB, calibration)
 │   │   ├── online_learning.py         # Online learning loop (reward attribution, sample curation)
+│   │   ├── auto_rollback.py           # Automatic model rollback on performance degradation
+│   │   ├── closed_loop.py             # Closed-loop integration (prediction → outcome → learning)
 │   │   ├── promotion_engine.py        # Champion-challenger auto-promotion with governance gates
 │   │   └── retraining_trigger.py      # Drift-triggered + scheduled retraining
 │   ├── risk/
@@ -1322,8 +1340,9 @@ algo-trader/
 │   │   ├── exposure_risk.py           # Exposure risk layer (concentration, overnight)
 │   │   └── execution_risk.py          # Execution risk layer (spread, volume, rate)
 │   ├── execution/
-│   │   ├── engine.py                  # Trade execution orchestrator
+│   │   ├── engine.py                  # Trade execution orchestrator + DecisionOrchestrator integration
 │   │   ├── simulator.py               # Execution realism simulator (volume-impact square-root model)
+│   │   ├── signal_dedup.py            # Signal deduplication (suppress repeated notifications)
 │   │   └── sector_lookup.py           # Dynamic sector classification with DB cache
 │   ├── data/
 │   │   ├── store.py                   # SQLAlchemy models + DB manager
@@ -1450,6 +1469,22 @@ Settings are loaded by Pydantic with validation, type coercion, and range checki
 | `LOOKBACK_BARS` | `200` | Historical bars to analyze |
 | `TRADING_INTERVAL` | `60` | Seconds between trading cycles |
 | `MULTI_STRATEGY_CONFIG` | — | Multi-strategy format: `name:symbols:tf:interval:weight;...` |
+| `SIGNAL_DEDUP_ENABLED` | `true` | Suppress repeated identical signal notifications |
+| `SIGNAL_DEDUP_STRENGTH_THRESHOLD` | `0.10` | Notify only if signal strength changes by this amount |
+
+### Crypto Strategy Parameters
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CRYPTO_MOMENTUM_FAST_EMA` | `21` | Fast EMA for crypto (wider than equities due to 24/7 noise) |
+| `CRYPTO_MOMENTUM_SLOW_EMA` | `55` | Slow EMA for crypto |
+| `CRYPTO_MOMENTUM_RSI_OVERSOLD` | `25` | RSI oversold threshold for crypto |
+| `CRYPTO_MOMENTUM_RSI_OVERBOUGHT` | `75` | RSI overbought threshold for crypto |
+| `CRYPTO_MOMENTUM_ATR_SL_MULT` | `2.5` | ATR stop-loss multiplier (wider for crypto volatility) |
+| `CRYPTO_MOMENTUM_ATR_TP_MULT` | `4.0` | ATR take-profit multiplier |
+| `CRYPTO_TIMEFRAME` | `15Min` | Default timeframe for crypto strategies |
+| `CRYPTO_LOOKBACK_BARS` | `500` | Historical bars for crypto analysis |
+| `CRYPTO_MIN_CONFIRMING_INDICATORS` | `1` | Minimum confirming indicators for crypto signals |
 
 ### Intelligence Layer
 
@@ -1582,6 +1617,7 @@ The Docker image uses:
 - Python 3.12-slim base
 - Non-root `trader` user (UID 1001)
 - Health check (30s interval)
+- Git commit hash embedded at build time (for model governance provenance)
 - Numba JIT cache redirected to writable directory
 - Persistent volumes recommended for `data_cache/`, `models/`, and `logs/`
 
@@ -1642,12 +1678,12 @@ Key test areas:
 - Intelligence layer (drift, scoring, routing)
 - **Decision governance** (7 confidence gates, threshold profiles, decay, calibration, regime adjustment)
 - **Decision contracts** (immutable contracts, contract store, pipeline integration)
-- ML lifecycle and governance
+- **Signal pipeline** (adapter, deduplication, full end-to-end flow)
+- ML lifecycle and governance (label encoding, dataset registry, auto-rollback)
 - Configuration service and persistence
 - Telegram command handling
 - Portfolio reconciliation
 - Monte Carlo simulation determinism
-- Signal pipeline integration
 
 ---
 
