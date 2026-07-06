@@ -88,11 +88,12 @@ class MLStrategy(BaseStrategy):
                 'trained_at': datetime.now(),
             }, self.model_path)
 
-        # Version the model
+        # Version the model (reuse class-level registry to avoid repeated init/recovery)
         try:
             from src.ml.model_registry import ModelRegistry
-            registry = ModelRegistry()
-            registry.save_version(
+            if not hasattr(MLStrategy, '_shared_registry'):
+                MLStrategy._shared_registry = ModelRegistry()
+            MLStrategy._shared_registry.save_version(
                 model=self.model,
                 features=self._feature_columns,
                 metrics=getattr(self, '_last_train_metrics', {}),

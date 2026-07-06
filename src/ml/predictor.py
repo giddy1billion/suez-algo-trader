@@ -444,40 +444,67 @@ class ModelPredictor:
     # ──────────────────────────────────────────────────────────────────────
 
     def _load_active_model(self):
-        """Load the currently active model from registry."""
+        """
+        Load the currently active model from registry.
+
+        Handles gracefully:
+        - No registry entries (recovery attempt)
+        - Registry references missing files (stale entries from deploy)
+        - No model files at all (waits for bootstrap training)
+        """
         active_version = self._registry.get_active_version()
         if active_version is None:
             # Attempt self-healing: trigger registry recovery if model files exist
             self._registry._recover_orphaned_models()
             active_version = self._registry.get_active_version()
 
-            if active_version is None:
-                # Last resort: load latest_model.joblib directly
-                latest_path = self._registry.latest_path
-                if os.path.exists(latest_path):
-                    try:
-                        import joblib
-                        artifact = joblib.load(latest_path)
-                        self._model = artifact["model"]
-                        self._features = artifact.get("features", [])
-                        self._version = "v000_fallback"
-                        self._loaded_at = datetime.now(timezone.utc)
-                        logger.warning(
-                            "predictor.loaded_from_fallback",
-                            path=latest_path,
-                            n_features=len(self._features),
-                        )
-                        return
-                    except Exception as e:
-                        logger.error("predictor.fallback_load_failed", error=str(e))
-
-                logger.warning("predictor.no_active_version")
+        if active_version is not None and active_version != self._version:
+            try:
+                self._load_version(active_version)
                 return
-
-        if active_version == self._version:
+            except (FileNotFoundError, KeyError) as e:
+                # Registry references a model file that doesn't exist on disk.
+                # Common in containerized deployments where .joblib is gitignored.
+                # Prune the stale entry and fall through to fallback.
+                logger.warning(
+                    "predictor.registry_stale_entry",
+                    version=active_version,
+                    error=str(e),
+                    msg="Registry references missing model file; pruning entry",
+                )
+                self._registry._prune_missing_entries()
+                active_version = None
+            except Exception as e:
+                logger.error("predictor.load_failed_unexpected", version=active_version, error=str(e))
+                active_version = None
+        elif active_version == self._version:
             return  # Already loaded
 
-        self._load_version(active_version)
+        # Fallback: load latest_model.joblib directly
+        if active_version is None and self._model is None:
+            latest_path = self._registry.latest_path
+            if os.path.exists(latest_path):
+                try:
+                    import joblib
+                    artifact = joblib.load(latest_path)
+                    self._model = artifact["model"]
+                    self._features = artifact.get("features", [])
+                    self._version = "v000_fallback"
+                    self._loaded_at = datetime.now(timezone.utc)
+                    logger.info(
+                        "predictor.loaded_from_fallback",
+                        path=latest_path,
+                        n_features=len(self._features),
+                    )
+                    return
+                except Exception as e:
+                    logger.error("predictor.fallback_load_failed", error=str(e))
+
+            # No model available at all — not an error, just awaiting training
+            logger.info(
+                "predictor.awaiting_model",
+                msg="No trained model available. System will use fallback strategy until auto-train completes.",
+            )
 
     def _load_version(self, version: str):
         """Load a specific version into the predictor."""

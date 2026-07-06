@@ -19,7 +19,7 @@ from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-_registry_lock = threading.Lock()
+_registry_lock = threading.RLock()
 
 
 class ModelRegistry:
@@ -474,6 +474,43 @@ class ModelRegistry:
                     os.remove(os.path.join(self.models_dir, f))
         except OSError:
             pass
+
+    def _prune_missing_entries(self) -> None:
+        """
+        Remove registry entries whose model files don't exist on disk.
+
+        Common after container deployments where .joblib files are gitignored
+        but registry.json is committed. Promotes the newest existing file to active.
+        """
+        with _registry_lock:
+            registry = self._load_registry()
+            if not registry:
+                return
+
+            pruned = []
+            kept = []
+            for entry in registry:
+                filepath = os.path.join(self.models_dir, entry["filename"])
+                if os.path.exists(filepath):
+                    kept.append(entry)
+                else:
+                    pruned.append(entry["version"])
+
+            if not pruned:
+                return
+
+            # Mark newest surviving entry as active
+            for entry in kept:
+                entry["is_active"] = False
+            if kept:
+                kept[-1]["is_active"] = True
+
+            self._save_registry(kept)
+            logger.info(
+                "ml.registry.pruned_missing",
+                removed=pruned,
+                remaining=len(kept),
+            )
 
     def _get_features_for_entry(self, entry: dict) -> list[str]:
         """Load features list for a registry entry from the model file."""

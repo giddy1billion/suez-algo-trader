@@ -18,6 +18,7 @@ data_cache/**/*.parquet
 data_cache/**/*.jsonl
 models/*.joblib
 models/*.pkl
+models/registry.json
 logs/*.log
 
 # IDE

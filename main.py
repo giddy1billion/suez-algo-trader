@@ -1229,13 +1229,14 @@ def cmd_run(
             id="daily_summary",
         )
 
-        # Automated backtest
+        # Automated backtest — delay start to avoid contending with bootstrap training
         if settings.auto_backtest_interval_hours > 0:
+            _backtest_delay = timedelta(minutes=2)  # Give bootstrap training priority
             _scheduler.add_job(
                 _auto_backtest,
                 IntervalTrigger(hours=settings.auto_backtest_interval_hours),
                 id="auto_backtest",
-                next_run_time=datetime.now(),  # Run immediately on start
+                next_run_time=datetime.now() + _backtest_delay,
             )
 
         # Automated ML training — runs immediately if model missing, else on schedule
@@ -1525,16 +1526,30 @@ def cmd_run(
                         orchestrator.disable_strategy(slot_name)
                         _disabled_slots.append(slot_name)
 
-                with _broker_lock:
-                    results = orchestrator.run_due_strategies(engine)
+                acquired = _broker_lock.acquire(timeout=30)
+                if acquired:
+                    try:
+                        results = orchestrator.run_due_strategies(engine)
+                    finally:
+                        _broker_lock.release()
+                else:
+                    logger.warning("cycle.broker_lock_timeout", msg="Background job holding broker lock > 30s")
+                    results = []
 
                 # Re-enable stock slots for next market-open cycle
                 for slot_name in _disabled_slots:
                     orchestrator.enable_strategy(slot_name)
             else:
                 # Full execution — use orchestrator for all strategies
-                with _broker_lock:
-                    results = orchestrator.run_due_strategies(engine)
+                acquired = _broker_lock.acquire(timeout=30)
+                if acquired:
+                    try:
+                        results = orchestrator.run_due_strategies(engine)
+                    finally:
+                        _broker_lock.release()
+                else:
+                    logger.warning("cycle.broker_lock_timeout", msg="Background job holding broker lock > 30s")
+                    results = []
 
             consecutive_errors = 0
 
