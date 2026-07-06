@@ -406,65 +406,65 @@ class ModelRegistry:
         Also includes latest_model.joblib if no versioned files found.
         This prevents the predictor.no_active_version warning after data loss.
         """
-        # Already recovered (race condition guard)
-        if os.path.exists(self.registry_path):
-            return
+        with _registry_lock:
+            # Double-check under lock (another thread may have recovered already)
+            if os.path.exists(self.registry_path):
+                return
 
-        model_files = sorted([
-            f for f in os.listdir(self.models_dir)
-            if f.startswith("v") and f.endswith(".joblib")
-        ])
+            model_files = sorted([
+                f for f in os.listdir(self.models_dir)
+                if f.startswith("v") and f.endswith(".joblib")
+            ])
 
-        # If no versioned files but latest_model.joblib exists, include it
-        if not model_files and os.path.exists(self.latest_path):
-            model_files = ["latest_model.joblib"]
+            # If no versioned files but latest_model.joblib exists, include it
+            if not model_files and os.path.exists(self.latest_path):
+                model_files = ["latest_model.joblib"]
 
-        if not model_files:
-            # Clean up any orphaned temp files from failed writes
+            if not model_files:
+                self._cleanup_temp_files()
+                return
+
+            logger.warning(
+                "ml.registry.recovering_orphaned_models",
+                count=len(model_files),
+            )
+
+            registry = []
+            for i, filename in enumerate(model_files, 1):
+                # Parse trained_at from filename pattern: v001_20260703_110304.joblib
+                parts = filename.replace(".joblib", "").split("_")
+                trained_at = datetime.now().isoformat()
+                if len(parts) >= 3 and parts[0].startswith("v"):
+                    try:
+                        date_str = parts[1]
+                        time_str = parts[2]
+                        trained_at = (
+                            f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]}"
+                            f"T{time_str[:2]}:{time_str[2:4]}:{time_str[4:]}"
+                        )
+                    except (IndexError, ValueError):
+                        pass
+
+                entry = {
+                    "version": f"v{i:03d}",
+                    "filename": filename,
+                    "trained_at": trained_at,
+                    "metrics": {"recovered": True},
+                    "symbols": [],
+                    "n_features": 0,
+                    "n_samples": 0,
+                    "note": f"Auto-recovered from orphaned file: {filename}",
+                    "is_active": (i == len(model_files)),
+                }
+                registry.append(entry)
+
+            self._save_registry(registry)
             self._cleanup_temp_files()
-            return
-
-        logger.warning(
-            "ml.registry.recovering_orphaned_models",
-            count=len(model_files),
-        )
-
-        registry = []
-        for i, filename in enumerate(model_files, 1):
-            # Parse trained_at from filename pattern: v001_20260703_110304.joblib
-            parts = filename.replace(".joblib", "").split("_")
-            trained_at = datetime.now().isoformat()
-            if len(parts) >= 3 and parts[0].startswith("v"):
-                try:
-                    date_str = parts[1]
-                    time_str = parts[2]
-                    trained_at = (
-                        f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]}"
-                        f"T{time_str[:2]}:{time_str[2:4]}:{time_str[4:]}"
-                    )
-                except (IndexError, ValueError):
-                    pass
-
-            entry = {
-                "version": f"v{i:03d}",
-                "filename": filename,
-                "trained_at": trained_at,
-                "metrics": {"recovered": True},
-                "symbols": [],
-                "n_features": 0,
-                "n_samples": 0,
-                "note": f"Auto-recovered from orphaned file: {filename}",
-                "is_active": (i == len(model_files)),
-            }
-            registry.append(entry)
-
-        self._save_registry(registry)
-        self._cleanup_temp_files()
-        logger.info(
-            "ml.registry.recovery_complete",
-            versions=len(registry),
-            active=f"v{len(registry):03d}",
-        )
+            logger.info(
+                "ml.registry.recovery_complete",
+                versions=len(registry),
+                active=f"v{len(registry):03d}",
+            )
 
     def _cleanup_temp_files(self) -> None:
         """Remove orphaned registry temp files from failed atomic writes."""

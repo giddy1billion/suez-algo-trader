@@ -28,6 +28,9 @@ class MLStrategy(BaseStrategy):
     - Auto-retraining on schedule
     """
 
+    _shared_registry = None
+    _shared_registry_lock = threading.Lock()
+
     def __init__(
         self,
         symbols: list[str],
@@ -54,8 +57,8 @@ class MLStrategy(BaseStrategy):
 
         # Warn clearly if no model available
         if self.model is None:
-            logger.warning(
-                "ml.NO_MODEL_AVAILABLE",
+            logger.info(
+                "ml.awaiting_model",
                 msg="No trained model found. System will use fallback strategy "
                     "until model is trained. Run /train or wait for auto-train.",
                 path=self.model_path,
@@ -91,8 +94,10 @@ class MLStrategy(BaseStrategy):
         # Version the model (reuse class-level registry to avoid repeated init/recovery)
         try:
             from src.ml.model_registry import ModelRegistry
-            if not hasattr(MLStrategy, '_shared_registry'):
-                MLStrategy._shared_registry = ModelRegistry()
+            if MLStrategy._shared_registry is None:
+                with MLStrategy._shared_registry_lock:
+                    if MLStrategy._shared_registry is None:
+                        MLStrategy._shared_registry = ModelRegistry()
             MLStrategy._shared_registry.save_version(
                 model=self.model,
                 features=self._feature_columns,
@@ -135,7 +140,7 @@ class MLStrategy(BaseStrategy):
 
     def _fallback_signals(self, data: dict[str, pd.DataFrame]) -> list:
         """Generate signals using fallback strategy when ML model unavailable."""
-        logger.warning("ml.using_fallback", reason="no trained model available")
+        logger.debug("ml.using_fallback", reason="no trained model available")
         fallback = self._get_fallback_strategy()
         if fallback is not None:
             try:

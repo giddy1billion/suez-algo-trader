@@ -80,8 +80,9 @@ class ModelPredictor:
         self._watcher_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
 
-        # Load initial model
-        self._load_active_model()
+        # Load initial model (under lock to avoid race with watcher thread)
+        with self._lock:
+            self._load_active_model()
 
         # Start watcher if auto-reload enabled
         if auto_reload:
