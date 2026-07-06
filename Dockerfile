@@ -5,14 +5,23 @@ WORKDIR /app
 # System deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
+    git \
     && rm -rf /var/lib/apt/lists/*
 
 # Python deps
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# App code
+# App code (including .git for governance commit hash tracking)
 COPY . .
+
+# Embed git commit hash at build time as fallback for governance
+ARG GIT_COMMIT_HASH=""
+RUN if [ -z "$GIT_COMMIT_HASH" ] && [ -d .git ]; then \
+        git rev-parse HEAD > /app/.git_commit 2>/dev/null || true; \
+    elif [ -n "$GIT_COMMIT_HASH" ]; then \
+        echo "$GIT_COMMIT_HASH" > /app/.git_commit; \
+    fi
 
 # Create directories and set ownership
 RUN mkdir -p data_cache models logs \

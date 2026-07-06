@@ -182,9 +182,20 @@ class DatasetRegistry:
                 start_date = datetime.now(timezone.utc)
                 end_date = datetime.now(timezone.utc)
 
-            # Save parquet snapshot
+            # Save parquet snapshot (with CSV fallback if pyarrow unavailable)
             parquet_path = str(self._snapshots_path / f"{dataset_id}.parquet")
-            data.to_parquet(parquet_path)
+            try:
+                data.to_parquet(parquet_path)
+            except ImportError:
+                # pyarrow/fastparquet not available — fall back to CSV
+                csv_path = str(self._snapshots_path / f"{dataset_id}.csv")
+                data.to_csv(csv_path)
+                parquet_path = csv_path
+                logger.warning(
+                    "dataset_registry.parquet_unavailable",
+                    msg="pyarrow not installed, falling back to CSV snapshot",
+                    dataset_id=dataset_id,
+                )
 
             now = datetime.now(timezone.utc)
             self._conn.execute(
@@ -221,7 +232,7 @@ class DatasetRegistry:
         return self._row_to_dataset_version(row)
 
     def load_dataset(self, dataset_id: str) -> Optional[pd.DataFrame]:
-        """Load the actual dataset Parquet file."""
+        """Load the actual dataset file (Parquet or CSV fallback)."""
         row = self._conn.execute(
             "SELECT parquet_path FROM datasets WHERE dataset_id = ?", [dataset_id]
         ).fetchone()
@@ -229,9 +240,15 @@ class DatasetRegistry:
             return None
         path = Path(row[0])
         if not path.exists():
-            logger.warning("parquet_file_missing", dataset_id=dataset_id, path=str(path))
+            logger.warning("dataset_file_missing", dataset_id=dataset_id, path=str(path))
             return None
-        return pd.read_parquet(path)
+        if path.suffix == ".csv":
+            return pd.read_csv(path, index_col=0)
+        try:
+            return pd.read_parquet(path)
+        except ImportError:
+            logger.warning("dataset_registry.read_parquet_unavailable", dataset_id=dataset_id)
+            return None
 
     def get_latest_dataset(self) -> Optional[DatasetVersion]:
         """Get the most recent dataset version."""

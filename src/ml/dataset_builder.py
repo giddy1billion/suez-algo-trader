@@ -133,9 +133,14 @@ class DatasetBuilder:
         ).hexdigest()[:12]
         version = f"ds_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{content_hash}"
 
-        # Save as Parquet
+        # Save as Parquet (with CSV fallback if pyarrow unavailable)
         file_path = self._storage_dir / f"{version}.parquet"
-        df.to_parquet(file_path, index=False)
+        try:
+            df.to_parquet(file_path, index=False)
+        except ImportError:
+            file_path = self._storage_dir / f"{version}.csv"
+            df.to_csv(file_path, index=False)
+            logger.warning("dataset_builder.parquet_unavailable", msg="Falling back to CSV")
 
         # Create version metadata
         symbols = sorted(df["asset"].unique().tolist())
@@ -179,7 +184,12 @@ class DatasetBuilder:
             if dv.version == version:
                 path = Path(dv.file_path)
                 if path.exists():
-                    return pd.read_parquet(path)
+                    if path.suffix == ".csv":
+                        return pd.read_csv(path)
+                    try:
+                        return pd.read_parquet(path)
+                    except ImportError:
+                        return None
         return None
 
     def list_versions(self, limit: int = 10) -> list[dict]:

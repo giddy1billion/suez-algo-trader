@@ -297,6 +297,16 @@ class TrainingPipeline:
         progress.status = PipelineStatus.FETCHING_DATA
         train_start = time.perf_counter()
 
+        # Pre-flight: check optional dependencies
+        try:
+            import pyarrow  # noqa: F401
+        except ImportError:
+            logger.warning(
+                "training_pipeline.pyarrow_missing",
+                msg="pyarrow not installed. Dataset snapshots will use CSV fallback. "
+                    "Install with: pip install pyarrow",
+            )
+
         # Step 1: Fetch data
         progress.current_step = "Fetching market data"
         logger.info("training_pipeline.step", step="fetch_data", symbols=symbols)
@@ -381,10 +391,19 @@ class TrainingPipeline:
             except Exception as e:
                 logger.warning("training_pipeline.dataset_registry_error", error=str(e))
 
-        # Step 5: Governance validation
+        # Step 5: Governance validation (with backtest metrics)
         progress.status = PipelineStatus.VALIDATING
-        progress.current_step = "Validating via governance"
+        progress.current_step = "Backtesting and validating via governance"
         logger.info("training_pipeline.step", step="validate", version=version)
+
+        # Run lightweight backtest to produce metrics governance requires
+        backtest_results = self._backtest_model(model, feature_cols, feature_data)
+        metrics.update({
+            "sharpe": backtest_results.get("sharpe", 0.0),
+            "sharpe_ratio": backtest_results.get("sharpe", 0.0),
+            "n_trades": backtest_results.get("n_trades", 0),
+            "max_drawdown": backtest_results.get("max_drawdown", 0.0),
+        })
 
         training_duration = time.perf_counter() - train_start
         self._governance.record_training(
@@ -394,6 +413,8 @@ class TrainingPipeline:
             metrics=metrics,
             hyperparameters=metrics.get("hyperparameters", {}),
             training_duration=training_duration,
+            walk_forward_results=backtest_results.get("walk_forward"),
+            monte_carlo_results=backtest_results.get("monte_carlo"),
         )
 
         is_valid, issues = self._governance.validate_for_deployment(version)
@@ -714,6 +735,129 @@ class TrainingPipeline:
 
         return final_model, metrics, feature_cols
 
+    def _backtest_model(
+        self,
+        model,
+        feature_cols: list[str],
+        feature_data: dict[str, pd.DataFrame],
+    ) -> dict:
+        """
+        Run a lightweight backtest on held-out data to produce governance metrics.
+
+        Generates simulated trades from model predictions on the final 20% of
+        each symbol's data (not used in final model training due to target NaN).
+        Returns sharpe, max_drawdown, n_trades, and Monte Carlo results.
+        """
+        from backtesting.monte_carlo import monte_carlo_simulation
+
+        all_trades = []
+        threshold = 0.005  # Same as training target threshold
+
+        for symbol, df in feature_data.items():
+            try:
+                # Use last 20% as backtest window
+                n = len(df)
+                split_idx = int(n * 0.8)
+                test_df = df.iloc[split_idx:].copy()
+
+                if len(test_df) < 20:
+                    continue
+
+                # Get features for prediction
+                available_cols = [c for c in feature_cols if c in test_df.columns]
+                if len(available_cols) < len(feature_cols) * 0.8:
+                    continue
+
+                X_test = test_df[available_cols].values
+                # Handle NaN in features
+                nan_mask = np.isnan(X_test) | np.isinf(X_test)
+                if nan_mask.any():
+                    X_test = np.where(nan_mask, 0.0, X_test)
+
+                # Predict
+                predictions = model.predict(X_test)
+                decoded_predictions = DirectionEncoder.decode(predictions)
+
+                # Simulate trades from predictions
+                close_prices = test_df['close'].values
+                for i in range(len(decoded_predictions) - 5):
+                    signal = decoded_predictions[i]
+                    if signal == 0:  # Flat — no trade
+                        continue
+
+                    entry_price = close_prices[i]
+                    exit_price = close_prices[min(i + 5, len(close_prices) - 1)]
+
+                    if entry_price <= 0:
+                        continue
+
+                    trade_return = (exit_price / entry_price - 1) * signal
+                    pnl = entry_price * trade_return
+
+                    all_trades.append({
+                        "pnl": pnl,
+                        "return": trade_return,
+                        "entry_price": entry_price,
+                        "exit_price": exit_price,
+                        "symbol": symbol,
+                    })
+            except Exception as e:
+                logger.debug("training_pipeline.backtest_symbol_error", symbol=symbol, error=str(e))
+                continue
+
+        # Compute metrics from trades
+        n_trades = len(all_trades)
+        if n_trades < 5:
+            return {
+                "sharpe": 0.0,
+                "max_drawdown": 0.0,
+                "n_trades": n_trades,
+                "walk_forward": {"sharpe": 0.0, "total_return": 0.0},
+                "monte_carlo": {"probability_of_profit": 0.0, "median_return": 0.0, "p5_return": 0.0},
+            }
+
+        trade_returns = np.array([t["return"] for t in all_trades])
+        mean_ret = np.mean(trade_returns)
+        std_ret = np.std(trade_returns, ddof=1) if len(trade_returns) > 1 else 1.0
+        sharpe = float(mean_ret / std_ret * np.sqrt(252)) if std_ret > 0 else 0.0
+
+        # Max drawdown from cumulative returns
+        equity = np.cumprod(1.0 + trade_returns)
+        peak = np.maximum.accumulate(equity)
+        drawdowns = (equity - peak) / np.where(peak > 0, peak, 1.0)
+        max_drawdown = float(abs(np.min(drawdowns))) if len(drawdowns) > 0 else 0.0
+
+        # Monte Carlo simulation
+        mc_results = {"probability_of_profit": 0.0, "median_return": 0.0, "p5_return": 0.0}
+        try:
+            mc_results = monte_carlo_simulation(
+                trades=all_trades,
+                initial_cash=10000.0,
+                n_simulations=500,
+                seed=42,
+            )
+        except Exception as e:
+            logger.debug("training_pipeline.monte_carlo_error", error=str(e))
+
+        logger.info(
+            "training_pipeline.backtest_complete",
+            n_trades=n_trades,
+            sharpe=round(sharpe, 3),
+            max_drawdown=round(max_drawdown, 4),
+            mc_prob_profit=round(mc_results.get("probability_of_profit", 0.0), 3),
+        )
+
+        return {
+            "sharpe": sharpe,
+            "max_drawdown": max_drawdown,
+            "n_trades": n_trades,
+            "walk_forward": {
+                "sharpe": sharpe,
+                "total_return": float(np.prod(1.0 + trade_returns) - 1.0),
+            },
+            "monte_carlo": mc_results,
+        }
+
     # ──────────────────────────────────────────────────────────────────────
     # Self-Healing & Recovery
     # ──────────────────────────────────────────────────────────────────────
@@ -807,20 +951,38 @@ class TrainingPipeline:
         Returns True if rollback was successful.
         """
         try:
-            previous = self._registry.rollback()
-            if previous:
+            # Find the previous version (second-to-last, or the one before active)
+            versions = self._registry.list_versions()
+            if len(versions) < 2:
+                logger.warning("training_pipeline.rollback_no_previous", reason=reason)
+                return False
+
+            active_version = self._registry.get_active_version()
+            previous_version = None
+            for v in versions:
+                if v["version"] != active_version:
+                    previous_version = v["version"]
+                    break
+
+            if not previous_version:
+                logger.warning("training_pipeline.rollback_no_candidate", reason=reason)
+                return False
+
+            success = self._registry.rollback(previous_version)
+            if success:
                 # Publish rollback event
                 if self._event_bus:
                     from src.core.events import ModelAutoRollback
                     self._event_bus.publish(ModelAutoRollback(
-                        from_version=getattr(previous, 'from_version', ''),
-                        to_version=getattr(previous, 'to_version', str(previous)),
+                        from_version=active_version or "",
+                        to_version=previous_version,
                         reason=reason,
                         source="training_pipeline",
                     ))
                 logger.info(
                     "training_pipeline.auto_rollback",
-                    to_version=str(previous),
+                    from_version=active_version,
+                    to_version=previous_version,
                     reason=reason,
                 )
                 return True

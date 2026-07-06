@@ -86,8 +86,11 @@ class ModelRegistry:
             }
             joblib.dump(artifact, filepath)
 
-            # Update latest_model.joblib (copy for cross-platform compatibility)
-            shutil.copy2(filepath, self.latest_path)
+            # Only update latest_model.joblib when governance approves activation.
+            # This prevents rejected models from being picked up by the predictor's
+            # fallback path (_load_active_model → latest_model.joblib).
+            if activate:
+                shutil.copy2(filepath, self.latest_path)
 
             if activate:
                 # Mark all previous versions as inactive
@@ -142,6 +145,11 @@ class ModelRegistry:
 
             if found:
                 self._save_registry(registry)
+                # Update latest_model.joblib to match the activated version
+                entry = self._find_entry(registry, version_str)
+                filepath = os.path.join(self.models_dir, entry["filename"])
+                if os.path.exists(filepath):
+                    shutil.copy2(filepath, self.latest_path)
                 logger.info("ml.registry.version_activated", version=version_str)
             else:
                 logger.warning("ml.registry.activate_not_found", version=version_str)
