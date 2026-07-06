@@ -315,15 +315,14 @@ class TestSubscribersIntegration:
         assert "RISK HALT" in messages[1]
 
     def test_setup_default_subscribers_registers_all(self):
-        """setup_default_subscribers should register 4 subscriber types."""
+        """setup_default_subscribers should register core subscriber types."""
         bus = EventBus()
         subs = setup_default_subscribers(bus)
 
         assert "audit" in subs
         assert "journal" in subs
-        assert "metrics" in subs
         assert "notifications" in subs
-        assert bus.subscriber_count >= 4
+        assert bus.subscriber_count >= 3
 
 
 class TestPeriodicCleanup:

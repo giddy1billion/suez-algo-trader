@@ -194,8 +194,8 @@ class TestMalformedEvent:
 
         # Publish a malformed event (base Event with no real data)
         malformed = Event(source="malformed-test")
-        # Manually break expected attributes
-        malformed.timestamp = "NOT-A-DATETIME"  # type: ignore
+        # Bypass frozen dataclass to simulate in-memory corruption
+        object.__setattr__(malformed, "timestamp", "NOT-A-DATETIME")
 
         # Should not raise
         bus.publish(malformed)
