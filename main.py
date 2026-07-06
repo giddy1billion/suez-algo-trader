@@ -699,6 +699,7 @@ def cmd_run(
         confidence_gate=confidence_gate,
         decision_orchestrator=decision_orchestrator,
         contract_store=contract_store,
+        signal_dedup_strength_threshold=settings.signal_dedup_strength_threshold,
         intelligence_orchestrator=AdaptiveIntelligenceOrchestrator(
             min_trade_score=settings.intelligence_min_trade_score,
             drift_window=settings.intelligence_drift_window,

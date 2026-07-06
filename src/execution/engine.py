@@ -26,6 +26,7 @@ from src.intelligence.confidence.orchestrator import DecisionOrchestrator
 from src.intelligence.confidence.decision_contract import DecisionContract, Decision
 from src.utils.logger import get_logger
 from src.core.runtime_state import RuntimeState
+from src.execution.signal_dedup import SignalDeduplicator
 
 # Event types — imported at top for reliability
 from src.core.events import (
@@ -91,6 +92,7 @@ class ExecutionEngine:
         confidence_gate: Optional[ConfidenceGate] = None,
         decision_orchestrator: Optional[DecisionOrchestrator] = None,
         contract_store=None,
+        signal_dedup_strength_threshold: float = 0.10,
     ):
         self.broker = broker
         self.risk = risk_manager
@@ -125,6 +127,11 @@ class ExecutionEngine:
         self._signal_builder = SignalPackageBuilder(signal_bridge_config)
         self._signal_monitor = ActiveSignalMonitor()
 
+        # Signal deduplication — delegates to standalone SignalDeduplicator
+        self._signal_dedup = SignalDeduplicator(
+            strength_threshold=signal_dedup_strength_threshold,
+        )
+
         # Trade context tracking for closed-loop feedback
         # Maps trade_id → {signal_package_id, model_version, strategy, entry_time, side, entry_price}
         self._trade_context: dict[str, dict] = {}
@@ -151,6 +158,10 @@ class ExecutionEngine:
                 source="signal_monitor",
             ))
         return len(invalidated)
+
+    def _should_notify_signal(self, signal: TradeSignal) -> bool:
+        """Delegate to SignalDeduplicator for notification suppression."""
+        return self._signal_dedup.should_notify(signal)
 
     # ──────────────────────────────────────────────────────────────────────
     # Event Publishing Helpers
@@ -242,6 +253,16 @@ class ExecutionEngine:
                     "engine.signal_suppressed_mode",
                     symbol=sig.symbol,
                     mode=self._runtime_state.operating_mode.value,
+                )
+                continue
+
+            # Deduplicate: suppress repeated identical notifications
+            if not self._should_notify_signal(sig):
+                logger.debug(
+                    "engine.signal_dedup_suppressed",
+                    symbol=sig.symbol,
+                    side=sig.side.value,
+                    strength=sig.signal_strength,
                 )
                 continue
             

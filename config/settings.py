@@ -92,6 +92,10 @@ class Settings(BaseSettings):
     crypto_lookback_bars: int = 500
     crypto_min_confirming_indicators: int = 1
 
+    # --- Signal Deduplication ---
+    signal_dedup_enabled: bool = True
+    signal_dedup_strength_threshold: float = 0.10  # Notify only if strength changes by 10%+
+
     # --- Strategy Parameters (Mean Reversion) ---
     mean_rev_bb_period: int = 20
     mean_rev_bb_std: float = 2.0
