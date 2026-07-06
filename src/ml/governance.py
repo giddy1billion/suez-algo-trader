@@ -461,28 +461,44 @@ class ModelGovernance:
     # ------------------------------------------------------------------
 
     def _get_git_commit(self) -> str:
-        """Get current git commit hash."""
-        try:
-            result = subprocess.run(
-                ["git", "rev-parse", "HEAD"],
-                capture_output=True, text=True, timeout=5,
-                cwd=os.path.dirname(os.path.abspath(__file__)),
-            )
-            return result.stdout.strip() if result.returncode == 0 else ""
-        except Exception:
-            return ""
+        """Get current git commit hash. Tries multiple paths for robustness."""
+        search_dirs = [
+            os.path.dirname(os.path.abspath(__file__)),  # src/ml/
+            os.getcwd(),  # working directory
+            os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),  # project root
+        ]
+        for cwd in search_dirs:
+            try:
+                result = subprocess.run(
+                    ["git", "rev-parse", "HEAD"],
+                    capture_output=True, text=True, timeout=5,
+                    cwd=cwd,
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    return result.stdout.strip()
+            except Exception:
+                continue
+        return ""
 
     def _get_git_branch(self) -> str:
-        """Get current git branch name."""
-        try:
-            result = subprocess.run(
-                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-                capture_output=True, text=True, timeout=5,
-                cwd=os.path.dirname(os.path.abspath(__file__)),
-            )
-            return result.stdout.strip() if result.returncode == 0 else ""
-        except Exception:
-            return ""
+        """Get current git branch name. Tries multiple paths for robustness."""
+        search_dirs = [
+            os.path.dirname(os.path.abspath(__file__)),
+            os.getcwd(),
+            os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+        ]
+        for cwd in search_dirs:
+            try:
+                result = subprocess.run(
+                    ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                    capture_output=True, text=True, timeout=5,
+                    cwd=cwd,
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    return result.stdout.strip()
+            except Exception:
+                continue
+        return ""
 
     def _hash_dict(self, d: dict) -> str:
         """Deterministic hash of a dictionary."""

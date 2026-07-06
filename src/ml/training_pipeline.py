@@ -360,6 +360,7 @@ class TrainingPipeline:
             metrics=metrics,
             symbols=symbols,
             note=f"Pipeline {progress.pipeline_id} ({progress.trigger})",
+            activate=False,  # Don't activate until governance approves
         )
         progress.version = version
         progress.steps_completed = 4
@@ -408,9 +409,13 @@ class TrainingPipeline:
                 version=version,
                 reason=f"Auto-deploy from pipeline {progress.pipeline_id}",
             )
+            # Activate in registry ONLY after governance approves — this is
+            # what the predictor's auto_reload watcher polls.
+            self._registry.set_active_version(version)
             progress.auto_deployed = True
             logger.info("training_pipeline.auto_deployed", version=version)
         elif not is_valid:
+            # Model stays inactive in registry — predictor won't load it
             logger.warning(
                 "training_pipeline.validation_failed",
                 version=version,

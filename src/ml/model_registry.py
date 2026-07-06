@@ -51,6 +51,7 @@ class ModelRegistry:
         metrics: dict,
         symbols: list,
         note: str = "",
+        activate: bool = True,
     ) -> str:
         """
         Save a new model version to the registry.
@@ -61,6 +62,9 @@ class ModelRegistry:
             metrics: Training/validation metrics dict.
             symbols: List of symbols the model was trained on.
             note: Optional human-readable note for this version.
+            activate: If True, immediately mark as active (predictor will load it).
+                      If False, model is registered but NOT active — governance
+                      must explicitly promote it via set_active_version().
 
         Returns:
             Version string, e.g. "v003".
@@ -85,9 +89,10 @@ class ModelRegistry:
             # Update latest_model.joblib (copy for cross-platform compatibility)
             shutil.copy2(filepath, self.latest_path)
 
-            # Mark all previous versions as inactive
-            for entry in registry:
-                entry["is_active"] = False
+            if activate:
+                # Mark all previous versions as inactive
+                for entry in registry:
+                    entry["is_active"] = False
 
             # Build metadata entry
             entry = {
@@ -99,7 +104,7 @@ class ModelRegistry:
                 "n_features": len(features),
                 "n_samples": metrics.get("n_samples", 0),
                 "note": note,
-                "is_active": True,
+                "is_active": activate,
             }
             registry.append(entry)
 
@@ -107,9 +112,40 @@ class ModelRegistry:
             logger.info(
                 "ml.registry.version_saved",
                 version=version_str,
+                activated=activate,
                 metrics=metrics,
             )
             return version_str
+
+    def set_active_version(self, version_str: str) -> bool:
+        """
+        Explicitly promote a registered version to active status.
+
+        Only governance-approved models should be activated. The predictor's
+        auto-reload watcher polls get_active_version() — this is the gate.
+
+        Args:
+            version_str: Version to activate (e.g. "v003").
+
+        Returns:
+            True if version was found and activated, False otherwise.
+        """
+        with _registry_lock:
+            registry = self._load_registry()
+            found = False
+            for entry in registry:
+                if entry["version"] == version_str:
+                    entry["is_active"] = True
+                    found = True
+                else:
+                    entry["is_active"] = False
+
+            if found:
+                self._save_registry(registry)
+                logger.info("ml.registry.version_activated", version=version_str)
+            else:
+                logger.warning("ml.registry.activate_not_found", version=version_str)
+            return found
 
     def list_versions(self) -> list[dict]:
         """
