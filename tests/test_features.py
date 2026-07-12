@@ -45,7 +45,7 @@ class TestEngineerFeatures:
         assert 'target' in result.columns
         assert 'future_return' in result.columns
         # Last forward_bars rows should be NaN (can't see future)
-        assert result['future_return'].iloc[-1] != result['future_return'].iloc[-1]  # NaN check
+        assert pd.isna(result['future_return'].iloc[-1])  # Last rows should be NaN (can't see future)
 
     def test_empty_dataframe_raises(self):
         with pytest.raises(ValueError, match="empty"):

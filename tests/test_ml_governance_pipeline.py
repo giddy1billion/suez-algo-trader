@@ -17,7 +17,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from src.ml.governance import ModelGovernance, ModelLineage, ModelStatus, ValidationResult
+from src.ml.governance import GovernanceViolation, ModelGovernance, ModelLineage, ModelStatus, ValidationResult
 from src.ml.label_encoder import DirectionEncoder
 
 
@@ -431,15 +431,14 @@ class TestPaperTradingActivation:
         assert model.deployment_reason == "Passed all gates"
 
     def test_rejected_model_cannot_be_force_deployed(self, failing_model):
-        """Even manual deploy of a model preserves lineage — but governance
-        tracks deployment status separately from validation."""
-        # deploy() is a governance action - it CAN be done manually
-        # but the automation path checks validation first
-        failing_model.deploy("v001", reason="Manual override")
-        model = failing_model.get_deployed_model()
-        # Model is deployed (manual override) but lineage shows poor metrics
-        assert model.is_deployed is True
-        assert model.cv_accuracy == 0.322  # Metrics unchanged
+        """Deploying a model that fails validation raises GovernanceViolation.
+
+        This is a regression test for the governance bypass vulnerability:
+        deploy() now enforces validation internally and cannot be bypassed
+        by calling it directly.
+        """
+        with pytest.raises(GovernanceViolation, match="failed governance validation"):
+            failing_model.deploy("v001", reason="Manual override")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

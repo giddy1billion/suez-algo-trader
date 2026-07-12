@@ -34,6 +34,10 @@ logger = get_logger(__name__)
 # ---------------------------------------------------------------------------
 
 
+class GovernanceViolation(Exception):
+    """Raised when a deployment is attempted without passing governance gates."""
+
+
 class ModelStatus(str, Enum):
     """Model promotion lifecycle status."""
     CANDIDATE = "candidate"
@@ -253,8 +257,37 @@ class ModelGovernance:
     # Deployment Lifecycle
     # ------------------------------------------------------------------
 
-    def deploy(self, version: str, reason: str = "") -> bool:
-        """Mark a model version as deployed (live in production)."""
+    def deploy(self, version: str, reason: str = "", *, skip_validation: bool = False) -> bool:
+        """
+        Mark a model version as deployed (live in production).
+
+        Deployment is BLOCKED unless the model passes all governance
+        validation gates.  The ``skip_validation`` flag exists **only**
+        for disaster-recovery rollbacks and is logged as an audit event.
+
+        Raises:
+            GovernanceViolation: If the model fails validation and
+                ``skip_validation`` is False.
+        """
+        # ── Mandatory validation gate ──────────────────────────────
+        is_valid, issues = self.validate_for_deployment(version)
+        if not is_valid and not skip_validation:
+            logger.warning(
+                "governance.deploy_blocked",
+                version=version,
+                issues=issues,
+            )
+            raise GovernanceViolation(
+                f"Model {version} failed governance validation: {issues}"
+            )
+        if skip_validation and not is_valid:
+            logger.warning(
+                "governance.deploy_override",
+                version=version,
+                issues=issues,
+                reason=reason,
+            )
+
         with self._lock:
             all_lineage = self._load_all_lineage()
 

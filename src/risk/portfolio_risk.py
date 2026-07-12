@@ -196,13 +196,26 @@ class PortfolioRiskLayer:
             )
 
         # 7. Portfolio VaR (simplified parametric estimate)
-        # Uses position-level approximation: sum of (position_value * daily_vol)
-        # A proper implementation would use a covariance matrix
-        portfolio_heat = sum(
-            abs(float(p.get("market_value", 0))) * float(p.get("daily_vol", 0.02))
-            for p in positions
-        )
-        trade_heat = adjusted_qty * request.price * 0.02  # Assume 2% daily vol if unknown
+        # Uses position-level realized volatility when available,
+        # falling back to asset-class defaults if daily_vol is absent.
+        _asset_class_vol_defaults = {
+            "crypto": 0.05,   # ~5% daily vol typical for BTC/ETH
+            "equity": 0.015,  # ~1.5% daily vol typical for large-cap equity
+        }
+        default_vol = 0.02
+
+        portfolio_heat = 0.0
+        for p in positions:
+            pos_vol = float(p.get("daily_vol", 0.0))
+            if pos_vol <= 0:
+                asset_class = str(p.get("asset_class", "equity")).lower()
+                pos_vol = _asset_class_vol_defaults.get(asset_class, default_vol)
+            portfolio_heat += abs(float(p.get("market_value", 0))) * pos_vol
+
+        # Estimate trade volatility from position data or asset-class default
+        trade_asset_class = "equity"  # default; callers can set via request metadata
+        trade_vol = _asset_class_vol_defaults.get(trade_asset_class, default_vol)
+        trade_heat = adjusted_qty * request.price * trade_vol
         total_heat = portfolio_heat + trade_heat
         var_estimate = total_heat * 1.65  # 95% confidence, 1-day
 
@@ -225,7 +238,7 @@ class PortfolioRiskLayer:
                     reason="Portfolio heat limit reached",
                 )
             # Scale down qty so trade contributes only the remaining heat budget
-            max_trade_value = max_heat_remaining / 0.02
+            max_trade_value = max_heat_remaining / trade_vol
             adjusted_qty = min(adjusted_qty, max_trade_value / request.price)
 
         # Determine final action

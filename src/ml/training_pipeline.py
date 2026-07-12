@@ -375,7 +375,7 @@ class TrainingPipeline:
         progress.current_step = "Training XGBoost model"
         logger.info("training_pipeline.step", step="train_model")
 
-        model, metrics, feature_cols, X_holdout, y_holdout = self._train_model(feature_data)
+        model, metrics, feature_cols, X_holdout, y_holdout, close_holdout = self._train_model(feature_data)
         self._raise_if_stopping()
         progress.metrics = metrics
         progress.steps_completed = 3
@@ -417,7 +417,7 @@ class TrainingPipeline:
         logger.info("training_pipeline.step", step="validate", version=version)
 
         # Run out-of-sample backtest on HELD-OUT data the model never trained on
-        backtest_results = self._backtest_model_oos(model, feature_cols, X_holdout, y_holdout)
+        backtest_results = self._backtest_model_oos(model, feature_cols, X_holdout, y_holdout, close_holdout)
         # Run genuine walk-forward validation (expanding-window refit + predict)
         walk_forward_results = self._walk_forward_validation(feature_data, feature_cols)
         metrics.update({
@@ -731,7 +731,10 @@ class TrainingPipeline:
         # Temporal holdout: last 20% reserved for governance backtest (never seen during training)
         holdout_start_idx = int(len(X) * 0.80)
 
-        return X, y, feature_cols, sample_weights, holdout_start_idx
+        # Preserve close prices for realistic OOS backtesting (not used as features)
+        close_prices = valid['close'].values if 'close' in valid.columns else None
+
+        return X, y, feature_cols, sample_weights, holdout_start_idx, close_prices
 
     def _train_model(
         self, feature_data: dict[str, pd.DataFrame]
@@ -754,7 +757,7 @@ class TrainingPipeline:
         from sklearn.model_selection import TimeSeriesSplit
         from sklearn.metrics import accuracy_score
 
-        X, y, feature_cols, sample_weights, holdout_start_idx = self._prepare_training_data(feature_data)
+        X, y, feature_cols, sample_weights, holdout_start_idx, close_prices = self._prepare_training_data(feature_data)
 
         # Split into train and holdout — holdout is NEVER used for model fitting
         X_train_all = X[:holdout_start_idx]
@@ -807,7 +810,18 @@ class TrainingPipeline:
             score = accuracy_score(y_val, model.predict(X_val))
             cv_scores.append(score)
 
-        # Train final model on training portion ONLY (excludes holdout)
+        # Train final model on training portion ONLY (excludes holdout).
+        # Use early stopping against the holdout to prevent overfitting,
+        # matching the regularisation applied during CV folds.
+        # Reserve a small internal validation split (last 10% of train) for
+        # early-stopping monitoring so the holdout stays truly unseen.
+        es_split = int(len(X_train_all) * 0.90)
+        X_train_es = X_train_all[:es_split]
+        y_train_es = y_train_all[:es_split]
+        X_val_es = X_train_all[es_split:]
+        y_val_es = y_train_all[es_split:]
+        w_train_es = w_train_all[:es_split] if w_train_all is not None else None
+
         final_model = XGBClassifier(
             n_estimators=500,
             max_depth=4,
@@ -822,8 +836,14 @@ class TrainingPipeline:
             eval_metric='mlogloss',
             random_state=42,
             verbosity=0,
+            early_stopping_rounds=30,
         )
-        final_model.fit(X_train_all, y_train_all, sample_weight=w_train_all, verbose=False)
+        final_model.fit(
+            X_train_es, y_train_es,
+            sample_weight=w_train_es,
+            eval_set=[(X_val_es, y_val_es)],
+            verbose=False,
+        )
 
         metrics = {
             "cv_accuracy": float(np.mean(cv_scores)) if cv_scores else 0.0,
@@ -851,7 +871,9 @@ class TrainingPipeline:
             },
         }
 
-        return final_model, metrics, feature_cols, X_holdout, y_holdout
+        close_holdout = close_prices[holdout_start_idx:] if close_prices is not None else None
+
+        return final_model, metrics, feature_cols, X_holdout, y_holdout, close_holdout
 
     def _backtest_model_oos(
         self,
@@ -859,20 +881,25 @@ class TrainingPipeline:
         feature_cols: list[str],
         X_holdout: np.ndarray,
         y_holdout: np.ndarray,
+        close_holdout: Optional[np.ndarray] = None,
+        transaction_cost_bps: float = 10.0,
+        slippage_bps: float = 5.0,
     ) -> dict:
         """
         Run out-of-sample backtest on held-out data the model NEVER trained on.
 
-        Generates NON-OVERLAPPING simulated trades from model predictions on the
-        temporal holdout set. Each trade holds for `hold_bars` and the next trade
-        can only start after the previous exits — ensuring statistical independence
-        of trade returns for valid Sharpe ratio computation.
+        Uses **actual close prices** when available to compute realistic
+        trade returns including round-trip transaction costs and slippage.
+        Falls back to a simplified simulation only when prices are absent.
 
         Args:
             model: Trained model (only trained on first 80% of data).
             feature_cols: Feature column names.
             X_holdout: Feature matrix from the temporal holdout (last 20%).
             y_holdout: True encoded targets from the holdout.
+            close_holdout: Close price array aligned with X_holdout (optional).
+            transaction_cost_bps: Round-trip transaction cost in basis points.
+            slippage_bps: Estimated slippage per side in basis points.
 
         Returns:
             Dict with sharpe, max_drawdown, n_trades, monte_carlo results.
@@ -880,6 +907,7 @@ class TrainingPipeline:
         from backtesting.monte_carlo import monte_carlo_simulation
 
         hold_bars = 5  # Holding period per trade
+        cost_per_trade = (transaction_cost_bps + 2 * slippage_bps) / 10_000.0
 
         # Handle NaN in holdout features
         nan_mask = np.isnan(X_holdout) | np.isinf(X_holdout)
@@ -890,6 +918,8 @@ class TrainingPipeline:
         predictions = model.predict(X_holdout)
         decoded_predictions = DirectionEncoder.decode(predictions)
 
+        use_prices = (close_holdout is not None and len(close_holdout) == len(X_holdout))
+
         # Generate NON-OVERLAPPING trades: after entering, skip forward by hold_bars
         all_trades = []
         i = 0
@@ -899,30 +929,29 @@ class TrainingPipeline:
                 i += 1
                 continue
 
-            # Use true targets to compute hypothetical P&L from the holdout
-            # The target encodes direction: 1=up, -1=down, 0=flat
-            # Trade return = signal * actual_return_over_hold_period
-            # Since we don't have close prices here, use a simplified
-            # trade simulation based on prediction correctness
-            true_direction = DirectionEncoder.decode(np.array([y_holdout[i]]))[0]
-
-            # Reward correct predictions, penalize incorrect ones
-            # This mirrors the actual trading outcome without needing prices
-            if true_direction == signal:
-                # Correct prediction — assume median favorable return
-                trade_return = 0.005 * abs(signal)  # threshold-level return
-            elif true_direction == 0:
-                # Predicted direction but market was flat — small loss (spread/slippage)
-                trade_return = -0.001
+            if use_prices:
+                # ── Realistic price-based return ────────────────────────
+                entry_price = close_holdout[i]
+                exit_price = close_holdout[i + hold_bars]
+                if entry_price > 0:
+                    raw_return = signal * (exit_price / entry_price - 1.0)
+                    trade_return = raw_return - cost_per_trade
+                else:
+                    trade_return = 0.0
             else:
-                # Wrong direction — assume median adverse return
-                trade_return = -0.005 * abs(signal)
+                # ── Fallback: direction-correctness estimate ────────────
+                true_direction = DirectionEncoder.decode(np.array([y_holdout[i]]))[0]
+                if true_direction == signal:
+                    trade_return = 0.005 * abs(signal) - cost_per_trade
+                elif true_direction == 0:
+                    trade_return = -cost_per_trade
+                else:
+                    trade_return = -0.005 * abs(signal) - cost_per_trade
 
             all_trades.append({
                 "pnl": 1000.0 * trade_return,  # Notional $1000 per trade
                 "return": trade_return,
                 "signal": signal,
-                "true_direction": true_direction,
             })
 
             # Skip forward by hold_bars — ensures non-overlapping trades

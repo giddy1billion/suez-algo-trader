@@ -312,8 +312,10 @@ class TelegramAuditForwarder:
         self._timeout_check_interval = max(0.5, timeout_check_interval)
         self._max_send_retries = max(1, max_send_retries)
 
-        # Pluggable correlation store (default: in-memory with TTL)
-        self._store = correlation_store or InMemoryCorrelationStore()
+        # Pluggable correlation store — production default is durable SQLite
+        # to ensure at-least-once delivery semantics.  Pass an
+        # InMemoryCorrelationStore explicitly for testing or development.
+        self._store = correlation_store or SqliteCorrelationStore()
 
         # Track last health status per component to suppress repeated identical notifications
         self._last_health_status: dict[str, str] = {}
