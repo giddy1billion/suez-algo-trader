@@ -30,8 +30,8 @@ from src.execution.signal_dedup import SignalDeduplicator
 
 # Event types — imported at top for reliability
 from src.core.events import (
-    SignalGenerated, DecisionContractCreated, RiskEvaluated, OrderSubmitted, OrderFilled,
-    OrderRejected, TradeOpened, TradeClosed, RiskHalt,
+    SignalGenerated, DecisionContractCreated, RiskEvaluated, SignalRejected,
+    OrderSubmitted, OrderFilled, OrderRejected, TradeOpened, TradeClosed, RiskHalt,
 )
 from src.core.state_machine import TradeState
 from src.strategy.signal_bridge import (
@@ -362,6 +362,13 @@ class ExecutionEngine:
                 strategy=signal.strategy_id,
                 signal_id=signal.signal_id,
             )
+            self._publish(SignalRejected(
+                signal_id=signal.signal_id,
+                symbol=signal.symbol,
+                reason=f"signal_strength {signal.signal_strength:.3f} < {self.min_signal_confidence}",
+                stage="strength_gate",
+                source="engine",
+            ))
             self._log_signal_v2(signal, executed=False)
             return None
 
@@ -372,9 +379,23 @@ class ExecutionEngine:
         existing = next((p for p in positions if p['symbol'] == signal.symbol), None)
         if existing and side == "buy" and existing.get('side') == 'long':
             logger.debug("engine.skip_existing_long", symbol=signal.symbol)
+            self._publish(SignalRejected(
+                signal_id=signal.signal_id,
+                symbol=signal.symbol,
+                reason="existing_long_position",
+                stage="existing_position",
+                source="engine",
+            ))
             return None
         if existing and side == "sell" and existing.get('side') == 'short':
             logger.debug("engine.skip_existing_short", symbol=signal.symbol)
+            self._publish(SignalRejected(
+                signal_id=signal.signal_id,
+                symbol=signal.symbol,
+                reason="existing_short_position",
+                stage="existing_position",
+                source="engine",
+            ))
             return None
 
         # ── Intelligence Layer (optional, adaptive) ─────────────────────────
@@ -397,6 +418,13 @@ class ExecutionEngine:
                     reason=intelligence_decision.routing.reason,
                     signal_id=signal.signal_id,
                 )
+                self._publish(SignalRejected(
+                    signal_id=signal.signal_id,
+                    symbol=signal.symbol,
+                    reason=f"intelligence_score {intelligence_decision.final_score:.2f}: {intelligence_decision.routing.reason}",
+                    stage="intelligence",
+                    source="engine",
+                ))
                 self._log_signal_v2(signal, executed=False)
                 return None
 
@@ -432,6 +460,13 @@ class ExecutionEngine:
                     symbol=signal.symbol,
                     errors=gate_errors,
                 )
+                self._publish(SignalRejected(
+                    signal_id=signal.signal_id,
+                    symbol=signal.symbol,
+                    reason=f"signal_gate: {'; '.join(gate_errors) if gate_errors else 'failed'}",
+                    stage="signal_gate",
+                    source="engine",
+                ))
                 self._log_signal_v2(signal, executed=False)
                 return None
 
@@ -460,12 +495,26 @@ class ExecutionEngine:
             qty = max_value / observed_price if observed_price > 0 else 0
 
         if qty <= 0:
+            self._publish(SignalRejected(
+                signal_id=signal.signal_id,
+                symbol=signal.symbol,
+                reason="zero_position_size",
+                stage="zero_qty",
+                source="engine",
+            ))
             return None
 
         if intelligence_decision:
             qty *= intelligence_decision.qty_multiplier
             if qty <= 0:
                 logger.info("engine.intelligence_zero_qty", symbol=signal.symbol)
+                self._publish(SignalRejected(
+                    signal_id=signal.signal_id,
+                    symbol=signal.symbol,
+                    reason="intelligence_zero_qty_multiplier",
+                    stage="zero_qty",
+                    source="engine",
+                ))
                 self._log_signal_v2(signal, executed=False)
                 return None
 
@@ -479,6 +528,13 @@ class ExecutionEngine:
                     symbol=signal.symbol,
                     mode=self._runtime_state.operating_mode.value,
                 )
+                self._publish(SignalRejected(
+                    signal_id=signal.signal_id,
+                    symbol=signal.symbol,
+                    reason=f"mode_zero_qty ({self._runtime_state.operating_mode.value})",
+                    stage="zero_qty",
+                    source="engine",
+                ))
                 return None
 
         # ── Decision Contract (authoritative decision) ──────────────────────
@@ -553,6 +609,15 @@ class ExecutionEngine:
                     vetoed=decision_contract.vetoed,
                     signal_id=signal.signal_id,
                 )
+                # Emit terminal verdict so correlation deadline is cancelled
+                self._publish(RiskEvaluated(
+                    symbol=signal.symbol,
+                    signal_id=signal.signal_id,
+                    approved=False,
+                    reasons=[f"contract_rejected: {decision_contract.recommendation}"],
+                    contract_id=decision_contract.contract_id,
+                    source="decision_orchestrator",
+                ))
                 self._record_contract_rejection(decision_contract, signal.symbol, "contract_rejected")
                 self._log_signal_v2(signal, executed=False)
                 return None
@@ -624,6 +689,13 @@ class ExecutionEngine:
             trade_lifecycle = self._trade_manager.create_trade(signal.symbol, side)
             if not trade_lifecycle.transition(TradeState.PENDING_RISK, "risk evaluation"):
                 logger.warning("engine.invalid_transition", symbol=signal.symbol, state="PENDING_RISK")
+                self._publish(SignalRejected(
+                    signal_id=signal.signal_id,
+                    symbol=signal.symbol,
+                    reason="state_machine_inconsistency",
+                    stage="state_machine",
+                    source="engine",
+                ))
                 self._record_contract_rejection(decision_contract, signal.symbol, "state_machine_error")
                 return None  # Abort: state machine inconsistency
 
@@ -656,6 +728,14 @@ class ExecutionEngine:
             )
         except Exception as e:
             logger.error("engine.risk_evaluation_exception", symbol=signal.symbol, error=str(e))
+            self._publish(RiskEvaluated(
+                symbol=signal.symbol,
+                signal_id=signal.signal_id,
+                approved=False,
+                reasons=[f"risk_exception: {str(e)[:80]}"],
+                contract_id=decision_contract.contract_id if decision_contract else "",
+                source="risk_engine",
+            ))
             self._log_signal_v2(signal, executed=False)
             self._record_contract_rejection(decision_contract, signal.symbol, "risk_exception")
             if trade_lifecycle:

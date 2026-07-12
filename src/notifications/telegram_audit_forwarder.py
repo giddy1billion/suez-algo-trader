@@ -41,6 +41,7 @@ from src.core.events import (
     RiskHalt,
     SchedulerEvent,
     SignalGenerated,
+    SignalRejected,
     SystemHealth,
     TradeClosed,
     TradeOpened,
@@ -334,7 +335,8 @@ class TelegramAuditForwarder:
         try:
             # Suppress trading events when paused
             if self._runtime_state.is_paused():
-                if isinstance(event, (SignalGenerated, RiskEvaluated, OrderSubmitted, OrderAccepted,
+                if isinstance(event, (SignalGenerated, RiskEvaluated, SignalRejected,
+                                    OrderSubmitted, OrderAccepted,
                                     OrderFilled, OrderPartialFill, OrderRejected,
                                     TradeOpened, TradeClosed)):
                     self._events_suppressed += 1
@@ -346,6 +348,10 @@ class TelegramAuditForwarder:
 
             if isinstance(event, DecisionContractCreated):
                 self._track_decision_contract(event)
+
+            if isinstance(event, SignalRejected):
+                self._handle_signal_rejected(event)
+                return
 
             if isinstance(event, RiskEvaluated):
                 self._handle_risk_evaluated(event)
@@ -398,6 +404,17 @@ class TelegramAuditForwarder:
             self._store.store_contract(signal_id, event)
         if event.contract_id and signal_id:
             self._store.map_contract_to_signal(event.contract_id, signal_id)
+
+    def _handle_signal_rejected(self, event: SignalRejected) -> None:
+        """Handle early signal rejection — cancel the correlation deadline.
+
+        SignalRejected is a terminal verdict emitted before risk evaluation
+        (e.g., low strength, existing position, intelligence rejection).
+        Cancelling the deadline prevents spurious 'NO VERDICT RECEIVED' warnings.
+        """
+        signal_id = (getattr(event, "signal_id", "") or "").strip()
+        if signal_id:
+            self._store.cancel_deadline(signal_id)
 
     def _emit_no_verdict_timeouts(self) -> None:
         """Check for expired deadlines and emit timeout warnings.
