@@ -228,3 +228,7 @@ class ConfigurationRepository:
     ) -> list[ConfigurationAuditLog]:
         """Get version history for a specific configuration key."""
         return self.get_audit_log(category=category, key=key, limit=limit)
+
+    def close(self) -> None:
+        """Dispose the engine connection pool."""
+        self._engine.dispose()

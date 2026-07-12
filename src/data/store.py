@@ -163,6 +163,10 @@ class DatabaseManager:
     def get_session(self) -> Session:
         return self.SessionFactory()
 
+    def close(self) -> None:
+        """Dispose the engine connection pool."""
+        self.engine.dispose()
+
     # --- Trades ---
 
     def record_trade(self, trade_data: dict) -> Trade:

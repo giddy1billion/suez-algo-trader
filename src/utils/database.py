@@ -1,20 +1,30 @@
-"""
-Shared Database Engine Factory — supports PostgreSQL and SQLite.
+﻿"""
+Shared Database Engine Factory - supports PostgreSQL and SQLite.
 
 Provides a centralized engine creation function that configures the
 appropriate driver, pooling, and pragmas based on the DATABASE_URL scheme.
 
+Includes:
+  - Connection pool lifecycle hooks (checkout, checkin, invalidate)
+  - Slow query detection (configurable threshold)
+  - Health check method for pool status
+  - Structured observability events for all pool transitions
+
 Usage:
-    from src.utils.database import create_db_engine, get_engine
+    from src.utils.database import create_db_engine, get_engine, db_health_check
 
     # Create a one-off engine
-    engine = create_db_engine("postgresql://user:pass@host:5432/db")
+    engine = create_db_engine("postgresql://host:5432/db")
 
     # Get/share the application-wide singleton engine
     engine = get_engine()
+
+    # Check pool health
+    status = db_health_check()
 """
 
 import threading
+import time
 from typing import Optional
 
 from sqlalchemy import create_engine as sa_create_engine, event as sa_event
@@ -29,16 +39,73 @@ _engine_lock = threading.Lock()
 _shared_engine: Optional[Engine] = None
 _shared_session_factory: Optional[sessionmaker] = None
 
+# Configurable slow query threshold (seconds)
+SLOW_QUERY_THRESHOLD_SECONDS: float = 1.0
+
+
+def _attach_pool_events(engine: Engine) -> None:
+    """Attach structured logging hooks to connection pool events."""
+
+    @sa_event.listens_for(engine, "checkout")
+    def _on_checkout(dbapi_conn, connection_record, connection_proxy):
+        connection_record.info["checkout_time"] = time.time()
+
+    @sa_event.listens_for(engine, "checkin")
+    def _on_checkin(dbapi_conn, connection_record):
+        checkout_time = connection_record.info.pop("checkout_time", None)
+        if checkout_time:
+            hold_duration = time.time() - checkout_time
+            if hold_duration > SLOW_QUERY_THRESHOLD_SECONDS:
+                logger.warning(
+                    "db.connection.slow_return",
+                    hold_seconds=round(hold_duration, 3),
+                    threshold=SLOW_QUERY_THRESHOLD_SECONDS,
+                )
+
+    @sa_event.listens_for(engine, "invalidate")
+    def _on_invalidate(dbapi_conn, connection_record, exception):
+        logger.warning(
+            "db.pool.connection_invalidated",
+            error=str(exception) if exception else "soft_invalidate",
+        )
+
+    @sa_event.listens_for(engine, "connect")
+    def _on_connect(dbapi_conn, connection_record):
+        logger.debug("db.pool.new_connection")
+
+
+def _attach_query_timing(engine: Engine) -> None:
+    """Attach before/after cursor execute hooks for slow query detection."""
+
+    @sa_event.listens_for(engine, "before_cursor_execute")
+    def _before_cursor_execute(conn, cursor, statement, parameters, context, executemany):
+        conn.info.setdefault("query_start_time", []).append(time.time())
+
+    @sa_event.listens_for(engine, "after_cursor_execute")
+    def _after_cursor_execute(conn, cursor, statement, parameters, context, executemany):
+        start_times = conn.info.get("query_start_time")
+        if start_times:
+            start = start_times.pop()
+            elapsed = time.time() - start
+            if elapsed > SLOW_QUERY_THRESHOLD_SECONDS:
+                stmt_preview = statement[:200] if statement else ""
+                logger.warning(
+                    "db.query.slow",
+                    elapsed_seconds=round(elapsed, 3),
+                    threshold=SLOW_QUERY_THRESHOLD_SECONDS,
+                    statement_preview=stmt_preview,
+                )
+
 
 def create_db_engine(database_url: str, echo: bool = False) -> Engine:
     """
     Create a SQLAlchemy engine configured for the given database URL.
 
     Supports:
-      - postgresql:// or postgresql+psycopg2://  → connection pool
-      - sqlite:///  → StaticPool with WAL pragmas
+      - postgresql:// or postgresql+psycopg2:// -> connection pool with observability
+      - sqlite:/// -> StaticPool with WAL pragmas
 
-    Returns a fully configured Engine instance.
+    Returns a fully configured Engine instance with lifecycle hooks attached.
     """
     engine_kwargs = {"echo": echo}
 
@@ -76,10 +143,21 @@ def create_db_engine(database_url: str, echo: bool = False) -> Engine:
 
         engine = sa_create_engine(database_url, **engine_kwargs)
 
-        logger.info("database.engine_created", backend="postgresql", pool_size=5)
+        # Attach pool lifecycle and query timing hooks for PostgreSQL
+        _attach_pool_events(engine)
+        _attach_query_timing(engine)
+
+        logger.info(
+            "db.pool.initialized",
+            backend="postgresql",
+            pool_size=5,
+            max_overflow=3,
+            pool_timeout=30,
+            pool_recycle=1800,
+        )
 
     else:
-        # Fallback: unknown scheme — let SQLAlchemy figure it out
+        # Fallback: unknown scheme - let SQLAlchemy figure it out
         engine = sa_create_engine(database_url, **engine_kwargs)
         logger.warning("database.engine_created", backend="unknown", url=database_url[:50])
 
@@ -143,11 +221,112 @@ def is_sqlite(engine: Optional[Engine] = None) -> bool:
     return engine.dialect.name == "sqlite"
 
 
+def db_health_check(engine: Optional[Engine] = None) -> dict:
+    """
+    Return connection pool health status.
+
+    For PostgreSQL, reports pool size, checked-out connections, overflow, etc.
+    For SQLite, reports basic connectivity.
+    """
+    if engine is None:
+        engine = get_engine()
+
+    status = {
+        "backend": engine.dialect.name,
+        "healthy": False,
+    }
+
+    try:
+        # Verify connectivity with a simple query
+        from sqlalchemy import text
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        status["healthy"] = True
+    except Exception as e:
+        status["error"] = str(e)
+        logger.error("db.health_check.failed", error=str(e))
+        return status
+
+    # Report pool stats for PostgreSQL (QueuePool)
+    pool = engine.pool
+    if hasattr(pool, "size"):
+        status["pool_size"] = pool.size()
+        status["checked_out"] = pool.checkedout()
+        status["overflow"] = pool.overflow()
+        status["checked_in"] = pool.checkedin()
+        status["pool_timeout"] = getattr(pool, "_timeout", None)
+
+    logger.info("db.health_check.ok", **status)
+    return status
+
+
+def dispose_engine(engine: Optional[Engine] = None, timeout: float = 5.0) -> None:
+    """
+    Gracefully dispose of an engine's connection pool.
+
+    Logs a warning if pool still has checked-out connections.
+    """
+    if engine is None:
+        engine = get_engine()
+
+    pool = engine.pool
+    if hasattr(pool, "checkedout") and pool.checkedout() > 0:
+        logger.warning(
+            "db.pool.dispose_with_active_connections",
+            checked_out=pool.checkedout(),
+        )
+
+    engine.dispose()
+    logger.info("db.pool.shutdown", backend=engine.dialect.name)
+
+
 def reset_engine() -> None:
     """Reset the shared engine (for testing or reconfiguration)."""
     global _shared_engine, _shared_session_factory
     with _engine_lock:
         if _shared_engine is not None:
-            _shared_engine.dispose()
+            dispose_engine(_shared_engine)
         _shared_engine = None
         _shared_session_factory = None
+
+
+def run_migrations(database_url: Optional[str] = None) -> None:
+    """
+    Run pending Alembic migrations against the target database.
+
+    Emits structured log events for migration start/success/failure.
+    Safe to call on startup - skips if already at head.
+    """
+    import os
+
+    if database_url is None:
+        from config.settings import settings
+        database_url = settings.database_url
+
+    # Only run migrations for PostgreSQL (SQLite uses create_all)
+    if not database_url.startswith("postgresql"):
+        logger.debug("db.migration.skipped", reason="sqlite_uses_create_all")
+        return
+
+    try:
+        from alembic.config import Config
+        from alembic import command
+
+        # Find alembic.ini relative to project root
+        project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        alembic_ini = os.path.join(project_root, "alembic.ini")
+
+        if not os.path.exists(alembic_ini):
+            logger.warning("db.migration.skipped", reason="alembic_ini_not_found")
+            return
+
+        alembic_cfg = Config(alembic_ini)
+        alembic_cfg.set_main_option("sqlalchemy.url", database_url)
+
+        logger.info("db.migration.starting", target="head")
+        command.upgrade(alembic_cfg, "head")
+        logger.info("db.migration.completed", target="head")
+
+    except Exception as e:
+        logger.error("db.migration.failed", error=str(e))
+        raise

@@ -27,6 +27,7 @@ if config.config_file_name is not None:
 from src.data.store import Base as TradingBase
 from src.core.event_store import EventBase
 from src.core.snapshots import SnapshotBase
+from src.config.models import ConfigBase
 
 # Combine all metadata into a single target for autogenerate
 from sqlalchemy import MetaData
@@ -34,9 +35,9 @@ from sqlalchemy import MetaData
 target_metadata = MetaData()
 
 # Merge all model metadata into one combined MetaData
-for model_base in [TradingBase, EventBase, SnapshotBase]:
+for model_base in [TradingBase, EventBase, SnapshotBase, ConfigBase]:
     for table in model_base.metadata.tables.values():
-        table.tometadata(target_metadata)
+        table.to_metadata(target_metadata)
 
 
 def run_migrations_offline() -> None:
