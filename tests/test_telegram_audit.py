@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch, call
 import pytest
 
 from src.core.events import (
+    DecisionContractCreated,
     EventBus,
     OrderAccepted,
     OrderFilled,
@@ -184,7 +185,7 @@ class TestTelegramAuditForwarder:
         time.sleep(1.0)
         forwarder.stop()
 
-        assert send_fn.call_count == len(events)
+        assert send_fn.call_count == len(events) - 1  # SignalGenerated waits for risk verdict
 
     def test_queue_overflow_does_not_crash(self):
         slow_send = MagicMock(side_effect=lambda x: time.sleep(0.5))
@@ -192,7 +193,7 @@ class TestTelegramAuditForwarder:
 
         # Flood the queue
         for i in range(6000):
-            forwarder.handle(SignalGenerated(symbol=f"SYM{i}", signal="BUY"))
+            forwarder.handle(RiskHalt(reason=f"halt-{i}", level="WARNING"))
 
         # Should not raise
         forwarder.stop()
@@ -204,7 +205,7 @@ class TestTelegramAuditForwarder:
         bus = EventBus()
         forwarder.register(bus)
 
-        bus.publish(SignalGenerated(symbol="X", signal="BUY"))
+        bus.publish(RiskHalt(reason="x", level="WARNING"))
         time.sleep(0.5)
         forwarder.stop()
 
@@ -227,11 +228,11 @@ class TestTelegramAuditForwarder:
         forwarder = TelegramAuditForwarder(failing_send)
 
         forwarder.handle(RiskHalt(reason="test", level="WARNING"))
-        time.sleep(0.5)
+        time.sleep(1.5)
         forwarder.stop()
 
-        # Should not crash; event attempted but failed
-        assert failing_send.call_count == 1
+        # Should not crash; event retried MAX_SEND_RETRIES times (Finding 3)
+        assert failing_send.call_count == TelegramAuditForwarder.MAX_SEND_RETRIES
 
 
 class TestTelegramLogHandler:
@@ -352,7 +353,178 @@ class TestSetupHelper:
         time.sleep(1.0)
         result["forwarder"].stop()
 
-        assert send_fn.call_count == 2
+        assert send_fn.call_count == 1
+
+
+class TestCanonicalTradeIntentPipeline:
+    def test_approved_signal_emits_single_actionable_message_with_dedup(self):
+        send_fn = MagicMock()
+        forwarder = TelegramAuditForwarder(
+            send_fn,
+            bracket_orders_supported_provider=lambda: True,
+        )
+        forwarder._get_active_model_version = lambda: "v1.2.3"
+
+        signal = SignalGenerated(
+            signal_id="sig-1",
+            symbol="AAPL",
+            signal="BUY",
+            side="BUY",
+            strategy="ml_momentum",
+            strategy_version="v1.2.3",
+            signal_strength=0.83,
+            features={"strategy_proposed_stop_loss": 145.0, "strategy_proposed_take_profit": 165.0},
+            source="engine",
+        )
+        contract = DecisionContractCreated(
+            contract_id="contract-1",
+            signal_id="sig-1",
+            decision="execute",
+            symbol="AAPL",
+            side="BUY",
+            recommended_stop_loss=144.9,
+            recommended_take_profit=165.1,
+        )
+        risk = RiskEvaluated(
+            symbol="AAPL",
+            signal_id="sig-1",
+            contract_id="contract-1",
+            approved=True,
+            adjusted_qty=10.7,
+        )
+
+        forwarder.handle(signal)
+        forwarder.handle(contract)
+        forwarder.handle(risk)
+        forwarder.handle(risk)  # duplicate delivery
+
+        time.sleep(0.8)
+        forwarder.stop()
+
+        assert send_fn.call_count == 2  # contract event + one final approved intent
+        final_message = send_fn.call_args_list[-1][0][0]
+        assert "/buy AAPL 11" in final_message
+        assert "Native bracket order will be submitted" in final_message
+        assert _format_signal(signal) in final_message
+
+    def test_no_verdict_timeout_emits_explicit_followup(self):
+        send_fn = MagicMock()
+        forwarder = TelegramAuditForwarder(
+            send_fn,
+            risk_verdict_timeout_seconds=1.0,
+            timeout_check_interval=0.5,
+        )
+        forwarder._get_active_model_version = lambda: "v1"
+
+        forwarder.handle(
+            SignalGenerated(
+                signal_id="sig-timeout",
+                symbol="MSFT",
+                signal="BUY",
+                side="BUY",
+                strategy="s",
+                strategy_version="v1",
+            )
+        )
+        time.sleep(2.0)  # Wait for background timer to fire after 1s timeout
+        forwarder.stop()
+
+        combined = "\n".join(call[0][0] for call in send_fn.call_args_list)
+        assert "NO VERDICT RECEIVED" in combined
+        assert "no action taken" in combined
+
+    def test_risk_rejection_suppresses_actionable_command(self):
+        send_fn = MagicMock()
+        forwarder = TelegramAuditForwarder(send_fn)
+        forwarder._get_active_model_version = lambda: "vA"
+
+        signal = SignalGenerated(
+            signal_id="sig-rej",
+            symbol="TSLA",
+            signal="SELL",
+            side="SELL",
+            strategy="s",
+            strategy_version="vA",
+            signal_strength=0.7,
+        )
+        risk = RiskEvaluated(
+            symbol="TSLA",
+            signal_id="sig-rej",
+            approved=False,
+            reasons=["max exposure"],
+            adjusted_qty=5.0,
+        )
+
+        forwarder.handle(signal)
+        forwarder.handle(risk)
+        time.sleep(0.6)
+        forwarder.stop()
+
+        msg = send_fn.call_args_list[-1][0][0]
+        assert "RISK REJECTED" in msg
+        assert "/buy" not in msg
+        assert "/sell" not in msg
+
+    def test_fallback_provenance_suppresses_command(self):
+        send_fn = MagicMock()
+        forwarder = TelegramAuditForwarder(send_fn)
+        forwarder._get_active_model_version = lambda: "vA"
+
+        forwarder.handle(
+            SignalGenerated(
+                signal_id="sig-fallback",
+                symbol="AAPL",
+                signal="BUY",
+                side="BUY",
+                strategy="s",
+                strategy_version="vA",
+                tags=("fallback",),
+            )
+        )
+        forwarder.handle(
+            RiskEvaluated(
+                symbol="AAPL",
+                signal_id="sig-fallback",
+                approved=True,
+                adjusted_qty=3.0,
+            )
+        )
+        time.sleep(0.6)
+        forwarder.stop()
+
+        msg = send_fn.call_args_list[-1][0][0]
+        assert "FALLBACK SOURCE" in msg
+        assert "/buy" not in msg
+
+    def test_malformed_sizing_input_suppresses_command(self):
+        send_fn = MagicMock()
+        forwarder = TelegramAuditForwarder(send_fn)
+        forwarder._get_active_model_version = lambda: "vA"
+
+        forwarder.handle(
+            SignalGenerated(
+                signal_id="sig-bad-size",
+                symbol="AAPL",
+                signal="BUY",
+                side="BUY",
+                strategy="s",
+                strategy_version="vA",
+            )
+        )
+        forwarder.handle(
+            RiskEvaluated(
+                symbol="AAPL",
+                signal_id="sig-bad-size",
+                approved=True,
+                adjusted_qty=float("inf"),
+            )
+        )
+        time.sleep(0.6)
+        forwarder.stop()
+
+        msg = send_fn.call_args_list[-1][0][0]
+        assert "position size could not be determined" in msg.lower()
+        assert "/buy" not in msg
 
 
 class TestNotificationSubscriberExpanded:
