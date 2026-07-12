@@ -237,7 +237,7 @@ def main():
         print("[WARN] Target URL is SQLite -- this script is for migrating TO PostgreSQL.")
         print("   Proceeding anyway (useful for testing the migration logic)...")
 
-    print(f"[START] Migration: SQLite → {target_url.split('@')[-1] if '@' in target_url else target_url[:50]}")
+    print(f"[START] Migration: SQLite -> {target_url.split('@')[-1] if '@' in target_url else target_url[:50]}")
     print(f"   Mode: {'DRY RUN' if args.dry_run else 'LIVE MIGRATION'}")
     print()
 
