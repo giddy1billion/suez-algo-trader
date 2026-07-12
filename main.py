@@ -85,63 +85,24 @@ if hasattr(signal, 'SIGBREAK'):
 # ──────────────────────────────────────────────────────────────────────────
 
 def _preflight_check(log):
-    """Verify critical runtime dependencies and credentials at startup.
+    """Run structured preflight and abort on critical failures."""
+    from src.core.preflight import run_preflight, PreflightOutcome
 
-    Fails fast with actionable error messages so container crashes are
-    immediately diagnosable from logs rather than producing opaque tracebacks.
-    """
-    issues = []
+    report = run_preflight(settings)
 
-    # 1. Timezone data — the exact failure that caused the 6-day crash loop
-    try:
-        from zoneinfo import ZoneInfo
-        ZoneInfo("US/Eastern")
-        ZoneInfo("America/New_York")
-    except Exception as e:
-        issues.append(
-            f"Timezone data unavailable ({type(e).__name__}: {e}). "
-            "Install 'tzdata' package or use a non-slim base image."
+    for check in report.warnings:
+        log.warning(f"preflight.{check.name}", msg=check.message)
+
+    if report.outcome == PreflightOutcome.FAIL:
+        for check in report.critical_failures:
+            log.error("preflight.FAILED", check=check.name, issue=check.message)
+        log.error(
+            "preflight.abort",
+            msg=f"{len(report.critical_failures)} preflight check(s) failed — aborting startup",
         )
-
-    # 2. Alpaca API credentials
-    api_key = (settings.alpaca_live_api_key
-               if settings.trading_mode == TradingMode.LIVE
-               else settings.alpaca_paper_api_key)
-    secret = (settings.alpaca_live_secret_key
-              if settings.trading_mode == TradingMode.LIVE
-              else settings.alpaca_paper_secret_key)
-
-    if not api_key or not secret or api_key.startswith("your_"):
-        issues.append(
-            f"Alpaca {'LIVE' if settings.trading_mode == TradingMode.LIVE else 'PAPER'} "
-            "API credentials are missing or placeholder."
-        )
-
-    # 3. Telegram bot token (warn only — bot can run without it)
-    if not settings.telegram_bot_token:
-        log.warning("preflight.telegram_token_missing",
-                    msg="Telegram bot disabled — no TELEGRAM_BOT_TOKEN set")
-    elif not settings.telegram_chat_id:
-        log.warning("preflight.telegram_chat_id_missing",
-                    msg="Telegram notifications disabled — no TELEGRAM_CHAT_ID set")
-
-    # 4. Critical imports that have caused container failures before
-    try:
-        import pandas
-        import numpy
-        import httpx
-    except ImportError as e:
-        issues.append(f"Critical dependency missing: {e}")
-
-    # Report results
-    if issues:
-        for issue in issues:
-            log.error("preflight.FAILED", issue=issue)
-        log.error("preflight.abort",
-                  msg=f"{len(issues)} preflight check(s) failed — aborting startup")
         sys.exit(1)
 
-    log.info("preflight.passed", checks=4)
+    log.info("preflight.passed", checks=report.total_count, passed=report.passed_count)
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -999,6 +960,7 @@ def cmd_run(
     # Start WebSocket streaming if enabled
     _stream_data = {}  # Shared dict: symbol -> latest bar data
     _stream_lock = threading.Lock()
+    _stream_thread = None
     if enable_streaming:
         import asyncio as _asyncio
 
@@ -1654,6 +1616,15 @@ def cmd_run(
     runtime_manager.shutdown()
     if _scheduler:
         _scheduler.shutdown(wait=False)
+    if enable_streaming:
+        try:
+            broker.stop_market_data_streams()
+        except Exception as e:
+            logger.error("shutdown.market_stream_stop_failed", error=str(e))
+    if _stream_thread and _stream_thread.is_alive():
+        _stream_thread.join(timeout=5.0)
+        if _stream_thread.is_alive():
+            logger.warning("shutdown.stream_thread_join_timeout", timeout=5.0)
     broker.stop_trade_stream()
     notifier.notify_daily_summary(risk.get_daily_summary())
 
@@ -1677,6 +1648,10 @@ def cmd_run(
             loop.run_until_complete(telegram_bot.stop())
         except Exception:
             pass
+    if _telegram_thread and _telegram_thread.is_alive():
+        _telegram_thread.join(timeout=5.0)
+        if _telegram_thread.is_alive():
+            logger.warning("shutdown.telegram_thread_join_timeout", timeout=5.0)
     print(f"\n[OK] Bot stopped after {cycle_count} cycles. All state saved.")
 
 
