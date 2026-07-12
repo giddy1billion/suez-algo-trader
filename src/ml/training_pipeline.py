@@ -641,6 +641,11 @@ class TrainingPipeline:
         Computes targets per-symbol (avoiding cross-symbol leakage), concatenates,
         drops forward-looking columns, and returns the clean feature matrix.
 
+        Improvements over naive approach:
+        - Volatility-adaptive labeling threshold per symbol (avoids labeling noise as signal)
+        - Symbol one-hot encoding (lets model learn asset-specific patterns)
+        - Feature variance filtering (removes near-constant noise features)
+
         Returns:
             X: Feature matrix (n_samples, n_features)
             y: Encoded target vector
@@ -650,22 +655,40 @@ class TrainingPipeline:
         """
         # Combine all symbol data
         all_dfs = []
+        symbol_list = sorted(feature_data.keys())
         for symbol, df in feature_data.items():
             df_copy = df.copy()
             df_copy['_symbol'] = symbol
             all_dfs.append(df_copy)
 
         # Compute target per-symbol BEFORE concatenation to avoid cross-symbol leakage
+        # Use VOLATILITY-ADAPTIVE threshold: scale by each symbol's realized volatility
+        # so high-vol assets (BTC, ETH) don't get mislabeled as directional on noise moves
         forward_bars = 5
-        threshold = 0.005
+        base_threshold = 0.005
         for df_copy in all_dfs:
             df_copy['future_return'] = df_copy['close'].shift(-forward_bars) / df_copy['close'] - 1
+            # Adaptive threshold = max(base, 0.5 * rolling 20-bar realized vol * sqrt(forward_bars))
+            # This prevents labeling noise as signal in volatile assets
+            if 'close' in df_copy.columns and len(df_copy) > 20:
+                returns = df_copy['close'].pct_change()
+                rolling_vol = returns.rolling(20, min_periods=10).std().fillna(returns.std())
+                adaptive_threshold = np.maximum(
+                    base_threshold,
+                    0.5 * rolling_vol * np.sqrt(forward_bars)
+                )
+            else:
+                adaptive_threshold = base_threshold
             df_copy['target'] = np.where(
-                df_copy['future_return'] > threshold, 1,
-                np.where(df_copy['future_return'] < -threshold, -1, 0)
+                df_copy['future_return'] > adaptive_threshold, 1,
+                np.where(df_copy['future_return'] < -adaptive_threshold, -1, 0)
             )
 
         combined = pd.concat(all_dfs, ignore_index=True)
+
+        # Add symbol one-hot encoding so model can learn asset-specific patterns
+        for sym in symbol_list:
+            combined[f'_sym_{sym}'] = (combined['_symbol'] == sym).astype(np.float32)
 
         # Get feature columns (exclude meta and target)
         exclude_cols = {'target', 'future_return', '_symbol', '_sample_weight', '_from_experience',
@@ -693,7 +716,13 @@ class TrainingPipeline:
                 f"Insufficient training samples: {len(valid)} < {self._min_samples}"
             )
 
-        X = valid[feature_cols].values
+        # Feature variance filtering: remove near-constant features (zero-variance = noise)
+        X_raw = valid[feature_cols].values
+        col_std = np.nanstd(X_raw, axis=0)
+        variance_mask = col_std > 1e-8  # Keep features with meaningful variance
+        feature_cols = [fc for fc, keep in zip(feature_cols, variance_mask) if keep]
+        X = X_raw[:, variance_mask]
+
         y = valid['target'].values
 
         # Encode trading labels [-1,0,1] → model classes [0,1,2]
@@ -746,10 +775,11 @@ class TrainingPipeline:
         cv_scores = []
 
         for train_idx, val_idx in tscv.split(X_train_all):
-            # Skip warmup bars at start of test fold to avoid cold-start bias
-            embargo_bars = 100
+            # Adaptive embargo: min(10% of val fold, 50 bars) — avoids destroying
+            # early folds while still preventing autocorrelation leakage
+            embargo_bars = min(max(len(val_idx) // 10, 5), 50)
             val_idx = val_idx[embargo_bars:]
-            if len(val_idx) == 0:
+            if len(val_idx) < 20:
                 continue
 
             X_train, X_val = X_train_all[train_idx], X_train_all[val_idx]
@@ -757,15 +787,20 @@ class TrainingPipeline:
             w_train = w_train_all[train_idx] if w_train_all is not None else None
 
             model = XGBClassifier(
-                n_estimators=200,
-                max_depth=6,
-                learning_rate=0.05,
-                subsample=0.8,
-                colsample_bytree=0.8,
+                n_estimators=500,
+                max_depth=4,
+                learning_rate=0.02,
+                subsample=0.7,
+                colsample_bytree=0.6,
+                min_child_weight=10,
+                gamma=0.1,
+                reg_alpha=0.1,
+                reg_lambda=1.5,
                 use_label_encoder=False,
                 eval_metric='mlogloss',
                 random_state=42,
                 verbosity=0,
+                early_stopping_rounds=30,
             )
             model.fit(X_train, y_train, sample_weight=w_train,
                       eval_set=[(X_val, y_val)], verbose=False)
@@ -774,11 +809,15 @@ class TrainingPipeline:
 
         # Train final model on training portion ONLY (excludes holdout)
         final_model = XGBClassifier(
-            n_estimators=200,
-            max_depth=6,
-            learning_rate=0.05,
-            subsample=0.8,
-            colsample_bytree=0.8,
+            n_estimators=500,
+            max_depth=4,
+            learning_rate=0.02,
+            subsample=0.7,
+            colsample_bytree=0.6,
+            min_child_weight=10,
+            gamma=0.1,
+            reg_alpha=0.1,
+            reg_lambda=1.5,
             use_label_encoder=False,
             eval_metric='mlogloss',
             random_state=42,
@@ -787,8 +826,8 @@ class TrainingPipeline:
         final_model.fit(X_train_all, y_train_all, sample_weight=w_train_all, verbose=False)
 
         metrics = {
-            "cv_accuracy": float(np.mean(cv_scores)),
-            "cv_std": float(np.std(cv_scores)),
+            "cv_accuracy": float(np.mean(cv_scores)) if cv_scores else 0.0,
+            "cv_std": float(np.std(cv_scores)) if cv_scores else 0.0,
             "n_samples": len(X_train_all),
             "n_holdout_samples": len(X_holdout),
             "n_features": len(feature_cols),
@@ -799,10 +838,16 @@ class TrainingPipeline:
                 "down": int((y_train_all == DirectionEncoder.DOWN_CLASS).sum()),
             },
             "hyperparameters": {
-                "n_estimators": 200,
-                "max_depth": 6,
-                "learning_rate": 0.05,
-                "subsample": 0.8,
+                "n_estimators": 500,
+                "max_depth": 4,
+                "learning_rate": 0.02,
+                "subsample": 0.7,
+                "colsample_bytree": 0.6,
+                "min_child_weight": 10,
+                "gamma": 0.1,
+                "reg_alpha": 0.1,
+                "reg_lambda": 1.5,
+                "early_stopping_rounds": 30,
             },
         }
 
@@ -986,8 +1031,9 @@ class TrainingPipeline:
         for split_idx in range(n_splits):
             # Training: all data from start up to end of segment (split_idx + 1)
             train_end = segment_size * (split_idx + 1)
-            # Test: next segment
-            test_start = train_end
+            # Purge gap: skip forward_bars (5) to prevent label leakage at boundary
+            purge_gap = 5
+            test_start = train_end + purge_gap
             test_end = min(train_end + segment_size, n_total)
 
             if test_end - test_start < 20:
@@ -1001,11 +1047,15 @@ class TrainingPipeline:
 
             # Train fresh model on expanding window
             wf_model = XGBClassifier(
-                n_estimators=200,
-                max_depth=6,
-                learning_rate=0.05,
-                subsample=0.8,
-                colsample_bytree=0.8,
+                n_estimators=500,
+                max_depth=4,
+                learning_rate=0.02,
+                subsample=0.7,
+                colsample_bytree=0.6,
+                min_child_weight=10,
+                gamma=0.1,
+                reg_alpha=0.1,
+                reg_lambda=1.5,
                 use_label_encoder=False,
                 eval_metric='mlogloss',
                 random_state=42,

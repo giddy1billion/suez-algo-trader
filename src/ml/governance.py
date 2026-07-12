@@ -477,7 +477,20 @@ class ModelGovernance:
     # ------------------------------------------------------------------
 
     def _get_git_commit(self) -> str:
-        """Get current git commit hash. Tries git CLI then .git_commit file fallback."""
+        """Get current git commit hash.
+
+        Resolution order:
+        1. GIT_COMMIT / SOURCE_VERSION environment variable (set by CI/Docker)
+        2. git rev-parse HEAD (tried from multiple directories)
+        3. .git_commit file (embedded at Docker build time)
+        """
+        # Priority 1: Environment variables (most reliable in CI/Docker)
+        for env_var in ("GIT_COMMIT", "SOURCE_VERSION", "GITHUB_SHA"):
+            commit = os.environ.get(env_var, "").strip()
+            if commit:
+                return commit
+
+        # Priority 2: git CLI
         search_dirs = [
             os.path.dirname(os.path.abspath(__file__)),  # src/ml/
             os.getcwd(),  # working directory
@@ -495,7 +508,7 @@ class ModelGovernance:
             except Exception:
                 continue
 
-        # Fallback: read from .git_commit file (embedded at Docker build time)
+        # Priority 3: .git_commit file (embedded at Docker build time)
         for cwd in search_dirs:
             commit_file = os.path.join(cwd, ".git_commit")
             if os.path.exists(commit_file):
