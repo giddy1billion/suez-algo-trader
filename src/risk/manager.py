@@ -21,8 +21,8 @@ def _market_date_et() -> date:
     try:
         from zoneinfo import ZoneInfo
         return datetime.now(ZoneInfo("US/Eastern")).date()
-    except ImportError:
-        # Fallback: approximate ET as UTC-5
+    except (ImportError, KeyError):
+        # Fallback: approximate ET as UTC-5 (covers missing tzdata on slim images)
         return (datetime.now(timezone.utc) - timedelta(hours=5)).date()
 
 
