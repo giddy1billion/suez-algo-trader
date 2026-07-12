@@ -188,10 +188,20 @@ def check_critical_imports() -> CheckResult:
 
 
 def check_database_writable(settings) -> CheckResult:
-    """Verify database path is writable (for SQLite) or reachable."""
+    """Verify database path is writable (for SQLite) or URL is well-formed (PostgreSQL)."""
     import os
 
     db_url = settings.database_url
+
+    # Validate URL format
+    if not db_url.startswith(("sqlite", "postgresql")):
+        return CheckResult(
+            name="database_writable",
+            passed=False,
+            severity=CheckSeverity.CRITICAL,
+            message=f"Unsupported database URL scheme: {db_url[:30]}... (expected sqlite:// or postgresql://)",
+        )
+
     if db_url.startswith("sqlite"):
         # Extract path from sqlite:///path
         db_path = db_url.replace("sqlite:///", "")
@@ -218,6 +228,33 @@ def check_database_writable(settings) -> CheckResult:
                 passed=False,
                 severity=CheckSeverity.CRITICAL,
                 message=f"Cannot write to database directory: {db_dir} ({e})",
+            )
+
+    elif db_url.startswith("postgresql"):
+        # Validate PostgreSQL URL has required components
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(db_url)
+            if not parsed.hostname:
+                return CheckResult(
+                    name="database_writable",
+                    passed=False,
+                    severity=CheckSeverity.CRITICAL,
+                    message=f"PostgreSQL URL missing hostname: {db_url[:40]}...",
+                )
+            if not parsed.path or parsed.path == "/":
+                return CheckResult(
+                    name="database_writable",
+                    passed=False,
+                    severity=CheckSeverity.CRITICAL,
+                    message="PostgreSQL URL missing database name.",
+                )
+        except Exception as e:
+            return CheckResult(
+                name="database_writable",
+                passed=False,
+                severity=CheckSeverity.CRITICAL,
+                message=f"Invalid PostgreSQL URL: {e}",
             )
 
     return CheckResult(

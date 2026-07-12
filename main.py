@@ -526,6 +526,10 @@ def cmd_run(
     ))
     db = DatabaseManager(settings.database_url)
 
+    # Run Alembic migrations for PostgreSQL (SQLite uses create_all)
+    from src.utils.database import run_migrations, db_health_check
+    run_migrations(settings.database_url)
+
     # Initialize event-driven infrastructure
     from src.core.events import EventBus, OrderFilled, OrderRejected
     from src.core.state_machine import TradeManager
@@ -791,7 +795,8 @@ def cmd_run(
 
     # --- Event Persistence (durable event log for replay & auditing) ---
     from src.core.event_store import EventStore, EventPersistenceSubscriber
-    event_store = EventStore(db_path="data_cache/events.db")
+    _pg_url = settings.database_url if settings.database_url.startswith("postgresql") else None
+    event_store = EventStore(db_path="data_cache/events.db", database_url=_pg_url)
     persistence_subscriber = EventPersistenceSubscriber(event_store)
     persistence_subscriber.attach(event_bus)
     logger.info("event_store.initialized", session_id=event_store.session_id)
@@ -818,7 +823,7 @@ def cmd_run(
 
     # --- State Snapshotting (periodic persistence for fast recovery) ---
     from src.core.snapshots import SnapshotStore, SnapshotManager
-    snapshot_store = SnapshotStore(db_path="data_cache/snapshots.db")
+    snapshot_store = SnapshotStore(db_path="data_cache/snapshots.db", database_url=_pg_url)
     snapshot_manager = SnapshotManager(snapshot_store, event_store, snapshot_interval_events=500)
     # Wire snapshot manager to event bus so event-count trigger works
     event_bus.subscribe(None, snapshot_manager.on_event)
@@ -952,6 +957,9 @@ def cmd_run(
         _telegram_thread = threading.Thread(target=_run_telegram_bot, args=(telegram_bot,), daemon=True)
         _telegram_thread.start()
         logger.info("telegram.bot_started")
+        # NOTE: set_components() is called later (after full initialization) to inject
+        # broker, engine, risk etc. Commands gracefully deny with "Not connected" during
+        # this brief window. drop_pending_updates=True prevents stale messages from triggering.
 
     mode = "DRY RUN" if dry_run else ("PAPER" if broker.paper else "[LIVE]")
     logger.info("bot.started", mode=mode, strategy=strategy_name, symbols=len(symbols))
@@ -1640,6 +1648,13 @@ def cmd_run(
             snapshot_store.close()
     except Exception as e:
         logger.error("shutdown.snapshot_store_close_failed", error=str(e))
+
+    # Dispose shared engine pool (PostgreSQL connections)
+    try:
+        from src.utils.database import reset_engine
+        reset_engine()
+    except Exception as e:
+        logger.error("shutdown.engine_reset_failed", error=str(e))
 
     if telegram_bot:
         import asyncio

@@ -311,6 +311,13 @@ class Settings(BaseSettings):
     def is_paper(self) -> bool:
         return self.trading_mode == TradingMode.PAPER
 
+    @field_validator("trading_mode", mode="before")
+    @classmethod
+    def validate_trading_mode(cls, v) -> str:
+        if not v or (isinstance(v, str) and not v.strip()):
+            return TradingMode.PAPER
+        return v
+
     @field_validator("database_url", mode="before")
     @classmethod
     def validate_database_url(cls, v: str) -> str:

@@ -40,9 +40,9 @@ ENV ACTIVE_STRATEGY=momentum
 # redirect JIT cache to a writable directory.
 ENV NUMBA_CACHE_DIR=/app/data_cache/.numba_cache
 
-# Health check — verify process is alive and responsive
-HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
-    CMD python -c "import os, signal; os.kill(1, signal.SIG_DFL) or True" || exit 1
+# Health check — verify process is alive and critical imports work
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD python -c "import sqlalchemy, pandas; from pathlib import Path; assert Path('/app/data_cache').is_dir()" || exit 1
 
 ENTRYPOINT ["python", "main.py"]
 CMD ["--interval", "60"]

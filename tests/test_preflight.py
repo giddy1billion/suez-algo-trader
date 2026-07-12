@@ -210,3 +210,124 @@ class TestRunPreflight:
         assert report.outcome == PreflightOutcome.FAIL
         crit = [c for c in report.critical_failures if c.name == "alpaca_credentials"]
         assert len(crit) == 1
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Validator and edge-case tests
+# ──────────────────────────────────────────────────────────────────────────
+
+
+class TestSettingsValidators:
+    """Verify pydantic validators handle edge cases from empty env vars."""
+
+    def test_empty_trading_mode_defaults_to_paper(self):
+        """TRADING_MODE='' should not crash — falls back to paper."""
+        from config.settings import Settings, TradingMode
+
+        with patch.dict(os.environ, {"TRADING_MODE": ""}, clear=False):
+            s = Settings()
+            assert s.trading_mode == TradingMode.PAPER
+
+    def test_valid_trading_mode_accepted(self):
+        from config.settings import Settings, TradingMode
+
+        with patch.dict(os.environ, {"TRADING_MODE": "live"}, clear=False):
+            s = Settings()
+            assert s.trading_mode == TradingMode.LIVE
+
+    def test_empty_database_url_defaults_to_sqlite(self):
+        """DATABASE_URL='' should fall back to local SQLite."""
+        from config.settings import Settings
+
+        with patch.dict(os.environ, {"DATABASE_URL": ""}, clear=False):
+            s = Settings()
+            assert s.database_url == "sqlite:///data_cache/trading.db"
+
+    def test_whitespace_database_url_defaults_to_sqlite(self):
+        from config.settings import Settings
+
+        with patch.dict(os.environ, {"DATABASE_URL": "   "}, clear=False):
+            s = Settings()
+            assert s.database_url == "sqlite:///data_cache/trading.db"
+
+    def test_valid_postgresql_url_accepted(self):
+        from config.settings import Settings
+
+        pg_url = "postgresql://user:pass@host:5432/dbname"
+        with patch.dict(os.environ, {"DATABASE_URL": pg_url}, clear=False):
+            s = Settings()
+            assert s.database_url == pg_url
+
+
+class TestDatabaseWritablePostgres:
+    """Verify preflight validates PostgreSQL URLs structurally."""
+
+    @dataclass
+    class _MockSettings:
+        database_url: str = ""
+
+    def test_postgresql_valid_url_passes(self):
+        settings = self._MockSettings(database_url="postgresql://user:pass@host:5432/mydb")
+        result = check_database_writable(settings)
+        assert result.passed is True
+
+    def test_postgresql_missing_host_fails(self):
+        settings = self._MockSettings(database_url="postgresql:///mydb")
+        result = check_database_writable(settings)
+        assert result.passed is False
+        assert "hostname" in result.message
+
+    def test_postgresql_missing_dbname_fails(self):
+        settings = self._MockSettings(database_url="postgresql://user:pass@host:5432/")
+        result = check_database_writable(settings)
+        assert result.passed is False
+        assert "database name" in result.message
+
+    def test_unsupported_scheme_fails(self):
+        settings = self._MockSettings(database_url="mysql://host/db")
+        result = check_database_writable(settings)
+        assert result.passed is False
+        assert "Unsupported" in result.message
+
+
+class TestConfigServiceNone:
+    """Verify set_config_components works when config_service=None."""
+
+    def test_set_config_components_with_none_config_service(self):
+        import threading
+        from src.notifications.telegram_config_commands import set_config_components
+        import src.notifications.telegram_config_commands as mod
+
+        set_config_components(
+            settings=None,
+            strategy_store=None,
+            authorized_users=set(),
+            runtime_lock=threading.Lock(),
+            runtime_changes={},
+            config_service=None,
+        )
+        assert mod._config_service is None
+
+    def test_persist_config_value_noop_when_service_none(self):
+        import threading
+        from src.notifications.telegram_config_commands import (
+            set_config_components,
+            _persist_config_value,
+        )
+
+        set_config_components(
+            settings=None,
+            strategy_store=None,
+            authorized_users=set(),
+            runtime_lock=threading.Lock(),
+            runtime_changes={},
+            config_service=None,
+        )
+        # Should not raise — just return silently
+        _persist_config_value(
+            category="test",
+            key="x",
+            value="v",
+            changed_by="unit_test",
+            change_reason="testing",
+        )
