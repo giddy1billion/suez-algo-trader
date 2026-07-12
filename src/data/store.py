@@ -157,7 +157,10 @@ class DatabaseManager:
         from src.utils.database import create_db_engine
 
         self.engine = create_db_engine(database_url)
-        Base.metadata.create_all(self.engine)
+        # For PostgreSQL, schema is managed by Alembic migrations (bootstrap_database).
+        # Only use create_all() for SQLite where Alembic is not applied.
+        if not database_url.startswith("postgresql"):
+            Base.metadata.create_all(self.engine)
         self.SessionFactory = sessionmaker(bind=self.engine)
 
     def get_session(self) -> Session:

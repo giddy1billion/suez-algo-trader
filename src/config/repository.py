@@ -22,7 +22,9 @@ class ConfigurationRepository:
         from src.utils.database import create_db_engine
 
         self._engine = create_db_engine(database_url)
-        ConfigBase.metadata.create_all(self._engine)
+        # For PostgreSQL, schema is managed by Alembic migrations (bootstrap_database).
+        if not database_url.startswith("postgresql"):
+            ConfigBase.metadata.create_all(self._engine)
         self._session_factory = sessionmaker(bind=self._engine)
 
     def _get_session(self) -> Session:

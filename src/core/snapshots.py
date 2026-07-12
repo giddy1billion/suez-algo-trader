@@ -65,7 +65,9 @@ class SnapshotStore:
 
         from src.utils.database import create_db_engine
         self._engine = create_db_engine(url)
-        SnapshotBase.metadata.create_all(self._engine)
+        # For PostgreSQL, schema is managed by Alembic migrations (bootstrap_database).
+        if not url.startswith("postgresql"):
+            SnapshotBase.metadata.create_all(self._engine)
         self._session_factory = sessionmaker(bind=self._engine)
 
     def save_snapshot(

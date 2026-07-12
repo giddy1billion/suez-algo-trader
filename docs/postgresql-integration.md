@@ -20,14 +20,23 @@ DATABASE_URL=postgresql://user:password@host:5432/algo_trader?sslmode=require
 
 ### 2. Run Migrations
 
-For PostgreSQL, Alembic migrations run automatically on startup. For manual execution:
+For PostgreSQL, schema initialization is handled automatically by `bootstrap_database()` on startup. This function:
+
+- **Fresh database**: Runs Alembic `upgrade head` to create all tables
+- **Existing tables without version tracking**: Stamps the current revision, then upgrades
+- **Already versioned database**: Runs `upgrade head` (no-op if current)
+
+For manual execution or troubleshooting:
 
 ```bash
-# Run pending migrations
-DATABASE_URL="postgresql://..." python -c "from src.utils.database import run_migrations; run_migrations()"
+# Run pending migrations manually
+DATABASE_URL="postgresql://..." python -c "from src.utils.database import bootstrap_database; bootstrap_database()"
 
 # Or via Alembic CLI directly
 DATABASE_URL="postgresql://..." python -m alembic -c alembic.ini upgrade head
+
+# Stamp an existing database created by create_all() without running migrations
+DATABASE_URL="postgresql://..." python -m alembic -c alembic.ini stamp 001
 ```
 
 For SQLite, tables are created automatically via `create_all()` - no migration step is needed.

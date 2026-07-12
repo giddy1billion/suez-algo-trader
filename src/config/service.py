@@ -348,10 +348,17 @@ class ConfigurationService:
     # ─── Lifecycle ────────────────────────────────────────────────────────
 
     def stop(self):
-        """Stop the background refresh loop."""
+        """Stop the background refresh loop and dispose the repository engine."""
         self._running = False
         if self._refresh_thread and self._refresh_thread.is_alive():
             self._refresh_thread.join(timeout=5)
+            if self._refresh_thread.is_alive():
+                logger.warning("config_service.refresh_thread_join_timeout", timeout=5.0)
+        if hasattr(self, '_repo') and self._repo:
+            try:
+                self._repo.close()
+            except Exception as e:
+                logger.error("config_service.repo_close_failed", error=str(e))
 
     @property
     def event_bus(self) -> ConfigEventBus:

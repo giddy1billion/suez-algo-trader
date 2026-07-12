@@ -524,6 +524,14 @@ def cmd_run(
         default_stop_loss_pct=settings.default_stop_loss_pct,
         default_take_profit_pct=settings.default_take_profit_pct,
     ))
+    # Bootstrap PostgreSQL schema before any store initialization
+    try:
+        from src.utils.database import bootstrap_database
+        bootstrap_database(settings.database_url)
+    except Exception as e:
+        logger.error("main.bootstrap_database_failed", error=str(e))
+        raise SystemExit(f"Database bootstrap failed: {e}")
+
     db = DatabaseManager(settings.database_url)
 
     # Initialize event-driven infrastructure
@@ -1644,6 +1652,18 @@ def cmd_run(
             snapshot_store.close()
     except Exception as e:
         logger.error("shutdown.snapshot_store_close_failed", error=str(e))
+
+    try:
+        if db:
+            db.close()
+    except Exception as e:
+        logger.error("shutdown.db_close_failed", error=str(e))
+
+    try:
+        if config_service:
+            config_service.stop()
+    except Exception as e:
+        logger.error("shutdown.config_service_stop_failed", error=str(e))
 
     # Dispose shared engine pool (PostgreSQL connections)
     try:

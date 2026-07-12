@@ -40,6 +40,7 @@ from src.utils.database import (
     db_health_check,
     dispose_engine,
     run_migrations,
+    bootstrap_database,
     is_postgres,
     is_sqlite,
     SLOW_QUERY_THRESHOLD_SECONDS,
@@ -547,3 +548,153 @@ class TestLivePostgreSQL:
 
         assert len(errors) == 0, f"PG concurrent write errors: {errors}"
         db.close()
+
+
+# ---------------------------------------------------------------------------
+# Bootstrap Database Tests
+# ---------------------------------------------------------------------------
+
+class TestBootstrapDatabase:
+    """Tests for the bootstrap_database() unified startup path."""
+
+    def test_bootstrap_skips_sqlite(self, capsys):
+        """bootstrap_database() should skip entirely for SQLite URLs."""
+        bootstrap_database("sqlite:///test.db")
+        # Should not raise, no migration attempted
+
+    def test_bootstrap_skips_when_no_alembic_ini(self, capsys):
+        """bootstrap_database() should warn and skip if alembic.ini is missing."""
+        with patch("os.path.exists", return_value=False):
+            bootstrap_database("postgresql://localhost/test")
+        captured = capsys.readouterr()
+        assert "alembic_ini_not_found" in captured.out
+
+    def test_bootstrap_stamps_existing_db(self):
+        """bootstrap_database() should stamp an existing database that has tables but no alembic_version."""
+        mock_inspector = MagicMock()
+        mock_inspector.get_table_names.return_value = ["trades", "events", "snapshots"]
+
+        with patch("os.path.exists", return_value=True), \
+             patch("sqlalchemy.inspect", return_value=mock_inspector), \
+             patch("src.utils.database.create_db_engine") as mock_engine, \
+             patch("alembic.config.Config") as mock_config_cls, \
+             patch("alembic.command.stamp") as mock_stamp, \
+             patch("alembic.command.upgrade") as mock_upgrade:
+
+            mock_engine.return_value = MagicMock()
+            bootstrap_database("postgresql://localhost/testdb")
+
+            # Should stamp because tables exist but no alembic_version
+            mock_stamp.assert_called_once()
+            # Should also upgrade to head after stamping
+            mock_upgrade.assert_called_once()
+
+    def test_bootstrap_upgrades_existing_versioned_db(self):
+        """bootstrap_database() should just run upgrade if alembic_version table exists."""
+        mock_inspector = MagicMock()
+        mock_inspector.get_table_names.return_value = ["trades", "events", "alembic_version"]
+
+        with patch("os.path.exists", return_value=True), \
+             patch("sqlalchemy.inspect", return_value=mock_inspector), \
+             patch("src.utils.database.create_db_engine") as mock_engine, \
+             patch("alembic.config.Config") as mock_config_cls, \
+             patch("alembic.command.stamp") as mock_stamp, \
+             patch("alembic.command.upgrade") as mock_upgrade:
+
+            mock_engine.return_value = MagicMock()
+            bootstrap_database("postgresql://localhost/testdb")
+
+            # Should NOT stamp (alembic_version already exists)
+            mock_stamp.assert_not_called()
+            # Should upgrade
+            mock_upgrade.assert_called_once()
+
+    def test_bootstrap_fresh_db_runs_migration(self):
+        """bootstrap_database() should run upgrade on a fresh empty database."""
+        mock_inspector = MagicMock()
+        mock_inspector.get_table_names.return_value = []  # Fresh, empty
+
+        with patch("os.path.exists", return_value=True), \
+             patch("sqlalchemy.inspect", return_value=mock_inspector), \
+             patch("src.utils.database.create_db_engine") as mock_engine, \
+             patch("alembic.config.Config") as mock_config_cls, \
+             patch("alembic.command.stamp") as mock_stamp, \
+             patch("alembic.command.upgrade") as mock_upgrade:
+
+            mock_engine.return_value = MagicMock()
+            bootstrap_database("postgresql://localhost/testdb")
+
+            # Should NOT stamp (no existing tables to baseline)
+            mock_stamp.assert_not_called()
+            # Should upgrade to create everything
+            mock_upgrade.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# ON CONFLICT Dedup Tests
+# ---------------------------------------------------------------------------
+
+class TestEventDedup:
+    """Tests for EventStore's ON CONFLICT dedup behavior."""
+
+    def test_sqlite_dedup_prevents_duplicate(self, tmp_path):
+        """SQLite path: second persist of same event_id is silently ignored."""
+        store = EventStore(db_path=str(tmp_path / "events.db"))
+        event = Event(source="test")
+        store.persist(event)
+        store.persist(event)  # Should not raise
+
+        events = store.get_session_events(store.session_id)
+        # Only one record despite two persist calls
+        assert len(events) == 1
+        store.close()
+
+    def test_sqlite_dedup_concurrent(self, tmp_path):
+        """Multiple threads persisting the same event_id should result in exactly one record."""
+        store = EventStore(db_path=str(tmp_path / "events.db"))
+        event = Event(source="test")
+        errors = []
+
+        def persist_event():
+            try:
+                store.persist(event)
+            except Exception as e:
+                errors.append(str(e))
+
+        threads = [threading.Thread(target=persist_event) for _ in range(5)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+
+        events = store.get_session_events(store.session_id)
+        assert len(events) == 1
+        assert len(errors) == 0
+        store.close()
+
+
+# ---------------------------------------------------------------------------
+# Config Service Stop Tests
+# ---------------------------------------------------------------------------
+
+class TestConfigServiceStop:
+    """Tests for ConfigurationService.stop() closing the repository."""
+
+    def test_stop_closes_repo(self, sqlite_url):
+        """ConfigurationService.stop() should close the underlying repository."""
+        from src.config.service import ConfigurationService
+        repo = ConfigurationRepository(database_url=sqlite_url)
+        svc = ConfigurationService(repository=repo)
+        # Verify repo is open (engine is not None)
+        assert svc._repo._engine is not None
+        svc.stop()
+        # After stop, the engine pool should be disposed
+        # (disposed engines still exist as objects but pool is invalidated)
+
+    def test_stop_is_idempotent(self, sqlite_url):
+        """Calling stop() multiple times should not raise."""
+        from src.config.service import ConfigurationService
+        repo = ConfigurationRepository(database_url=sqlite_url)
+        svc = ConfigurationService(repository=repo)
+        svc.stop()
+        svc.stop()  # Should not raise

@@ -126,7 +126,9 @@ class EventStore:
 
         from src.utils.database import create_db_engine
         self._engine = create_db_engine(url)
-        EventBase.metadata.create_all(self._engine)
+        # For PostgreSQL, schema is managed by Alembic migrations (bootstrap_database).
+        if not url.startswith("postgresql"):
+            EventBase.metadata.create_all(self._engine)
         self._session_factory = sessionmaker(bind=self._engine)
 
         logger.info("EventStore initialized", session_id=self.session_id)
@@ -135,31 +137,50 @@ class EventStore:
         return self._session_factory()
 
     def persist(self, event: Event) -> None:
-        """Persist an event to the database. Deduplicates by event_id."""
+        """Persist an event to the database. Deduplicates by event_id.
+
+        Uses INSERT ... ON CONFLICT DO NOTHING on PostgreSQL to avoid TOCTOU race
+        conditions in multi-process deployments. Falls back to check-then-insert
+        for SQLite (single-writer, lock-protected).
+        """
         try:
             data = event.to_dict()
             event_type = data.pop("_type", type(event).__name__)
             payload_json = json.dumps(data, default=str)
 
+            record = EventRecord(
+                event_type=event_type,
+                event_id=event.event_id,
+                timestamp=event.timestamp.isoformat() if isinstance(event.timestamp, datetime) else str(event.timestamp),
+                source=event.source,
+                payload=payload_json,
+                session_id=self.session_id,
+            )
+
             with self._lock:
                 with self._get_session() as session:
-                    # Check if event already exists (dedup)
-                    existing = session.query(EventRecord.id).filter_by(
-                        event_id=event.event_id
-                    ).first()
-                    if existing:
-                        return
-
-                    record = EventRecord(
-                        event_type=event_type,
-                        event_id=event.event_id,
-                        timestamp=event.timestamp.isoformat() if isinstance(event.timestamp, datetime) else str(event.timestamp),
-                        source=event.source,
-                        payload=payload_json,
-                        session_id=self.session_id,
-                    )
-                    session.add(record)
-                    session.commit()
+                    dialect = session.bind.dialect.name if session.bind else "sqlite"
+                    if dialect == "postgresql":
+                        from sqlalchemy.dialects.postgresql import insert as pg_insert
+                        stmt = pg_insert(EventRecord).values(
+                            event_type=record.event_type,
+                            event_id=record.event_id,
+                            timestamp=record.timestamp,
+                            source=record.source,
+                            payload=record.payload,
+                            session_id=record.session_id,
+                        ).on_conflict_do_nothing(index_elements=["event_id"])
+                        session.execute(stmt)
+                        session.commit()
+                    else:
+                        # SQLite: check-then-insert under the threading lock
+                        existing = session.query(EventRecord.id).filter_by(
+                            event_id=event.event_id
+                        ).first()
+                        if existing:
+                            return
+                        session.add(record)
+                        session.commit()
         except Exception:
             logger.exception("Failed to persist event %s", type(event).__name__)
             raise
