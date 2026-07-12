@@ -219,10 +219,13 @@ class DatabaseManager:
     def log_signal(self, signal_data: dict) -> SignalLog:
         """Log a generated signal. Converts numpy types to native Python for PostgreSQL compat."""
         # Sanitize numpy scalars that psycopg2 cannot serialize
+        # (numpy 2.0+ removed float64 subclassing from Python float)
         sanitized = {}
         for k, v in signal_data.items():
             if hasattr(v, 'item'):  # numpy scalar → native Python
                 sanitized[k] = v.item()
+            elif hasattr(v, 'dtype'):  # numpy array-like (0-d or otherwise)
+                sanitized[k] = float(v)
             else:
                 sanitized[k] = v
         with self.get_session() as session:

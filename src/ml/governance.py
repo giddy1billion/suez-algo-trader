@@ -358,7 +358,23 @@ class ModelGovernance:
             min_expectancy = settings.model_min_expectancy
             min_precision = settings.model_min_precision
             min_backtest_trades = settings.model_min_backtest_trades
-        except Exception:
+            logger.info(
+                "governance.thresholds_loaded",
+                source="config.settings",
+                cv_accuracy=min_cv_accuracy,
+                sharpe=min_sharpe_ratio,
+                max_drawdown=max_drawdown_pct,
+                walk_forward_sharpe=min_walk_forward_sharpe,
+                monte_carlo_prob=min_monte_carlo_prob_profit,
+                min_precision=min_precision,
+                min_trades=min_backtest_trades,
+            )
+        except Exception as e:
+            logger.warning(
+                "governance.settings_fallback",
+                error=str(e),
+                msg="Using hardcoded default thresholds — verify config/settings.py is accessible",
+            )
             min_cv_accuracy = 0.52
             min_walk_forward_sharpe = 0.0
             min_monte_carlo_prob_profit = 0.50

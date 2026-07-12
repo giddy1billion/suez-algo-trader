@@ -232,8 +232,9 @@ class PortfolioBacktester:
             # Only compute EMAs where we have valid data (non-NaN)
             valid_mask = ~np.isnan(closes)
             if valid_mask.sum() >= slow_ema:
-                # Fill NaN with forward fill for EMA computation
-                filled = pd.Series(closes).ffill().bfill().values
+                # Forward-fill only — never backfill (bfill would leak future prices
+                # into the EMA warmup period, creating look-ahead bias).
+                filled = pd.Series(closes).ffill().values
                 ema_fast[symbol] = _compute_ema(filled, fast_ema)
                 ema_slow[symbol] = _compute_ema(filled, slow_ema)
             else:

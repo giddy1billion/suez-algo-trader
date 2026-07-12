@@ -75,23 +75,26 @@ def adapt_signal(
         tags.append("strong_signal")
 
     # Extract numeric indicators from the indicators dict
+    # Use hasattr(v, 'item') to catch numpy scalars (numpy 2.0+ removed float subclassing)
     numeric_indicators = {}
     general_features = {}
     if signal.indicators:
         for key, value in signal.indicators.items():
-            if isinstance(value, (int, float)) and value is not None:
+            if isinstance(value, (int, float)) or hasattr(value, 'item'):
                 numeric_indicators[key] = float(value)
+            elif value is None:
+                numeric_indicators[key] = None
             else:
                 general_features[key] = value
 
     # Preserve legacy SL/TP in features for the DecisionOrchestrator
     # (it may use strategy-proposed levels as hints)
     if signal.stop_loss is not None:
-        general_features["strategy_proposed_stop_loss"] = signal.stop_loss
+        general_features["strategy_proposed_stop_loss"] = float(signal.stop_loss)
     if signal.take_profit is not None:
-        general_features["strategy_proposed_take_profit"] = signal.take_profit
+        general_features["strategy_proposed_take_profit"] = float(signal.take_profit)
     if signal.price:
-        general_features["observed_price"] = signal.price
+        general_features["observed_price"] = float(signal.price)
 
     return TradeSignal(
         signal_id=f"SIG-{uuid.uuid4().hex[:8]}",
@@ -101,7 +104,7 @@ def adapt_signal(
         timeframe=strategy.timeframe,
         timestamp=datetime.now(timezone.utc),
         side=side,
-        signal_strength=signal.confidence,
+        signal_strength=float(signal.confidence),
         expected_direction=expected_direction,
         tags=tuple(tags),
         reason=signal.reason,

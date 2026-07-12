@@ -1279,10 +1279,30 @@ def cmd_run(
                 next_run_time=datetime.now() + _backtest_delay,
             )
 
-        # Automated ML training — runs immediately if model missing, else on schedule
+        # Automated ML training — runs immediately if model missing AND no recent training
         if settings.auto_train_interval_hours > 0:
-            # Run immediately on startup if no model exists (bootstrap)
-            _needs_bootstrap = not os.path.exists(settings.ml_model_path)
+            # Check both the active model path AND the registry for recent training attempts.
+            # This prevents wasteful re-training loops when a model was trained but rejected
+            # by governance (file exists in registry but not at ml_model_path).
+            _has_active_model = os.path.exists(settings.ml_model_path)
+            _has_recent_training = False
+            if not _has_active_model:
+                try:
+                    from src.ml.model_registry import ModelRegistry
+                    _bootstrap_registry = ModelRegistry(settings.ml_models_dir)
+                    _latest = _bootstrap_registry.get_latest_version()
+                    if _latest is not None:
+                        # Registry has entries — a model was trained recently (even if rejected)
+                        _has_recent_training = True
+                        logger.info(
+                            "scheduler.ml_bootstrap_skipped",
+                            msg="No active model but registry has entries — skipping immediate retrain",
+                            latest_version=_latest,
+                        )
+                except Exception as e:
+                    logger.debug("scheduler.ml_bootstrap_registry_check_error", error=str(e))
+
+            _needs_bootstrap = not _has_active_model and not _has_recent_training
             _scheduler.add_job(
                 _auto_train,
                 IntervalTrigger(hours=settings.auto_train_interval_hours),
@@ -1290,7 +1310,9 @@ def cmd_run(
                 next_run_time=datetime.now() if _needs_bootstrap else None,
             )
             if _needs_bootstrap:
-                logger.info("scheduler.ml_bootstrap", msg="No model found, training immediately")
+                logger.info("scheduler.ml_bootstrap", msg="No model found and no registry entries, training immediately")
+            elif not _has_active_model:
+                logger.info("scheduler.ml_next_scheduled", hours=settings.auto_train_interval_hours)
 
         # Automated parameter sweep
         if settings.auto_sweep_interval_hours > 0:

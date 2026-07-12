@@ -179,8 +179,8 @@ class MomentumStrategy(BaseStrategy):
                 confidence_factors.append(0.8)
                 reasons.append(f"Volume spike confirms sell ({vol_ratio:.1f}x)")
 
-        # Calculate confidence
-        confidence = np.mean(confidence_factors) if confidence_factors else 0.0
+        # Calculate confidence (cast to native float for PostgreSQL compatibility)
+        confidence = float(np.mean(confidence_factors)) if confidence_factors else 0.0
 
         # Require minimum confirming indicators for a BUY/SELL signal.
         # A single weak indicator (e.g., just "below slow EMA") should not
@@ -202,7 +202,8 @@ class MomentumStrategy(BaseStrategy):
             signal = Signal.HOLD
 
         # Calculate stop-loss and take-profit using ATR
-        atr = latest['atr'] if not pd.isna(latest['atr']) else price * 0.02
+        atr = float(latest['atr']) if not pd.isna(latest['atr']) else float(price) * 0.02
+        price = float(price)
         if signal in (Signal.BUY, Signal.STRONG_BUY):
             stop_loss = price - (atr * self.atr_sl_multiplier)
             take_profit = price + (atr * self.atr_tp_multiplier)
@@ -212,6 +213,9 @@ class MomentumStrategy(BaseStrategy):
         else:
             stop_loss = None
             take_profit = None
+
+        rsi = float(latest['rsi'])
+        vol_ratio = latest.get('volume_ratio', pd.NA)
 
         return LegacyTradeSignal(
             symbol=symbol,
@@ -223,11 +227,11 @@ class MomentumStrategy(BaseStrategy):
             reason=" | ".join(reasons),
             indicators={
                 "rsi": round(rsi, 2),
-                "macd_hist": round(latest['macd_hist'], 4),
-                "ema_fast": round(latest['ema_fast'], 4),
-                "ema_slow": round(latest['ema_slow'], 4),
+                "macd_hist": round(float(latest['macd_hist']), 4),
+                "ema_fast": round(float(latest['ema_fast']), 4),
+                "ema_slow": round(float(latest['ema_slow']), 4),
                 "atr": round(atr, 4),
-                "volume_ratio": round(vol_ratio, 2) if not pd.isna(vol_ratio) else None,
-                "score": score,
+                "volume_ratio": round(float(vol_ratio), 2) if not pd.isna(vol_ratio) else None,
+                "score": int(score),
             },
         )
