@@ -228,11 +228,11 @@ class TestTelegramAuditForwarder:
         forwarder = TelegramAuditForwarder(failing_send)
 
         forwarder.handle(RiskHalt(reason="test", level="WARNING"))
-        time.sleep(0.5)
+        time.sleep(1.5)
         forwarder.stop()
 
-        # Should not crash; event attempted but failed
-        assert failing_send.call_count == 1
+        # Should not crash; event retried MAX_SEND_RETRIES times (Finding 3)
+        assert failing_send.call_count == TelegramAuditForwarder.MAX_SEND_RETRIES
 
 
 class TestTelegramLogHandler:

@@ -19,6 +19,38 @@ logger = logging.getLogger(__name__)
 # Event schema version — increment when event structure changes
 SCHEMA_VERSION = "1.0.0"
 
+# Migration hooks registry: version → callable(data_dict) → data_dict
+# Each hook transforms event data from its version to the next.
+# Example: _MIGRATIONS["0.9.0"] = lambda d: {**d, "new_field": "default"}
+_MIGRATIONS: dict[str, Callable] = {}
+
+
+def register_event_migration(from_version: str, migration_fn: Callable) -> None:
+    """Register a migration hook for event deserialization (Finding 5).
+
+    When deserializing events serialized at an older schema version,
+    registered migrations are applied in version order to bring the
+    data dict up to the current SCHEMA_VERSION.
+
+    Args:
+        from_version: The schema version this migration upgrades FROM.
+        migration_fn: Callable that takes a data dict and returns
+                      the upgraded data dict.
+    """
+    _MIGRATIONS[from_version] = migration_fn
+
+
+def _apply_migrations(data: dict[str, Any], stored_version: str) -> dict[str, Any]:
+    """Apply migration hooks to bring data from stored_version to current."""
+    if stored_version == SCHEMA_VERSION:
+        return data
+    # Sort migration keys and apply sequentially
+    sorted_versions = sorted(_MIGRATIONS.keys())
+    for ver in sorted_versions:
+        if ver >= stored_version and ver < SCHEMA_VERSION:
+            data = _MIGRATIONS[ver](data)
+    return data
+
 
 # ---------------------------------------------------------------------------
 # Base Event
@@ -44,10 +76,24 @@ class Event:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Event":
-        """Deserialize event from a dictionary (base implementation)."""
+        """Deserialize event from a dictionary (base implementation).
+
+        Finding 5: Validates _schema_version and applies any registered
+        migration hooks to bring old-format data up to the current
+        schema before constructing the event object.
+        """
         data = data.copy()
         data.pop("_type", None)
-        data.pop("_schema_version", None)  # Remove version before constructing
+        stored_version = data.pop("_schema_version", SCHEMA_VERSION)
+
+        # Validate and migrate (Finding 5)
+        if stored_version != SCHEMA_VERSION:
+            logger.info(
+                "event.schema_migration",
+                extra={"from_version": stored_version, "to_version": SCHEMA_VERSION},
+            )
+            data = _apply_migrations(data, stored_version)
+
         ts = data.get("timestamp")
         if isinstance(ts, str):
             data["timestamp"] = datetime.fromisoformat(ts)

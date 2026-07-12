@@ -52,6 +52,7 @@ from src.ml.model_registry import ModelRegistry
 from src.notifications.signal_formatter import SignalPackage, format_signal_message
 from src.notifications.correlation_store import (
     InMemoryCorrelationStore,
+    SqliteCorrelationStore,
     CorrelationMetrics,
 )
 
@@ -257,6 +258,11 @@ class TelegramAuditForwarder:
           and reconciled when the signal arrives.
     """
 
+    # Maximum retry attempts for Telegram delivery before dead-lettering
+    MAX_SEND_RETRIES = 3
+    # Base delay between retries (exponential backoff)
+    RETRY_BASE_DELAY = 0.5
+
     def __init__(
         self,
         send_func: Callable[[str], None],
@@ -265,6 +271,7 @@ class TelegramAuditForwarder:
         bracket_orders_supported_provider: Optional[Callable[[], bool]] = None,
         correlation_store: Optional[InMemoryCorrelationStore] = None,
         timeout_check_interval: float = 5.0,
+        max_send_retries: int = 3,
     ) -> None:
         """
         Args:
@@ -277,6 +284,14 @@ class TelegramAuditForwarder:
                              Defaults to a bounded in-memory store.
             timeout_check_interval: How often (seconds) the background timer
                                    checks for verdict timeouts.
+            max_send_retries: Maximum delivery attempts before dead-lettering
+                            (Finding 3).
+
+        Delivery semantics (documented behavior change):
+            With InMemoryCorrelationStore: at-most-once delivery.
+            With SqliteCorrelationStore: at-least-once delivery.
+            Dedup keys are always persisted BEFORE dispatch to prevent
+            double-sends on crash (persist-before-dispatch, Finding 6).
         """
         self._send = send_func
         self._runtime_state = runtime_state or RuntimeState()
@@ -294,6 +309,7 @@ class TelegramAuditForwarder:
         self._risk_verdict_timeout_seconds = max(1.0, risk_verdict_timeout_seconds)
         self._bracket_orders_supported_provider = bracket_orders_supported_provider
         self._timeout_check_interval = max(0.5, timeout_check_interval)
+        self._max_send_retries = max(1, max_send_retries)
 
         # Pluggable correlation store (default: in-memory with TTL)
         self._store = correlation_store or InMemoryCorrelationStore()
@@ -365,7 +381,7 @@ class TelegramAuditForwarder:
         if not signal_id:
             signal_id = f"sig:{event.event_id}"
         self._store.store_signal(signal_id, event)
-        self._store.set_deadline(signal_id, time.time() + self._risk_verdict_timeout_seconds)
+        self._store.set_deadline(signal_id, time.monotonic() + self._risk_verdict_timeout_seconds)
 
         # Check if a RiskEvaluated arrived out-of-order before this signal
         late_risk = self._store.pop_late_risk(signal_id)
@@ -384,9 +400,15 @@ class TelegramAuditForwarder:
             self._store.map_contract_to_signal(event.contract_id, signal_id)
 
     def _emit_no_verdict_timeouts(self) -> None:
-        """Check for expired deadlines and emit timeout warnings."""
-        now = time.time()
-        expired = self._store.get_expired_deadlines(now)
+        """Check for expired deadlines and emit timeout warnings.
+
+        Uses expire_and_cancel_deadlines for atomicity (Finding 2):
+        the deadline is removed in the same operation that reads it,
+        preventing the race where cancel_deadline (from a verdict
+        arriving concurrently) interleaves with get_expired_deadlines.
+        """
+        now = time.monotonic()
+        expired = self._store.expire_and_cancel_deadlines(now)
         for signal_id in expired:
             signal_event = self._store.get_signal(signal_id)
             if signal_event:
@@ -398,8 +420,6 @@ class TelegramAuditForwarder:
                 )
                 self._enqueue_message(warning)
                 self._store.metrics.timeouts_emitted += 1
-            # Atomically cancel the deadline
-            self._store.cancel_deadline(signal_id)
 
     def _timeout_loop(self) -> None:
         """Proactive background timer that checks for verdict timeouts."""
@@ -438,11 +458,17 @@ class TelegramAuditForwarder:
             self._store.metrics.duplicates_suppressed += 1
             return
 
-        rendered = format_signal_message(intent)
-        self._enqueue_message(rendered)
+        # Persist-before-dispatch (Finding 6): mark as sent BEFORE enqueuing
+        # to prevent duplicate delivery on crash.  If the process crashes
+        # after mark_sent but before actual Telegram delivery, the message
+        # will be in the dead-letter queue for retry (at-least-once with
+        # SqliteCorrelationStore).
         self._store.mark_sent(intent.trade_intent_id)
 
-        # Atomically cancel the pending deadline for this signal
+        rendered = format_signal_message(intent)
+        self._enqueue_message(rendered)
+
+        # Cancel the pending deadline for this signal
         if signal_id:
             self._store.cancel_deadline(signal_id)
 
@@ -585,15 +611,47 @@ class TelegramAuditForwarder:
         return f"intent:{digest}"
 
     def _sender_loop(self) -> None:
-        """Background thread that drains the queue and sends to Telegram."""
+        """Background thread that drains the queue and sends to Telegram.
+
+        Finding 3: Retry delivery with exponential backoff.  If all
+        retries fail and the store supports dead-lettering
+        (SqliteCorrelationStore), the message is persisted for later
+        retry.  Failures are logged and counted in metrics.
+        """
         while self._running:
             try:
                 message = self._queue.get(timeout=1.0)
-                try:
-                    self._send(message)
-                    self._events_sent += 1
-                except Exception:
-                    pass  # Silently handle send failures to avoid recursion
+                sent = False
+                last_error = ""
+                for attempt in range(self._max_send_retries):
+                    try:
+                        self._send(message)
+                        self._events_sent += 1
+                        sent = True
+                        break
+                    except Exception as exc:
+                        last_error = f"{type(exc).__name__}: {exc}"
+                        self._store.metrics.send_failures += 1
+                        logger.warning(
+                            "telegram_audit.send_retry",
+                            extra={
+                                "attempt": attempt + 1,
+                                "max_retries": self._max_send_retries,
+                                "error": last_error,
+                            },
+                        )
+                        if attempt < self._max_send_retries - 1:
+                            time.sleep(self.RETRY_BASE_DELAY * (2 ** attempt))
+
+                if not sent:
+                    logger.error(
+                        "telegram_audit.send_exhausted",
+                        extra={"error": last_error, "message_preview": message[:100]},
+                    )
+                    # Dead-letter persistence (Finding 3)
+                    if hasattr(self._store, "add_dead_letter"):
+                        self._store.add_dead_letter(message, last_error)
+
                 # Small delay to avoid Telegram rate limits (30 msg/sec max)
                 time.sleep(0.05)
             except queue.Empty:
@@ -621,6 +679,8 @@ class TelegramAuditForwarder:
             "events_suppressed": self._events_suppressed,
             "queue_size": self._queue.qsize(),
             "running": self._running,
+            "send_failures": self._store.metrics.send_failures,
+            "dead_letters": self._store.metrics.dead_letters,
         }
 
     @property
