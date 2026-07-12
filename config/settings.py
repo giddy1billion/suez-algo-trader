@@ -311,6 +311,13 @@ class Settings(BaseSettings):
     def is_paper(self) -> bool:
         return self.trading_mode == TradingMode.PAPER
 
+    @field_validator("database_url", mode="before")
+    @classmethod
+    def validate_database_url(cls, v: str) -> str:
+        if not v or not v.strip():
+            return "sqlite:///data_cache/trading.db"
+        return v
+
     @field_validator("max_position_size_pct", "max_daily_loss_pct", "max_portfolio_exposure", "max_single_stock_pct", "default_stop_loss_pct", "default_take_profit_pct")
     @classmethod
     def validate_percentage(cls, v: float) -> float:
