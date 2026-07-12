@@ -36,6 +36,7 @@ _strategy_store = None
 _authorized_users: set[int] = set()
 _runtime_lock = None
 _runtime_changes = None
+_config_service = None
 
 ENV_FILE = Path(".env")
 
@@ -46,14 +47,63 @@ def set_config_components(
     authorized_users: set[int],
     runtime_lock: threading.Lock,
     runtime_changes: dict,
+    config_service=None,
 ):
     """Inject dependencies into this module."""
-    global _settings, _strategy_store, _authorized_users, _runtime_lock, _runtime_changes
+    global _settings, _strategy_store, _authorized_users, _runtime_lock, _runtime_changes, _config_service
     _settings = settings
     _strategy_store = strategy_store
     _authorized_users = authorized_users
     _runtime_lock = runtime_lock
     _runtime_changes = runtime_changes
+    _config_service = config_service
+
+
+def _persist_config_value(
+    *,
+    category: str,
+    key: str,
+    value,
+    changed_by: str,
+    change_reason: str,
+    value_type: Optional[str] = None,
+) -> None:
+    if _config_service is None:
+        return
+
+    updated = _config_service.set(
+        category=category,
+        key=key,
+        value=value,
+        changed_by=changed_by,
+        change_reason=change_reason,
+        value_type=value_type,
+    )
+    if not updated:
+        raise RuntimeError(f"persist_failed:{category}.{key}")
+
+
+def _apply_setting_update(
+    field_name: str,
+    runtime_value,
+    *,
+    category: str,
+    key: str,
+    changed_by: str,
+    change_reason: str,
+    value_type: Optional[str] = None,
+    stored_value=None,
+) -> None:
+    persist_value = runtime_value if stored_value is None else stored_value
+    _persist_config_value(
+        category=category,
+        key=key,
+        value=persist_value,
+        changed_by=changed_by,
+        change_reason=change_reason,
+        value_type=value_type,
+    )
+    setattr(_settings, field_name, runtime_value)
 
 
 def _is_authorized(message: Message) -> bool:
@@ -111,6 +161,11 @@ async def cmd_setalpaca(message: Message):
         return
 
     sub_cmd = parts[1].lower()
+    actor = (
+        f"telegram:{message.from_user.id}"
+        if message.from_user
+        else "telegram:unknown"
+    )
 
     if sub_cmd in ("paper", "live"):
         if len(parts) < 4:
@@ -132,12 +187,48 @@ async def cmd_setalpaca(message: Message):
             )
             return
 
-        if sub_cmd == "paper":
-            _settings.alpaca_paper_api_key = api_key
-            _settings.alpaca_paper_secret_key = secret_key
-        else:
-            _settings.alpaca_live_api_key = api_key
-            _settings.alpaca_live_secret_key = secret_key
+        try:
+            if sub_cmd == "paper":
+                _apply_setting_update(
+                    "alpaca_paper_api_key",
+                    api_key,
+                    category="broker",
+                    key="alpaca_paper_api_key",
+                    changed_by=actor,
+                    change_reason="telegram:/setalpaca paper",
+                    value_type="str",
+                )
+                _apply_setting_update(
+                    "alpaca_paper_secret_key",
+                    secret_key,
+                    category="broker",
+                    key="alpaca_paper_secret_key",
+                    changed_by=actor,
+                    change_reason="telegram:/setalpaca paper",
+                    value_type="str",
+                )
+            else:
+                _apply_setting_update(
+                    "alpaca_live_api_key",
+                    api_key,
+                    category="broker",
+                    key="alpaca_live_api_key",
+                    changed_by=actor,
+                    change_reason="telegram:/setalpaca live",
+                    value_type="str",
+                )
+                _apply_setting_update(
+                    "alpaca_live_secret_key",
+                    secret_key,
+                    category="broker",
+                    key="alpaca_live_secret_key",
+                    changed_by=actor,
+                    change_reason="telegram:/setalpaca live",
+                    value_type="str",
+                )
+        except RuntimeError:
+            await message.answer("❌ Failed to persist credential update.")
+            return
 
         # Delete the user's message containing secrets (security)
         try:
@@ -160,7 +251,19 @@ async def cmd_setalpaca(message: Message):
             return
 
         old_feed = _settings.alpaca_data_feed
-        _settings.alpaca_data_feed = feed
+        try:
+            _apply_setting_update(
+                "alpaca_data_feed",
+                feed,
+                category="exchange",
+                key="data_feed",
+                changed_by=actor,
+                change_reason="telegram:/setalpaca feed",
+                value_type="str",
+            )
+        except RuntimeError:
+            await message.answer("❌ Failed to persist data feed update.")
+            return
 
         await message.answer(
             f"✅ <b>Data feed updated</b>\n"
@@ -217,10 +320,30 @@ async def cmd_setalpaca(message: Message):
             )
             return
 
-        if mode == "paper":
-            _settings.alpaca_paper_base_url = url
-        else:
-            _settings.alpaca_live_base_url = url
+        try:
+            if mode == "paper":
+                _apply_setting_update(
+                    "alpaca_paper_base_url",
+                    url,
+                    category="broker",
+                    key="alpaca_paper_base_url",
+                    changed_by=actor,
+                    change_reason="telegram:/setalpaca url paper",
+                    value_type="str",
+                )
+            else:
+                _apply_setting_update(
+                    "alpaca_live_base_url",
+                    url,
+                    category="broker",
+                    key="alpaca_live_base_url",
+                    changed_by=actor,
+                    change_reason="telegram:/setalpaca url live",
+                    value_type="str",
+                )
+        except RuntimeError:
+            await message.answer("❌ Failed to persist broker URL update.")
+            return
 
         await message.answer(
             f"✅ <b>Alpaca {mode} URL updated</b>\n  <code>{url}</code>",
@@ -264,6 +387,11 @@ async def cmd_setmode(message: Message):
         return
 
     old_mode = _settings.trading_mode.value
+    actor = (
+        f"telegram:{message.from_user.id}"
+        if message.from_user
+        else "telegram:unknown"
+    )
     if new_mode == old_mode:
         await message.answer(f"Already in {new_mode} mode.")
         return
@@ -279,6 +407,22 @@ async def cmd_setmode(message: Message):
             )
             return
 
+    try:
+        _apply_setting_update(
+            "trading_mode",
+            TradingMode(new_mode),
+            category="trading",
+            key="trading_mode",
+            changed_by=actor,
+            change_reason="telegram:/setmode",
+            value_type="str",
+            stored_value=new_mode,
+        )
+    except RuntimeError:
+        await message.answer("❌ Failed to persist trading mode change.")
+        return
+
+    if new_mode == "live":
         await message.answer(
             f"⚠️ <b>SWITCHING TO LIVE TRADING</b>\n\n"
             f"🔴 This will use REAL MONEY.\n"
@@ -294,8 +438,6 @@ async def cmd_setmode(message: Message):
             f"Mode changed: {old_mode} → <b>PAPER</b>",
             parse_mode=ParseMode.HTML,
         )
-
-    _settings.trading_mode = TradingMode(new_mode)
 
 
 # =============================================================================
@@ -929,9 +1071,33 @@ async def cmd_applystrats(message: Message):
 
     config_str = _strategy_store.get_multi_config_string()
 
-    # Update settings
-    _settings.multi_strategy_config = config_str
-    _settings.active_strategy = "multi"
+    actor = (
+        f"telegram:{message.from_user.id}"
+        if message.from_user
+        else "telegram:unknown"
+    )
+    try:
+        _apply_setting_update(
+            "multi_strategy_config",
+            config_str,
+            category="trading",
+            key="multi_strategy_config",
+            changed_by=actor,
+            change_reason="telegram:/applystrats",
+            value_type="str",
+        )
+        _apply_setting_update(
+            "active_strategy",
+            "multi",
+            category="trading",
+            key="active_strategy",
+            changed_by=actor,
+            change_reason="telegram:/applystrats",
+            value_type="str",
+        )
+    except RuntimeError:
+        await message.answer("❌ Failed to persist strategy application.")
+        return
 
     # Signal main loop
     if _runtime_lock and _runtime_changes is not None:

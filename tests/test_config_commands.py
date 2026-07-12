@@ -10,6 +10,7 @@ import pytest
 
 from src.notifications.telegram_config_commands import (
     _mask_secret,
+    _apply_setting_update,
     _generate_env_content,
     set_config_components,
 )
@@ -118,3 +119,71 @@ class TestSetConfigComponents:
         assert mod._authorized_users == {123, 456}
         assert mod._runtime_lock is lock
         assert mod._runtime_changes is changes
+
+
+class TestConfigAuditPersistence:
+    def test_apply_setting_update_persists_to_config_service(self):
+        from config.settings import Settings, TradingMode
+
+        settings = Settings()
+        lock = threading.Lock()
+        config_service = MagicMock()
+        config_service.set.return_value = True
+
+        set_config_components(
+            settings=settings,
+            strategy_store=None,
+            authorized_users=set(),
+            runtime_lock=lock,
+            runtime_changes={},
+            config_service=config_service,
+        )
+
+        _apply_setting_update(
+            "trading_mode",
+            TradingMode.LIVE,
+            category="trading",
+            key="trading_mode",
+            changed_by="telegram:123",
+            change_reason="test",
+            value_type="str",
+            stored_value="live",
+        )
+
+        assert settings.trading_mode == TradingMode.LIVE
+        config_service.set.assert_called_once_with(
+            category="trading",
+            key="trading_mode",
+            value="live",
+            changed_by="telegram:123",
+            change_reason="test",
+            value_type="str",
+        )
+
+    def test_apply_setting_update_rejects_failed_persistence(self):
+        from config.settings import Settings
+
+        settings = Settings()
+        lock = threading.Lock()
+        config_service = MagicMock()
+        config_service.set.return_value = False
+
+        set_config_components(
+            settings=settings,
+            strategy_store=None,
+            authorized_users=set(),
+            runtime_lock=lock,
+            runtime_changes={},
+            config_service=config_service,
+        )
+
+        with pytest.raises(RuntimeError, match="persist_failed:trading.trading_mode"):
+            _apply_setting_update(
+                "trading_mode",
+                "live",
+                category="trading",
+                key="trading_mode",
+                changed_by="telegram:123",
+                change_reason="test",
+                value_type="str",
+            )
