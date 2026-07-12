@@ -409,7 +409,11 @@ class TestCanonicalTradeIntentPipeline:
 
     def test_no_verdict_timeout_emits_explicit_followup(self):
         send_fn = MagicMock()
-        forwarder = TelegramAuditForwarder(send_fn, risk_verdict_timeout_seconds=1.0)
+        forwarder = TelegramAuditForwarder(
+            send_fn,
+            risk_verdict_timeout_seconds=1.0,
+            timeout_check_interval=0.5,
+        )
         forwarder._get_active_model_version = lambda: "v1"
 
         forwarder.handle(
@@ -422,9 +426,7 @@ class TestCanonicalTradeIntentPipeline:
                 strategy_version="v1",
             )
         )
-        time.sleep(1.2)
-        forwarder.handle(RiskHalt(reason="tick", level="WARNING"))  # trigger timeout flush
-        time.sleep(0.7)
+        time.sleep(2.0)  # Wait for background timer to fire after 1s timeout
         forwarder.stop()
 
         combined = "\n".join(call[0][0] for call in send_fn.call_args_list)

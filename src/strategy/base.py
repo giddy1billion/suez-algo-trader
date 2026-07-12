@@ -69,7 +69,7 @@ class TradeSignal:
     """
 
     # ── Identity ──
-    signal_id: str = field(default_factory=lambda: f"SIG-{uuid.uuid4().hex[:8]}")
+    signal_id: str = field(default_factory=lambda: f"SIG-{uuid.uuid4().hex}")
     strategy_id: str = ""
     strategy_version: str = "1.0.0"
 

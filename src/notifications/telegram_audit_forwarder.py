@@ -8,6 +8,14 @@ level logs to Telegram.
 Design: Forward all events to Telegram, except when trading is paused.
 Trading-related events (signals, orders, trades) are suppressed when paused,
 but system events (health, errors) are still sent.
+
+Correlation & Dedup:
+    All correlation state (signals, deadlines, dedup keys) lives in a
+    pluggable CorrelationStore with TTL-based cleanup.  A proactive
+    background timer checks for timeouts independently of event arrival.
+    Out-of-order delivery (RiskEvaluated arriving before SignalGenerated)
+    is buffered and reconciled.  Deduplication covers both approvals
+    and rejections.
 """
 
 import asyncio
@@ -42,6 +50,10 @@ from src.market.constraints import get_constraints
 from src.market.registry import classify_symbol
 from src.ml.model_registry import ModelRegistry
 from src.notifications.signal_formatter import SignalPackage, format_signal_message
+from src.notifications.correlation_store import (
+    InMemoryCorrelationStore,
+    CorrelationMetrics,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -236,6 +248,13 @@ class TelegramAuditForwarder:
 
     Uses a background sender thread with a queue to avoid blocking the
     main trading loop on Telegram API latency.
+
+    Correlation / Dedup / Timeout Design:
+        - All state is held in a CorrelationStore (TTL-bounded, replaceable).
+        - A background timer thread proactively checks for verdict timeouts.
+        - Deduplication covers both approved AND rejected intents.
+        - Out-of-order RiskEvaluated (before SignalGenerated) is buffered
+          and reconciled when the signal arrives.
     """
 
     def __init__(
@@ -244,6 +263,8 @@ class TelegramAuditForwarder:
         runtime_state: Optional[RuntimeState] = None,
         risk_verdict_timeout_seconds: float = 60.0,
         bracket_orders_supported_provider: Optional[Callable[[], bool]] = None,
+        correlation_store: Optional[InMemoryCorrelationStore] = None,
+        timeout_check_interval: float = 5.0,
     ) -> None:
         """
         Args:
@@ -252,6 +273,10 @@ class TelegramAuditForwarder:
                        or telegram_bot.send_sync).
             runtime_state: RuntimeState for checking pause state (optional).
                           If not provided, never suppresses events.
+            correlation_store: Pluggable store for correlation state.
+                             Defaults to a bounded in-memory store.
+            timeout_check_interval: How often (seconds) the background timer
+                                   checks for verdict timeouts.
         """
         self._send = send_func
         self._runtime_state = runtime_state or RuntimeState()
@@ -268,13 +293,21 @@ class TelegramAuditForwarder:
         self._events_suppressed = 0
         self._risk_verdict_timeout_seconds = max(1.0, risk_verdict_timeout_seconds)
         self._bracket_orders_supported_provider = bracket_orders_supported_provider
-        self._signals_by_id: dict[str, SignalGenerated] = {}
-        self._pending_signal_deadlines: dict[str, float] = {}
-        self._contracts_by_signal_id: dict[str, DecisionContractCreated] = {}
-        self._signal_id_by_contract_id: dict[str, str] = {}
-        self._approved_intent_ids_sent: set[str] = set()
+        self._timeout_check_interval = max(0.5, timeout_check_interval)
+
+        # Pluggable correlation store (default: in-memory with TTL)
+        self._store = correlation_store or InMemoryCorrelationStore()
+
         # Track last health status per component to suppress repeated identical notifications
         self._last_health_status: dict[str, str] = {}
+
+        # Proactive background timer for timeout emission
+        self._timeout_thread = threading.Thread(
+            target=self._timeout_loop,
+            daemon=True,
+            name="TelegramTimeoutChecker",
+        )
+        self._timeout_thread.start()
 
     def handle(self, event: Event) -> None:
         """Handle any event — format and enqueue for Telegram delivery.
@@ -283,8 +316,6 @@ class TelegramAuditForwarder:
         but always forwards system events.
         """
         try:
-            self._emit_no_verdict_timeouts()
-
             # Suppress trading events when paused
             if self._runtime_state.is_paused():
                 if isinstance(event, (SignalGenerated, RiskEvaluated, OrderSubmitted, OrderAccepted,
@@ -333,27 +364,31 @@ class TelegramAuditForwarder:
         signal_id = (getattr(event, "signal_id", "") or "").strip()
         if not signal_id:
             signal_id = f"sig:{event.event_id}"
-        self._signals_by_id[signal_id] = event
-        self._pending_signal_deadlines[signal_id] = time.time() + self._risk_verdict_timeout_seconds
+        self._store.store_signal(signal_id, event)
+        self._store.set_deadline(signal_id, time.time() + self._risk_verdict_timeout_seconds)
+
+        # Check if a RiskEvaluated arrived out-of-order before this signal
+        late_risk = self._store.pop_late_risk(signal_id)
+        if late_risk is not None:
+            logger.info(
+                "telegram_audit.late_signal_reconciled",
+                extra={"signal_id": signal_id},
+            )
+            self._handle_risk_evaluated(late_risk)
 
     def _track_decision_contract(self, event: DecisionContractCreated) -> None:
         signal_id = (event.signal_id or "").strip()
         if signal_id:
-            self._contracts_by_signal_id[signal_id] = event
+            self._store.store_contract(signal_id, event)
         if event.contract_id and signal_id:
-            self._signal_id_by_contract_id[event.contract_id] = signal_id
+            self._store.map_contract_to_signal(event.contract_id, signal_id)
 
     def _emit_no_verdict_timeouts(self) -> None:
-        if not self._pending_signal_deadlines:
-            return
+        """Check for expired deadlines and emit timeout warnings."""
         now = time.time()
-        expired = [
-            signal_id
-            for signal_id, deadline in self._pending_signal_deadlines.items()
-            if deadline <= now
-        ]
+        expired = self._store.get_expired_deadlines(now)
         for signal_id in expired:
-            signal_event = self._signals_by_id.get(signal_id)
+            signal_event = self._store.get_signal(signal_id)
             if signal_event:
                 block = _format_signal(signal_event)
                 warning = (
@@ -362,26 +397,54 @@ class TelegramAuditForwarder:
                     f"(timeout={int(self._risk_verdict_timeout_seconds)}s)"
                 )
                 self._enqueue_message(warning)
-            self._pending_signal_deadlines.pop(signal_id, None)
+                self._store.metrics.timeouts_emitted += 1
+            # Atomically cancel the deadline
+            self._store.cancel_deadline(signal_id)
+
+    def _timeout_loop(self) -> None:
+        """Proactive background timer that checks for verdict timeouts."""
+        while self._running:
+            try:
+                self._emit_no_verdict_timeouts()
+            except Exception:
+                logger.debug("telegram_audit.timeout_check_error", exc_info=True)
+            time.sleep(self._timeout_check_interval)
 
     def _handle_risk_evaluated(self, event: RiskEvaluated) -> None:
         signal_id = (getattr(event, "signal_id", "") or "").strip()
         if not signal_id and event.contract_id:
-            signal_id = self._signal_id_by_contract_id.get(event.contract_id, "")
-        signal_event = self._signals_by_id.get(signal_id) if signal_id else None
-        contract_event = self._contracts_by_signal_id.get(signal_id) if signal_id else None
+            signal_id = self._store.lookup_signal_by_contract(event.contract_id)
+        signal_event = self._store.get_signal(signal_id) if signal_id else None
+        contract_event = self._store.get_contract(signal_id) if signal_id else None
+
+        # Out-of-order: RiskEvaluated arrived before SignalGenerated
+        if signal_event is None and signal_id:
+            self._store.record_late_risk(signal_id, event)
+            logger.info(
+                "telegram_audit.risk_before_signal_buffered",
+                extra={"signal_id": signal_id},
+            )
+            return
+
+        if signal_event is not None:
+            self._store.metrics.verdicts_correlated += 1
+        else:
+            self._store.metrics.verdicts_uncorrelated += 1
 
         intent = self._build_trade_intent(event, signal_event, contract_event, signal_id)
-        if intent.risk_approved and intent.trade_intent_id in self._approved_intent_ids_sent:
+
+        # Dedup: suppress BOTH approved AND rejected duplicate intents
+        if self._store.check_dedup(intent.trade_intent_id):
+            self._store.metrics.duplicates_suppressed += 1
             return
 
         rendered = format_signal_message(intent)
         self._enqueue_message(rendered)
-        if intent.risk_approved:
-            self._approved_intent_ids_sent.add(intent.trade_intent_id)
+        self._store.mark_sent(intent.trade_intent_id)
 
+        # Atomically cancel the pending deadline for this signal
         if signal_id:
-            self._pending_signal_deadlines.pop(signal_id, None)
+            self._store.cancel_deadline(signal_id)
 
     def _build_trade_intent(
         self,
@@ -541,10 +604,14 @@ class TelegramAuditForwarder:
         bus.subscribe(None, self.handle)
 
     def stop(self) -> None:
-        """Gracefully stop the sender thread."""
+        """Gracefully stop the sender and timeout threads."""
         self._running = False
         if self._sender_thread.is_alive():
             self._sender_thread.join(timeout=5.0)
+        if self._timeout_thread.is_alive():
+            self._timeout_thread.join(timeout=5.0)
+        # Final cleanup of expired state
+        self._store.cleanup_expired()
 
     @property
     def stats(self) -> dict:
@@ -555,6 +622,11 @@ class TelegramAuditForwarder:
             "queue_size": self._queue.qsize(),
             "running": self._running,
         }
+
+    @property
+    def correlation_metrics(self) -> CorrelationMetrics:
+        """Observable correlation/dedup metrics."""
+        return self._store.metrics
 
 
 # ─────────────────────────────────────────────────────────────────────────────
