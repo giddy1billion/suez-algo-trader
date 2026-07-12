@@ -80,6 +80,13 @@ class AssetClassScheduler:
         self._thread: Optional[threading.Thread] = None
         self._tick_interval = 30.0  # Evaluate triggers every 30 seconds
 
+        # Health monitoring
+        self._last_tick_time: Optional[datetime] = None
+        self._consecutive_errors: int = 0
+        self._max_consecutive_errors: int = 5
+        self._health_timeout_seconds: float = 120.0  # Unhealthy if no tick in 2 min
+        self._restart_count: int = 0
+
         # Subscribe to events
         if self._event_bus:
             self._subscribe_events()
@@ -200,8 +207,20 @@ class AssetClassScheduler:
         while self._running:
             try:
                 self.tick()
+                with self._lock:
+                    self._last_tick_time = datetime.now(timezone.utc)
+                    self._consecutive_errors = 0
             except Exception as e:
                 logger.error("scheduler.tick_error", error=str(e))
+                with self._lock:
+                    self._consecutive_errors += 1
+                    if self._consecutive_errors >= self._max_consecutive_errors:
+                        logger.critical(
+                            "scheduler.too_many_errors",
+                            consecutive_errors=self._consecutive_errors,
+                            action="restarting",
+                        )
+                        self._attempt_restart()
             time.sleep(self._tick_interval)
 
     def tick(self) -> list[ActivityResult]:
@@ -339,15 +358,49 @@ class AssetClassScheduler:
         self._operational_mode = mode
         logger.info("scheduler.mode_changed", old=old.value, new=mode.value)
 
+    def health_check(self) -> dict[str, Any]:
+        """Return scheduler health status with liveness and error metrics."""
+        with self._lock:
+            now = datetime.now(timezone.utc)
+            last_tick = self._last_tick_time
+            if last_tick is not None:
+                seconds_since = (now - last_tick).total_seconds()
+                is_healthy = seconds_since < self._health_timeout_seconds
+            else:
+                seconds_since = None
+                is_healthy = self._running  # Not yet ticked
+
+            return {
+                "healthy": is_healthy,
+                "running": self._running,
+                "seconds_since_last_tick": seconds_since,
+                "consecutive_errors": self._consecutive_errors,
+                "restart_count": self._restart_count,
+                "health_timeout_seconds": self._health_timeout_seconds,
+            }
+
+    def _attempt_restart(self) -> None:
+        """Attempt to restart the scheduler loop after repeated failures."""
+        self._running = False
+        self._restart_count += 1
+        logger.warning(
+            "scheduler.auto_restart",
+            restart_count=self._restart_count,
+        )
+        # Reset error counter and restart
+        self._consecutive_errors = 0
+        self._running = True
+
     @property
     def is_running(self) -> bool:
         return self._running
 
     def get_status(self) -> dict[str, Any]:
-        """Get comprehensive scheduler status."""
+        """Get comprehensive scheduler status including health."""
         return {
             "running": self._running,
             "operational_mode": self._operational_mode.value,
+            "health": self.health_check(),
             "market_status": {
                 k: {"phase": v.phase.value, "is_trading": v.is_trading}
                 for k, v in self._market_status.get_all_statuses().items()

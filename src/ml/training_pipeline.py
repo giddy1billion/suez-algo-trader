@@ -777,6 +777,29 @@ class TrainingPipeline:
         tscv = TimeSeriesSplit(n_splits=5)
         cv_scores = []
 
+        # ── Class-imbalance handling ──────────────────────────────────
+        # Compute per-class sample weights to correct class imbalance.
+        # This ensures the minority direction class (up/down) is not
+        # overwhelmed by the majority (usually flat) in the loss function.
+        from sklearn.utils.class_weight import compute_sample_weight
+        class_sample_weights = compute_sample_weight("balanced", y_train_all)
+        if w_train_all is not None:
+            # Combine with any experience-enrichment weights
+            w_train_all = w_train_all * class_sample_weights
+        else:
+            w_train_all = class_sample_weights
+
+        # Report class distribution for monitoring
+        unique_classes, class_counts = np.unique(y_train_all, return_counts=True)
+        class_dist = dict(zip(unique_classes.tolist(), class_counts.tolist()))
+        total = sum(class_counts)
+        imbalance_ratio = max(class_counts) / max(min(class_counts), 1)
+        logger.info(
+            "training_pipeline.class_distribution",
+            distribution=class_dist,
+            imbalance_ratio=round(float(imbalance_ratio), 2),
+        )
+
         for train_idx, val_idx in tscv.split(X_train_all):
             # Adaptive embargo: min(10% of val fold, 50 bars) — avoids destroying
             # early folds while still preventing autocorrelation leakage
@@ -857,6 +880,7 @@ class TrainingPipeline:
                 "flat": int((y_train_all == DirectionEncoder.FLAT_CLASS).sum()),
                 "down": int((y_train_all == DirectionEncoder.DOWN_CLASS).sum()),
             },
+            "class_imbalance_ratio": float(imbalance_ratio),
             "hyperparameters": {
                 "n_estimators": 500,
                 "max_depth": 4,

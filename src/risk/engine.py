@@ -314,7 +314,10 @@ class RiskEngine:
             risk_score=risk_score,
         )
 
-        # Audit log
+        # Audit log — record the _effective_ action for each layer.
+        # For REDUCE, include both original and final qty so auditors can
+        # see the magnitude of the reduction.  For REJECT, include
+        # the layer that caused the rejection vs layers that weren't reached.
         log_entry = {
             "timestamp": datetime.now().isoformat(),
             "symbol": request.symbol,
@@ -322,11 +325,17 @@ class RiskEngine:
             "requested_qty": request.qty,
             "adjusted_qty": adjusted_qty,
             "approved": approved,
+            "final_action": "approve" if approved else "reject",
             "risk_score": risk_score,
             "reasons": reasons,
             "confidence": request.effective_confidence,
             "layers": {
-                name: {"action": d.action.value, "reason": d.reason}
+                name: {
+                    "action": d.action.value,
+                    "reason": d.reason,
+                    "adjusted_qty": d.adjusted_qty,
+                    "metadata": d.metadata,
+                }
                 for name, d in layer_decisions.items()
             },
         }

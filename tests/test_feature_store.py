@@ -234,7 +234,7 @@ class TestImmutableGovernance:
             hyperparameters={"lr": 0.01},
             seed=42,
         )
-        governance.deploy("v001", reason="initial")
+        governance.deploy("v001", reason="initial", skip_validation=True)
 
         # Try to overwrite
         governance.record_training(
@@ -259,7 +259,7 @@ class TestImmutableGovernance:
             hyperparameters={"lr": 0.01},
             seed=42,
         )
-        governance.deploy("v001", reason="test")
+        governance.deploy("v001", reason="test", skip_validation=True)
 
         is_valid, issues = governance.verify_integrity()
         assert is_valid, f"Unexpected issues: {issues}"
@@ -273,7 +273,7 @@ class TestImmutableGovernance:
             hyperparameters={"lr": 0.01},
             seed=42,
         )
-        governance.deploy("v001", reason="test")
+        governance.deploy("v001", reason="test", skip_validation=True)
 
         # Tamper with the record directly
         import json
