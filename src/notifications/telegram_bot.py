@@ -2201,11 +2201,16 @@ async def cmd_journalstats(message: Message):
         # Summary stats
         summary = journal.get_summary(days=30)
 
+        closed = summary.get('closed_trades', summary.get('total_trades', 0))
+        open_t = summary.get('open_trades', 0)
+        total = summary.get('total_trades', 0)
         text = (
             f"<b>Journal Analytics (30 days)</b>\n"
             f"{'=' * 30}\n\n"
-            f"Total Trades: {summary.get('total_trades', 0)}\n"
-            f"Win Rate: {summary.get('win_rate', 0):.1%}\n"
+            f"Total Trades: {total}"
+            f"{f' ({closed} closed, {open_t} open)' if open_t else ''}\n"
+            f"Win Rate: {summary.get('win_rate', 0):.1%}"
+            f"{f' (of {closed} closed)' if open_t else ''}\n"
             f"Avg PnL: ${summary.get('avg_pnl', 0):.2f}\n"
             f"Total PnL: ${summary.get('total_pnl', 0):.2f}\n"
             f"Best Trade: ${summary.get('best_trade', 0):.2f}\n"

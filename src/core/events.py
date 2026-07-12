@@ -56,6 +56,11 @@ def _apply_migrations(data: dict[str, Any], stored_version: str) -> dict[str, An
 # Base Event
 # ---------------------------------------------------------------------------
 
+# Auto-populated registry: every Event subclass is registered via __init_subclass__.
+# Used by the event store for deserialization without manual maintenance.
+_EVENT_CLASS_REGISTRY: dict[str, type] = {}
+
+
 @dataclass(frozen=True)
 class Event:
     """Base event with timestamp and metadata. Immutable after creation."""
@@ -63,6 +68,11 @@ class Event:
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     source: str = ""
     event_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+
+    def __init_subclass__(cls, **kwargs):
+        """Automatically register every Event subclass for deserialization."""
+        super().__init_subclass__(**kwargs)
+        _EVENT_CLASS_REGISTRY[cls.__name__] = cls
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize event to a dictionary."""
@@ -188,6 +198,22 @@ class RiskEvaluated(Event):
     adjusted_qty: float = 0.0
     risk_score: float = 0.0
     contract_id: str = ""  # Links to DecisionContract evaluated
+
+
+@dataclass(frozen=True)
+class SignalRejected(Event):
+    """Emitted when a signal is rejected before reaching risk evaluation.
+
+    This is a terminal verdict event that allows the notification correlation
+    layer to cancel the pending deadline without waiting for a timeout.
+    Covers: low strength, existing position, intelligence rejection,
+    signal gate rejection, zero quantity, and state machine errors.
+    """
+
+    signal_id: str = ""
+    symbol: str = ""
+    reason: str = ""
+    stage: str = ""  # "strength_gate" | "existing_position" | "intelligence" | "signal_gate" | "zero_qty" | "state_machine"
 
 
 # ---------------------------------------------------------------------------
@@ -543,6 +569,15 @@ class ModelAutoRollback(Event):
     from_version: str = ""
     to_version: str = ""
     reason: str = ""
+
+
+def get_event_class_registry() -> dict[str, type]:
+    """Return the auto-populated event class registry (read-only copy).
+
+    All concrete Event subclasses are automatically registered via
+    __init_subclass__ when their class body is evaluated.
+    """
+    return dict(_EVENT_CLASS_REGISTRY)
 
 
 # ---------------------------------------------------------------------------

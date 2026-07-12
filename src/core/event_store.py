@@ -9,6 +9,7 @@ backends via SQLAlchemy.
 import json
 import threading
 import uuid
+from dataclasses import fields as dataclass_fields
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import List, Optional
@@ -18,6 +19,8 @@ from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from src.core.events import (
     Event,
+    _EVENT_CLASS_REGISTRY,
+    get_event_class_registry,
     OrderAccepted,
     OrderFilled,
     OrderPartialFill,
@@ -27,6 +30,7 @@ from src.core.events import (
     RiskHalt,
     SchedulerEvent,
     SignalGenerated,
+    SignalRejected,
     SystemHealth,
     TradeClosed,
     TradeOpened,
@@ -67,21 +71,11 @@ class EventRecord(EventBase):
 # Event Class Registry
 # ---------------------------------------------------------------------------
 
-EVENT_REGISTRY: dict[str, type] = {
-    "Event": Event,
-    "SignalGenerated": SignalGenerated,
-    "RiskEvaluated": RiskEvaluated,
-    "OrderSubmitted": OrderSubmitted,
-    "OrderAccepted": OrderAccepted,
-    "OrderPartialFill": OrderPartialFill,
-    "OrderFilled": OrderFilled,
-    "OrderRejected": OrderRejected,
-    "TradeOpened": TradeOpened,
-    "TradeClosed": TradeClosed,
-    "RiskHalt": RiskHalt,
-    "SchedulerEvent": SchedulerEvent,
-    "SystemHealth": SystemHealth,
-}
+# The canonical registry is now auto-populated via Event.__init_subclass__.
+# EVENT_REGISTRY is kept as a public alias for backward compatibility.
+EVENT_REGISTRY: dict[str, type] = _EVENT_CLASS_REGISTRY
+# Also include the base Event class itself (not a subclass, so not auto-registered).
+EVENT_REGISTRY["Event"] = Event
 
 
 def register_event_class(cls: type) -> None:
@@ -90,13 +84,24 @@ def register_event_class(cls: type) -> None:
 
 
 def _reconstruct_event(event_type: str, payload: dict) -> Event:
-    """Reconstruct a typed Event object from its type name and payload dict."""
+    """Reconstruct a typed Event object from its type name and payload dict.
+
+    Falls back to base Event with unknown fields stripped for resilience
+    during recovery from stores containing newer/unknown event schemas.
+    """
     cls = EVENT_REGISTRY.get(event_type, Event)
     try:
         return cls.from_dict(payload)
     except Exception:
         logger.warning("Failed to reconstruct %s, falling back to base Event", event_type)
-        return Event.from_dict(payload)
+        # Strip unknown fields: only pass fields known to the base Event class
+        base_field_names = {f.name for f in dataclass_fields(Event)}
+        safe_payload = {k: v for k, v in payload.items() if k in base_field_names or k.startswith("_")}
+        try:
+            return Event.from_dict(safe_payload)
+        except Exception:
+            # Ultimate fallback: construct with absolute minimum
+            return Event(source=payload.get("source", ""), event_id=payload.get("event_id", uuid.uuid4().hex))
 
 
 # ---------------------------------------------------------------------------
