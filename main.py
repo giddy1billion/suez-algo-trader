@@ -526,10 +526,6 @@ def cmd_run(
     ))
     db = DatabaseManager(settings.database_url)
 
-    # Run Alembic migrations for PostgreSQL (SQLite uses create_all)
-    from src.utils.database import run_migrations, db_health_check
-    run_migrations(settings.database_url)
-
     # Initialize event-driven infrastructure
     from src.core.events import EventBus, OrderFilled, OrderRejected
     from src.core.state_machine import TradeManager
