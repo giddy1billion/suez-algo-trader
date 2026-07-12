@@ -604,29 +604,25 @@ class TestContractIdFlowsSystemWide:
             db.record_trade(scorecard)
 
             # Verify stored in predictions table
-            result = db._conn.execute(
-                "SELECT contract_id FROM predictions WHERE trade_id = ?",
-                ["T-exp001"]
-            ).fetchone()
-            assert result[0] == "DC-sol-test"
+            from src.ml.models import MLPrediction, MLOutcome, MLScorecard
+            with db._Session() as session:
+                pred = session.query(MLPrediction).filter_by(trade_id="T-exp001").first()
+                assert pred is not None
+                assert pred.contract_id == "DC-sol-test"
 
-            # Verify stored in outcomes table
-            result = db._conn.execute(
-                "SELECT contract_id, contract_decision, contract_confidence FROM outcomes WHERE trade_id = ?",
-                ["T-exp001"]
-            ).fetchone()
-            assert result[0] == "DC-sol-test"
-            assert result[1] == "execute"
-            assert result[2] == 0.78
+                # Verify stored in outcomes table
+                outcome = session.query(MLOutcome).filter_by(trade_id="T-exp001").first()
+                assert outcome is not None
+                assert outcome.contract_id == "DC-sol-test"
+                assert outcome.contract_decision == "execute"
+                assert outcome.contract_confidence == 0.78
 
-            # Verify stored in scorecards table
-            result = db._conn.execute(
-                "SELECT contract_id FROM scorecards WHERE trade_id = ?",
-                ["T-exp001"]
-            ).fetchone()
-            assert result[0] == "DC-sol-test"
+                # Verify stored in scorecards table
+                sc = session.query(MLScorecard).filter_by(trade_id="T-exp001").first()
+                assert sc is not None
+                assert sc.contract_id == "DC-sol-test"
 
-            db._conn.close()
+            db._engine.dispose()
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
@@ -764,7 +760,7 @@ class TestContractRejectionOutcomes:
             assert scorecard.contract_decision == "EXECUTE"
             assert scorecard.contract_confidence == 0.87
         finally:
-            db._conn.close()
+            db._engine.dispose()
             shutil.rmtree(test_dir, ignore_errors=True)
 
     def test_get_trades_includes_contract_id(self):

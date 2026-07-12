@@ -330,3 +330,70 @@ def run_migrations(database_url: Optional[str] = None) -> None:
     except Exception as e:
         logger.error("db.migration.failed", error=str(e))
         raise
+
+
+def bootstrap_database(database_url: Optional[str] = None) -> None:
+    """
+    Single entry point for PostgreSQL schema initialization on startup.
+
+    Handles all deployment scenarios:
+      - Fresh PostgreSQL: runs Alembic migration to create all tables
+      - Existing PG (tables exist, no alembic_version): stamps current revision, then upgrades
+      - Existing PG (alembic_version exists): runs upgrade to head (no-op if current)
+      - SQLite: skips entirely (stores use create_all() for simplicity)
+
+    Must be called BEFORE any DatabaseManager/EventStore/SnapshotStore/ConfigRepo
+    initialization when using PostgreSQL.
+    """
+    import os
+
+    if database_url is None:
+        from config.settings import settings
+        database_url = settings.database_url
+
+    if not database_url.startswith("postgresql"):
+        logger.debug("db.bootstrap.skipped", reason="sqlite_uses_create_all")
+        return
+
+    try:
+        from sqlalchemy import inspect as sa_inspect, text as sa_text
+        from alembic.config import Config
+        from alembic import command
+
+        project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        alembic_ini = os.path.join(project_root, "alembic.ini")
+
+        if not os.path.exists(alembic_ini):
+            logger.warning("db.bootstrap.skipped", reason="alembic_ini_not_found")
+            return
+
+        alembic_cfg = Config(alembic_ini)
+        alembic_cfg.set_main_option("sqlalchemy.url", database_url)
+
+        # Create a temporary engine to inspect the database state
+        engine = create_db_engine(database_url)
+        inspector = sa_inspect(engine)
+        existing_tables = inspector.get_table_names()
+        has_alembic_version = "alembic_version" in existing_tables
+        has_app_tables = "trades" in existing_tables or "events" in existing_tables
+
+        if has_app_tables and not has_alembic_version:
+            # Existing database bootstrapped by create_all() — stamp current revision
+            logger.info(
+                "db.bootstrap.stamping_existing",
+                tables_found=len(existing_tables),
+                reason="tables_exist_without_alembic_version",
+            )
+            command.stamp(alembic_cfg, "001")
+            logger.info("db.bootstrap.stamped", revision="001")
+
+        # Now run upgrade to head (no-op if already at head)
+        logger.info("db.bootstrap.upgrading", target="head")
+        command.upgrade(alembic_cfg, "head")
+        logger.info("db.bootstrap.completed", target="head")
+
+        engine.dispose()
+
+    except Exception as e:
+        logger.error("db.bootstrap.failed", error=str(e))
+        raise

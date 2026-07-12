@@ -37,3 +37,8 @@ desktop.ini
 
 # Generated configs
 liu_tradeplan.toml
+
+tests/_test_artifacts/
+data_cache/datasets/
+data_cache/experience/
+data_cache/features/

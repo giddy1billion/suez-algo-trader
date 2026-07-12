@@ -15,10 +15,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
-import duckdb
 import numpy as np
 import pandas as pd
+from sqlalchemy.orm import sessionmaker
 
+from src.ml.models import MLBase, MLFeatureSnapshot, MLFeatureVersion, MLTransformationLog
+from src.utils.database import create_db_engine
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -53,69 +55,27 @@ class FeatureSnapshot:
 
 class FeatureStore:
     """
-    Production feature store backed by DuckDB.
+    Production feature store backed by SQLAlchemy ORM.
 
     Provides versioned feature management, snapshot storage for prediction
     reproducibility, and drift detection via Population Stability Index.
     """
 
-    def __init__(self, storage_path: str = "data_cache/features", store_dir: str = None) -> None:
+    def __init__(self, storage_path: str = "data_cache/features", store_dir: str = None, database_url: str = None) -> None:
         path = store_dir or storage_path
         self._storage_path = Path(path)
         self._storage_path.mkdir(parents=True, exist_ok=True)
-        self._db_path = str(self._storage_path / "features.duckdb")
         self._write_lock = threading.Lock()
-        self._init_db()
+
+        if database_url:
+            self._engine = create_db_engine(database_url)
+        else:
+            db_path = self._storage_path / "features.db"
+            self._engine = create_db_engine(f"sqlite:///{db_path}")
+
+        MLBase.metadata.create_all(self._engine)
+        self._Session = sessionmaker(bind=self._engine)
         logger.info("feature_store.initialized", storage_path=str(self._storage_path))
-
-    def _get_conn(self) -> duckdb.DuckDBPyConnection:
-        """Create a new connection to the DuckDB database."""
-        return duckdb.connect(self._db_path)
-
-    def _init_db(self) -> None:
-        """Initialize database schema."""
-        conn = self._get_conn()
-        try:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS feature_versions (
-                    version_id TEXT PRIMARY KEY,
-                    feature_names TEXT NOT NULL,
-                    feature_hash TEXT NOT NULL UNIQUE,
-                    scaling_params TEXT,
-                    encoding_params TEXT,
-                    normalization_method TEXT DEFAULT 'standard',
-                    description TEXT DEFAULT '',
-                    parent_version TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS feature_snapshots (
-                    snapshot_id TEXT PRIMARY KEY,
-                    version_id TEXT NOT NULL,
-                    symbol TEXT NOT NULL,
-                    prediction_id TEXT,
-                    timestamp TIMESTAMP NOT NULL,
-                    values_json TEXT NOT NULL,
-                    raw_values_json TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_snapshots_symbol_time
-                ON feature_snapshots(symbol, timestamp)
-            """)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS transformation_log (
-                    log_id TEXT PRIMARY KEY,
-                    version_id TEXT NOT NULL,
-                    operation TEXT NOT NULL,
-                    params TEXT,
-                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-        finally:
-            conn.close()
 
     def register_version(
         self,
@@ -138,58 +98,47 @@ class FeatureStore:
         feature_hash = self._compute_hash(feature_names, scaling_params, encoding_params)
 
         with self._write_lock:
-            conn = self._get_conn()
-            try:
+            with self._Session() as session:
                 # Check for existing hash (dedup)
-                result = conn.execute(
-                    "SELECT version_id FROM feature_versions WHERE feature_hash = ?",
-                    [feature_hash],
-                ).fetchone()
+                existing = session.query(MLFeatureVersion).filter(
+                    MLFeatureVersion.feature_hash == feature_hash
+                ).first()
 
-                if result is not None:
-                    existing_id = result[0]
+                if existing:
                     logger.info(
                         "feature_store.version_deduplicated",
-                        existing_version_id=existing_id,
+                        existing_version_id=existing.version_id,
                         feature_hash=feature_hash,
                     )
-                    return existing_id
+                    return existing.version_id
 
                 # Determine parent version if not provided
                 if parent_version is None:
-                    active = conn.execute(
-                        "SELECT version_id FROM feature_versions ORDER BY created_at DESC LIMIT 1"
-                    ).fetchone()
-                    if active is not None:
-                        parent_version = active[0]
+                    active = session.query(MLFeatureVersion).order_by(
+                        MLFeatureVersion.created_at.desc()
+                    ).first()
+                    if active:
+                        parent_version = active.version_id
 
                 version_id = self._generate_version_id()
                 now = datetime.now(timezone.utc)
 
-                conn.execute(
-                    """
-                    INSERT INTO feature_versions
-                    (version_id, feature_names, feature_hash, scaling_params,
-                     encoding_params, normalization_method, description,
-                     parent_version, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    [
-                        version_id,
-                        json.dumps(feature_names),
-                        feature_hash,
-                        json.dumps(scaling_params),
-                        json.dumps(encoding_params),
-                        normalization_method,
-                        description,
-                        parent_version,
-                        now,
-                    ],
+                record = MLFeatureVersion(
+                    version_id=version_id,
+                    feature_names=json.dumps(feature_names),
+                    feature_hash=feature_hash,
+                    scaling_params=json.dumps(scaling_params),
+                    encoding_params=json.dumps(encoding_params),
+                    normalization_method=normalization_method,
+                    description=description,
+                    parent_version=parent_version,
+                    created_at=now,
                 )
+                session.add(record)
 
                 # Log the registration
                 self._log_transformation(
-                    conn,
+                    session,
                     version_id,
                     "register",
                     {
@@ -198,6 +147,8 @@ class FeatureStore:
                     },
                 )
 
+                session.commit()
+
                 logger.info(
                     "feature_store.version_registered",
                     version_id=version_id,
@@ -205,39 +156,30 @@ class FeatureStore:
                     normalization_method=normalization_method,
                 )
                 return version_id
-            finally:
-                conn.close()
 
     def get_version(self, version_id: str) -> FeatureVersion:
         """Retrieve a specific feature version by ID."""
-        conn = self._get_conn()
-        try:
-            row = conn.execute(
-                "SELECT * FROM feature_versions WHERE version_id = ?",
-                [version_id],
-            ).fetchone()
+        with self._Session() as session:
+            row = session.query(MLFeatureVersion).filter(
+                MLFeatureVersion.version_id == version_id
+            ).first()
 
             if row is None:
                 raise KeyError(f"Feature version not found: {version_id}")
 
             return self._row_to_version(row)
-        finally:
-            conn.close()
 
     def get_active_version(self) -> Optional[FeatureVersion]:
         """Get the currently active feature version (latest registered)."""
-        conn = self._get_conn()
-        try:
-            row = conn.execute(
-                "SELECT * FROM feature_versions ORDER BY created_at DESC LIMIT 1"
-            ).fetchone()
+        with self._Session() as session:
+            row = session.query(MLFeatureVersion).order_by(
+                MLFeatureVersion.created_at.desc()
+            ).first()
 
             if row is None:
                 return None
 
             return self._row_to_version(row)
-        finally:
-            conn.close()
 
     def snapshot_features(
         self,
@@ -257,26 +199,19 @@ class FeatureStore:
         now = datetime.now(timezone.utc)
 
         with self._write_lock:
-            conn = self._get_conn()
-            try:
-                conn.execute(
-                    """
-                    INSERT INTO feature_snapshots
-                    (snapshot_id, version_id, symbol, prediction_id,
-                     timestamp, values_json, raw_values_json, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    [
-                        snapshot_id,
-                        version_id,
-                        symbol,
-                        prediction_id,
-                        now,
-                        json.dumps(values),
-                        json.dumps(raw_values) if raw_values else None,
-                        now,
-                    ],
+            with self._Session() as session:
+                record = MLFeatureSnapshot(
+                    snapshot_id=snapshot_id,
+                    version_id=version_id,
+                    symbol=symbol,
+                    prediction_id=prediction_id,
+                    timestamp=now,
+                    values_json=json.dumps(values),
+                    raw_values_json=json.dumps(raw_values) if raw_values else None,
+                    created_at=now,
                 )
+                session.add(record)
+                session.commit()
 
                 logger.debug(
                     "feature_store.snapshot_stored",
@@ -285,31 +220,25 @@ class FeatureStore:
                     symbol=symbol,
                 )
                 return snapshot_id
-            finally:
-                conn.close()
 
     def get_snapshot(self, snapshot_id: str) -> Optional[FeatureSnapshot]:
         """Retrieve a stored feature snapshot."""
-        conn = self._get_conn()
-        try:
-            row = conn.execute(
-                "SELECT * FROM feature_snapshots WHERE snapshot_id = ?",
-                [snapshot_id],
-            ).fetchone()
+        with self._Session() as session:
+            row = session.query(MLFeatureSnapshot).filter(
+                MLFeatureSnapshot.snapshot_id == snapshot_id
+            ).first()
 
             if row is None:
                 return None
 
             return FeatureSnapshot(
-                snapshot_id=row[0],
-                version_id=row[1],
-                symbol=row[2],
-                timestamp=row[4],
-                values=json.loads(row[5]),
-                raw_values=json.loads(row[6]) if row[6] else {},
+                snapshot_id=row.snapshot_id,
+                version_id=row.version_id,
+                symbol=row.symbol,
+                timestamp=row.timestamp,
+                values=json.loads(row.values_json),
+                raw_values=json.loads(row.raw_values_json) if row.raw_values_json else {},
             )
-        finally:
-            conn.close()
 
     def get_snapshots_for_symbol(
         self,
@@ -318,49 +247,33 @@ class FeatureStore:
         limit: int = 1000,
     ) -> pd.DataFrame:
         """Get feature snapshots for a symbol as a DataFrame."""
-        conn = self._get_conn()
-        try:
+        with self._Session() as session:
+            query = session.query(MLFeatureSnapshot).filter(
+                MLFeatureSnapshot.symbol == symbol
+            )
+
             if since is not None:
-                rows = conn.execute(
-                    """
-                    SELECT snapshot_id, version_id, symbol, timestamp, values_json, raw_values_json
-                    FROM feature_snapshots
-                    WHERE symbol = ? AND timestamp >= ?
-                    ORDER BY timestamp DESC
-                    LIMIT ?
-                    """,
-                    [symbol, since, limit],
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    """
-                    SELECT snapshot_id, version_id, symbol, timestamp, values_json, raw_values_json
-                    FROM feature_snapshots
-                    WHERE symbol = ?
-                    ORDER BY timestamp DESC
-                    LIMIT ?
-                    """,
-                    [symbol, limit],
-                ).fetchall()
+                query = query.filter(MLFeatureSnapshot.timestamp >= since)
+
+            query = query.order_by(MLFeatureSnapshot.timestamp.desc()).limit(limit)
+            rows = query.all()
 
             if not rows:
                 return pd.DataFrame()
 
             records = []
             for row in rows:
-                values = json.loads(row[4])
+                values = json.loads(row.values_json)
                 record = {
-                    "snapshot_id": row[0],
-                    "version_id": row[1],
-                    "symbol": row[2],
-                    "timestamp": row[3],
+                    "snapshot_id": row.snapshot_id,
+                    "version_id": row.version_id,
+                    "symbol": row.symbol,
+                    "timestamp": row.timestamp,
                     **values,
                 }
                 records.append(record)
 
             return pd.DataFrame(records)
-        finally:
-            conn.close()
 
     def compute_feature_drift(
         self,
@@ -380,27 +293,17 @@ class FeatureStore:
         baseline_start = now - timedelta(days=baseline_days)
         recent_start = now - timedelta(days=recent_days)
 
-        conn = self._get_conn()
-        try:
+        with self._Session() as session:
             # Get baseline snapshots
-            baseline_rows = conn.execute(
-                """
-                SELECT values_json FROM feature_snapshots
-                WHERE timestamp >= ? AND timestamp < ?
-                """,
-                [baseline_start, recent_start],
-            ).fetchall()
+            baseline_rows = session.query(MLFeatureSnapshot.values_json).filter(
+                MLFeatureSnapshot.timestamp >= baseline_start,
+                MLFeatureSnapshot.timestamp < recent_start,
+            ).all()
 
             # Get recent snapshots
-            recent_rows = conn.execute(
-                """
-                SELECT values_json FROM feature_snapshots
-                WHERE timestamp >= ?
-                """,
-                [recent_start],
-            ).fetchall()
-        finally:
-            conn.close()
+            recent_rows = session.query(MLFeatureSnapshot.values_json).filter(
+                MLFeatureSnapshot.timestamp >= recent_start,
+            ).all()
 
         if not baseline_rows or not recent_rows:
             logger.warning(
@@ -454,17 +357,12 @@ class FeatureStore:
 
     def get_feature_importance_history(self) -> pd.DataFrame:
         """Track how feature importance changes across model versions."""
-        conn = self._get_conn()
-        try:
-            rows = conn.execute(
-                """
-                SELECT version_id, feature_names, created_at
-                FROM feature_versions
-                ORDER BY created_at ASC
-                """
-            ).fetchall()
-        finally:
-            conn.close()
+        with self._Session() as session:
+            rows = session.query(
+                MLFeatureVersion.version_id,
+                MLFeatureVersion.feature_names,
+                MLFeatureVersion.created_at,
+            ).order_by(MLFeatureVersion.created_at.asc()).all()
 
         if not rows:
             return pd.DataFrame()
@@ -472,7 +370,7 @@ class FeatureStore:
         records = []
         for row in rows:
             version_id = row[0]
-            feature_names = json.loads(row[1])
+            feature_names = json.loads(row[1]) if isinstance(row[1], str) else row[1]
             created_at = row[2]
             for idx, name in enumerate(feature_names):
                 records.append(
@@ -489,22 +387,14 @@ class FeatureStore:
     @property
     def version_count(self) -> int:
         """Number of registered feature versions."""
-        conn = self._get_conn()
-        try:
-            result = conn.execute("SELECT COUNT(*) FROM feature_versions").fetchone()
-            return result[0] if result else 0
-        finally:
-            conn.close()
+        with self._Session() as session:
+            return session.query(MLFeatureVersion).count()
 
     @property
     def snapshot_count(self) -> int:
         """Total stored snapshots."""
-        conn = self._get_conn()
-        try:
-            result = conn.execute("SELECT COUNT(*) FROM feature_snapshots").fetchone()
-            return result[0] if result else 0
-        finally:
-            conn.close()
+        with self._Session() as session:
+            return session.query(MLFeatureSnapshot).count()
 
     # ─── Predictor Integration ─────────────────────────────────────────
 
@@ -580,45 +470,37 @@ class FeatureStore:
         short_id = uuid.uuid4().hex[:8]
         return f"fv_{date_str}_{short_id}"
 
-    def _row_to_version(self, row: tuple) -> FeatureVersion:
-        """Convert a database row to FeatureVersion dataclass."""
-        # Column order: version_id, feature_names, feature_hash, scaling_params,
-        #               encoding_params, normalization_method, description,
-        #               parent_version, created_at
+    def _row_to_version(self, row: MLFeatureVersion) -> FeatureVersion:
+        """Convert an ORM model object to FeatureVersion dataclass."""
         return FeatureVersion(
-            version_id=row[0],
-            feature_names=json.loads(row[1]) if isinstance(row[1], str) else row[1],
-            feature_hash=row[2],
-            scaling_params=json.loads(row[3]) if isinstance(row[3], str) else (row[3] or {}),
-            encoding_params=json.loads(row[4]) if isinstance(row[4], str) else (row[4] or {}),
-            normalization_method=row[5] or "standard",
-            created_at=row[8] if len(row) > 8 else datetime.now(timezone.utc),
-            description=row[6] or "",
-            parent_version=row[7],
+            version_id=row.version_id,
+            feature_names=json.loads(row.feature_names) if isinstance(row.feature_names, str) else row.feature_names,
+            feature_hash=row.feature_hash,
+            scaling_params=json.loads(row.scaling_params) if isinstance(row.scaling_params, str) else (row.scaling_params or {}),
+            encoding_params=json.loads(row.encoding_params) if isinstance(row.encoding_params, str) else (row.encoding_params or {}),
+            normalization_method=row.normalization_method or "standard",
+            created_at=row.created_at or datetime.now(timezone.utc),
+            description=row.description or "",
+            parent_version=row.parent_version,
         )
 
     def _log_transformation(
         self,
-        conn: duckdb.DuckDBPyConnection,
+        session,
         version_id: str,
         operation: str,
         params: dict,
     ) -> None:
         """Log a transformation operation."""
         log_id = f"log_{uuid.uuid4().hex[:12]}"
-        conn.execute(
-            """
-            INSERT INTO transformation_log (log_id, version_id, operation, params, timestamp)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            [
-                log_id,
-                version_id,
-                operation,
-                json.dumps(params),
-                datetime.now(timezone.utc),
-            ],
+        log_record = MLTransformationLog(
+            log_id=log_id,
+            version_id=version_id,
+            operation=operation,
+            params=json.dumps(params),
+            timestamp=datetime.now(timezone.utc),
         )
+        session.add(log_record)
 
     def _compute_psi(
         self, baseline: np.ndarray, recent: np.ndarray, bins: int = 10
@@ -756,17 +638,3 @@ class FeatureSetMetadata:
     computation_seconds: float
     computed_at: str
     parameters: dict = field(default_factory=dict)
-
-    def _row_to_version(self, row: tuple) -> FeatureVersion:
-        """Convert a database row to a FeatureVersion dataclass."""
-        return FeatureVersion(
-            version_id=row[0],
-            feature_names=json.loads(row[1]),
-            feature_hash=row[2],
-            scaling_params=json.loads(row[3]) if row[3] else {},
-            encoding_params=json.loads(row[4]) if row[4] else {},
-            normalization_method=row[5] or "standard",
-            description=row[6] or "",
-            parent_version=row[7],
-            created_at=row[8],
-        )

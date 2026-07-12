@@ -6,14 +6,23 @@ import math
 import threading
 import uuid
 from dataclasses import dataclass, field, asdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-import duckdb
 import numpy as np
 import pandas as pd
+from sqlalchemy import func, text
+from sqlalchemy.orm import sessionmaker
 
+from src.ml.models import (
+    MLBase,
+    MLFeatureSnapshotExp,
+    MLOutcome,
+    MLPrediction,
+    MLScorecard,
+)
+from src.utils.database import create_db_engine
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -88,91 +97,31 @@ def _compute_feature_hash(feature_vector: dict) -> str:
 class ExperienceDatabase:
     """Stores all scorecards and provides query interface for the training pipeline.
 
-    Uses DuckDB for efficient columnar storage and SQL-based analytics.
+    Uses SQLAlchemy ORM for portable storage across SQLite and PostgreSQL.
     """
 
-    _CREATE_TABLES_SQL = """
-    CREATE TABLE IF NOT EXISTS predictions (
-        prediction_id TEXT PRIMARY KEY,
-        trade_id TEXT,
-        symbol TEXT NOT NULL,
-        timestamp TIMESTAMP NOT NULL,
-        model_version TEXT,
-        strategy_name TEXT,
-        predicted_direction TEXT,
-        predicted_confidence DOUBLE,
-        predicted_win_probability DOUBLE,
-        predicted_return_pct DOUBLE,
-        predicted_duration_minutes INTEGER,
-        predicted_risk_reward DOUBLE,
-        market_regime TEXT,
-        volatility_level TEXT,
-        feature_hash TEXT,
-        contract_id TEXT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
-
-    CREATE TABLE IF NOT EXISTS outcomes (
-        trade_id TEXT PRIMARY KEY,
-        symbol TEXT NOT NULL,
-        actual_profitable BOOLEAN,
-        actual_return_pct DOUBLE,
-        actual_duration_minutes INTEGER,
-        actual_risk_reward DOUBLE,
-        entry_price DOUBLE,
-        exit_price DOUBLE,
-        stop_loss_price DOUBLE,
-        stop_loss_hit BOOLEAN,
-        max_favorable_excursion DOUBLE,
-        max_adverse_excursion DOUBLE,
-        slippage_pct DOUBLE,
-        fees DOUBLE,
-        contract_id TEXT,
-        contract_decision TEXT,
-        contract_confidence DOUBLE,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
-
-    CREATE TABLE IF NOT EXISTS scorecards (
-        trade_id TEXT PRIMARY KEY,
-        symbol TEXT NOT NULL,
-        timestamp TIMESTAMP NOT NULL,
-        direction_score DOUBLE,
-        confidence_calibration_error DOUBLE,
-        timing_score DOUBLE,
-        exit_efficiency DOUBLE,
-        overall_score DOUBLE,
-        model_version TEXT,
-        strategy_name TEXT,
-        market_regime TEXT,
-        contract_id TEXT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
-
-    CREATE TABLE IF NOT EXISTS feature_snapshots (
-        trade_id TEXT NOT NULL,
-        feature_name TEXT NOT NULL,
-        feature_value DOUBLE,
-        PRIMARY KEY (trade_id, feature_name)
-    );
-    """
-
-    def __init__(self, storage_path: str = "data_cache/experience") -> None:
+    def __init__(
+        self,
+        storage_path: str = "data_cache/experience",
+        database_url: str = None,
+    ) -> None:
         self._storage_path = Path(storage_path)
         self._storage_path.mkdir(parents=True, exist_ok=True)
-        self._db_path = self._storage_path / "experience.duckdb"
         self._write_lock = threading.Lock()
-        self._conn = duckdb.connect(str(self._db_path))
-        self._init_tables()
-        self._check_legacy_migration()
-        logger.info("experience_db_initialized", path=str(self._db_path))
 
-    def _init_tables(self) -> None:
-        """Create tables if they do not exist."""
-        self._conn.execute(self._CREATE_TABLES_SQL)
+        if database_url:
+            self._engine = create_db_engine(database_url)
+        else:
+            db_path = self._storage_path / "experience.db"
+            self._engine = create_db_engine(f"sqlite:///{db_path}")
+
+        MLBase.metadata.create_all(self._engine)
+        self._Session = sessionmaker(bind=self._engine)
+        self._check_legacy_migration()
+        logger.info("experience_db_initialized", path=str(self._storage_path))
 
     def _check_legacy_migration(self) -> None:
-        """Warn if legacy JSONL file exists and migrate schema if needed."""
+        """Warn if legacy JSONL file exists."""
         legacy_path = self._storage_path / "scorecards.jsonl"
         if legacy_path.exists():
             logger.warning(
@@ -181,28 +130,9 @@ class ExperienceDatabase:
                 message="Legacy JSONL file found. Consider migrating with "
                 "ExperienceDatabase.migrate_from_jsonl().",
             )
-        # Schema migration: add contract_id columns if missing
-        self._migrate_contract_columns()
-
-    def _migrate_contract_columns(self) -> None:
-        """Add contract_id columns to existing tables (idempotent)."""
-        migrations = [
-            ("predictions", "contract_id", "TEXT"),
-            ("outcomes", "contract_id", "TEXT"),
-            ("outcomes", "contract_decision", "TEXT"),
-            ("outcomes", "contract_confidence", "DOUBLE"),
-            ("scorecards", "contract_id", "TEXT"),
-        ]
-        for table, column, dtype in migrations:
-            try:
-                self._conn.execute(
-                    f"ALTER TABLE {table} ADD COLUMN {column} {dtype}"
-                )
-            except Exception:
-                pass  # Column already exists
 
     def migrate_from_jsonl(self) -> int:
-        """Migrate legacy JSONL data into DuckDB. Returns count of migrated records."""
+        """Migrate legacy JSONL data into the database. Returns count of migrated records."""
         legacy_path = self._storage_path / "scorecards.jsonl"
         if not legacy_path.exists():
             return 0
@@ -266,7 +196,7 @@ class ExperienceDatabase:
         )
 
     def record_trade(self, scorecard: TradeScorecard) -> None:
-        """Insert into predictions, outcomes, scorecards, feature_snapshots tables."""
+        """Upsert into ml_predictions, ml_outcomes, ml_scorecards, ml_feature_snapshots_exp."""
         ts = scorecard.timestamp
         if isinstance(ts, str):
             ts = datetime.fromisoformat(ts)
@@ -275,88 +205,85 @@ class ExperienceDatabase:
         prediction_id = f"{scorecard.trade_id}_{scorecard.signal_id}"
 
         with self._write_lock:
-            # Insert prediction
-            self._conn.execute(
-                """
-                INSERT OR REPLACE INTO predictions (
-                    prediction_id, trade_id, symbol, timestamp, model_version,
-                    strategy_name, predicted_direction, predicted_confidence,
-                    predicted_win_probability, predicted_return_pct,
-                    predicted_duration_minutes, predicted_risk_reward,
-                    market_regime, volatility_level, feature_hash, contract_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                [
-                    prediction_id, scorecard.trade_id, scorecard.symbol, ts,
-                    scorecard.model_version, scorecard.strategy_name,
-                    scorecard.predicted_direction, scorecard.predicted_confidence,
-                    scorecard.predicted_win_probability, scorecard.predicted_return_pct,
-                    scorecard.predicted_duration_minutes, scorecard.predicted_risk_reward,
-                    scorecard.market_regime, scorecard.volatility_level, feature_hash,
-                    scorecard.contract_id,
-                ],
-            )
+            with self._Session() as session:
+                # Upsert prediction
+                pred = MLPrediction(
+                    prediction_id=prediction_id,
+                    trade_id=scorecard.trade_id,
+                    symbol=scorecard.symbol,
+                    timestamp=ts,
+                    model_version=scorecard.model_version,
+                    strategy_name=scorecard.strategy_name,
+                    predicted_direction=scorecard.predicted_direction,
+                    predicted_confidence=scorecard.predicted_confidence,
+                    predicted_win_probability=scorecard.predicted_win_probability,
+                    predicted_return_pct=scorecard.predicted_return_pct,
+                    predicted_duration_minutes=scorecard.predicted_duration_minutes,
+                    predicted_risk_reward=scorecard.predicted_risk_reward,
+                    market_regime=scorecard.market_regime,
+                    volatility_level=scorecard.volatility_level,
+                    feature_hash=feature_hash,
+                    contract_id=scorecard.contract_id,
+                    created_at=datetime.now(timezone.utc),
+                )
+                session.merge(pred)
 
-            # Insert outcome
-            self._conn.execute(
-                """
-                INSERT OR REPLACE INTO outcomes (
-                    trade_id, symbol, actual_profitable, actual_return_pct,
-                    actual_duration_minutes, actual_risk_reward, entry_price,
-                    exit_price, stop_loss_price, stop_loss_hit,
-                    max_favorable_excursion, max_adverse_excursion,
-                    slippage_pct, fees, contract_id, contract_decision,
-                    contract_confidence
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                [
-                    scorecard.trade_id, scorecard.symbol,
-                    scorecard.actual_profitable, scorecard.actual_return_pct,
-                    scorecard.actual_duration_minutes, scorecard.actual_risk_reward,
-                    scorecard.entry_price, scorecard.exit_price,
-                    scorecard.stop_loss_price, scorecard.stop_loss_hit,
-                    scorecard.max_favorable_excursion, scorecard.max_adverse_excursion,
-                    scorecard.slippage_pct, scorecard.fees,
-                    scorecard.contract_id, scorecard.contract_decision,
-                    scorecard.contract_confidence,
-                ],
-            )
+                # Upsert outcome
+                outcome = MLOutcome(
+                    trade_id=scorecard.trade_id,
+                    symbol=scorecard.symbol,
+                    actual_profitable=scorecard.actual_profitable,
+                    actual_return_pct=scorecard.actual_return_pct,
+                    actual_duration_minutes=scorecard.actual_duration_minutes,
+                    actual_risk_reward=scorecard.actual_risk_reward,
+                    entry_price=scorecard.entry_price,
+                    exit_price=scorecard.exit_price,
+                    stop_loss_price=scorecard.stop_loss_price,
+                    stop_loss_hit=scorecard.stop_loss_hit,
+                    max_favorable_excursion=scorecard.max_favorable_excursion,
+                    max_adverse_excursion=scorecard.max_adverse_excursion,
+                    slippage_pct=scorecard.slippage_pct,
+                    fees=scorecard.fees,
+                    contract_id=scorecard.contract_id,
+                    contract_decision=scorecard.contract_decision,
+                    contract_confidence=scorecard.contract_confidence,
+                    created_at=datetime.now(timezone.utc),
+                )
+                session.merge(outcome)
 
-            # Insert scorecard
-            self._conn.execute(
-                """
-                INSERT OR REPLACE INTO scorecards (
-                    trade_id, symbol, timestamp, direction_score,
-                    confidence_calibration_error, timing_score, exit_efficiency,
-                    overall_score, model_version, strategy_name, market_regime,
-                    contract_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                [
-                    scorecard.trade_id, scorecard.symbol, ts,
-                    scorecard.direction_score, scorecard.confidence_calibration_error,
-                    scorecard.timing_score, scorecard.exit_efficiency,
-                    scorecard.overall_score, scorecard.model_version,
-                    scorecard.strategy_name, scorecard.market_regime,
-                    scorecard.contract_id,
-                ],
-            )
+                # Upsert scorecard
+                sc = MLScorecard(
+                    trade_id=scorecard.trade_id,
+                    symbol=scorecard.symbol,
+                    timestamp=ts,
+                    direction_score=scorecard.direction_score,
+                    confidence_calibration_error=scorecard.confidence_calibration_error,
+                    timing_score=scorecard.timing_score,
+                    exit_efficiency=scorecard.exit_efficiency,
+                    overall_score=scorecard.overall_score,
+                    model_version=scorecard.model_version,
+                    strategy_name=scorecard.strategy_name,
+                    market_regime=scorecard.market_regime,
+                    contract_id=scorecard.contract_id,
+                    created_at=datetime.now(timezone.utc),
+                )
+                session.merge(sc)
 
-            # Insert feature snapshots
-            if scorecard.feature_vector:
-                for fname, fval in scorecard.feature_vector.items():
-                    try:
-                        fval_float = float(fval)
-                    except (TypeError, ValueError):
-                        continue
-                    self._conn.execute(
-                        """
-                        INSERT OR REPLACE INTO feature_snapshots
-                            (trade_id, feature_name, feature_value)
-                        VALUES (?, ?, ?)
-                        """,
-                        [scorecard.trade_id, fname, fval_float],
-                    )
+                # Upsert feature snapshots
+                if scorecard.feature_vector:
+                    for fname, fval in scorecard.feature_vector.items():
+                        try:
+                            fval_float = float(fval)
+                        except (TypeError, ValueError):
+                            continue
+                        fs = MLFeatureSnapshotExp(
+                            trade_id=scorecard.trade_id,
+                            feature_name=fname,
+                            feature_value=fval_float,
+                        )
+                        session.merge(fs)
+
+                session.commit()
 
         logger.info(
             "trade_recorded",
@@ -369,20 +296,13 @@ class ExperienceDatabase:
         self, min_trades: int = 50, since: Optional[datetime] = None
     ) -> pd.DataFrame:
         """SQL query joining outcomes + features, returns training-ready DataFrame."""
-        where_clause = ""
-        params: list[Any] = []
-        if since is not None:
-            where_clause = "WHERE o.created_at >= ?"
-            params.append(since)
-
-        count_result = self._conn.execute(
-            f"SELECT COUNT(*) FROM outcomes o {where_clause}", params
-        ).fetchone()
-        count = count_result[0] if count_result else 0
+        with self._Session() as session:
+            query = session.query(func.count(MLOutcome.trade_id))
+            if since is not None:
+                query = query.filter(MLOutcome.created_at >= since)
+            count = query.scalar() or 0
 
         if count < min_trades:
-            # Demote to info-level when bootstrapping (no trades yet) — this is
-            # expected on fresh sessions and not an actionable warning.
             if count == 0:
                 logger.info(
                     "training_data.bootstrapping",
@@ -396,8 +316,7 @@ class ExperienceDatabase:
                 )
             return pd.DataFrame()
 
-        df = self._conn.execute(
-            f"""
+        sql = text("""
             SELECT
                 o.trade_id, o.symbol, o.actual_profitable, o.actual_return_pct,
                 o.actual_duration_minutes, o.actual_risk_reward, o.entry_price,
@@ -412,14 +331,18 @@ class ExperienceDatabase:
                 s.direction_score, s.confidence_calibration_error,
                 s.timing_score, s.exit_efficiency, s.overall_score,
                 p.timestamp
-            FROM outcomes o
-            LEFT JOIN predictions p ON o.trade_id = p.trade_id
-            LEFT JOIN scorecards s ON o.trade_id = s.trade_id
+            FROM ml_outcomes o
+            LEFT JOIN ml_predictions p ON o.trade_id = p.trade_id
+            LEFT JOIN ml_scorecards s ON o.trade_id = s.trade_id
             {where_clause}
             ORDER BY o.created_at
-            """,
-            params,
-        ).fetchdf()
+        """.format(where_clause="WHERE o.created_at >= :since_param" if since else ""))
+
+        with self._engine.connect() as conn:
+            if since is not None:
+                df = pd.read_sql(sql, conn, params={"since_param": since})
+            else:
+                df = pd.read_sql(sql, conn)
 
         # Add derived label columns
         df["profitable"] = df["actual_profitable"].astype(int)
@@ -452,26 +375,26 @@ class ExperienceDatabase:
 
     def get_calibration_data(self) -> dict:
         """SQL query: GROUP BY confidence_bin, compute actual win rates."""
-        total_result = self._conn.execute(
-            "SELECT COUNT(*) FROM outcomes"
-        ).fetchone()
-        total_trades = total_result[0] if total_result else 0
+        with self._Session() as session:
+            total_trades = session.query(func.count(MLOutcome.trade_id)).scalar() or 0
 
         if total_trades == 0:
             return {"bins": [], "total_trades": 0}
 
-        rows = self._conn.execute(
-            """
+        sql = text("""
             SELECT
                 FLOOR(p.predicted_confidence * 10) / 10.0 AS bin_low,
                 COUNT(*) AS cnt,
                 AVG(CASE WHEN o.actual_profitable THEN 1.0 ELSE 0.0 END) AS actual_win_rate
-            FROM predictions p
-            JOIN outcomes o ON p.trade_id = o.trade_id
+            FROM ml_predictions p
+            JOIN ml_outcomes o ON p.trade_id = o.trade_id
             GROUP BY bin_low
             ORDER BY bin_low
-            """
-        ).fetchall()
+        """)
+
+        with self._engine.connect() as conn:
+            result = conn.execute(sql)
+            rows = result.fetchall()
 
         result_bins = []
         for row in rows:
@@ -490,20 +413,20 @@ class ExperienceDatabase:
 
     def get_model_performance(self, model_version: str) -> dict:
         """SQL aggregation for a specific model version."""
-        row = self._conn.execute(
-            """
+        sql = text("""
             SELECT
                 COUNT(*) AS total,
                 SUM(CASE WHEN o.actual_profitable THEN 1 ELSE 0 END) AS wins,
                 AVG(o.actual_return_pct) AS avg_return,
                 AVG(s.overall_score) AS avg_score
-            FROM outcomes o
-            JOIN predictions p ON o.trade_id = p.trade_id
-            LEFT JOIN scorecards s ON o.trade_id = s.trade_id
-            WHERE p.model_version = ?
-            """,
-            [model_version],
-        ).fetchone()
+            FROM ml_outcomes o
+            JOIN ml_predictions p ON o.trade_id = p.trade_id
+            LEFT JOIN ml_scorecards s ON o.trade_id = s.trade_id
+            WHERE p.model_version = :model_ver
+        """)
+
+        with self._engine.connect() as conn:
+            row = conn.execute(sql, {"model_ver": model_version}).fetchone()
 
         if not row or row[0] == 0:
             return {"model_version": model_version, "total_trades": 0}
@@ -522,18 +445,19 @@ class ExperienceDatabase:
 
     def get_regime_performance(self) -> dict:
         """SQL GROUP BY market_regime."""
-        rows = self._conn.execute(
-            """
+        sql = text("""
             SELECT
                 COALESCE(p.market_regime, 'unknown') AS regime,
                 COUNT(*) AS total,
                 SUM(CASE WHEN o.actual_profitable THEN 1 ELSE 0 END) AS wins,
                 AVG(o.actual_return_pct) AS avg_return
-            FROM outcomes o
-            JOIN predictions p ON o.trade_id = p.trade_id
+            FROM ml_outcomes o
+            JOIN ml_predictions p ON o.trade_id = p.trade_id
             GROUP BY regime
-            """
-        ).fetchall()
+        """)
+
+        with self._engine.connect() as conn:
+            rows = conn.execute(sql).fetchall()
 
         result = {}
         for row in rows:
@@ -548,67 +472,71 @@ class ExperienceDatabase:
         return result
 
     def get_recent_accuracy(self, n_trades: int = 50) -> float:
-        """SQL: SELECT from outcomes ORDER BY created_at DESC LIMIT n."""
-        row = self._conn.execute(
-            """
+        """SELECT from outcomes ORDER BY created_at DESC LIMIT n."""
+        sql = text("""
             SELECT AVG(CASE WHEN actual_profitable THEN 1.0 ELSE 0.0 END)
             FROM (
                 SELECT actual_profitable
-                FROM outcomes
+                FROM ml_outcomes
                 ORDER BY created_at DESC
-                LIMIT ?
-            )
-            """,
-            [n_trades],
-        ).fetchone()
+                LIMIT :n_limit
+            ) sub
+        """)
+
+        with self._engine.connect() as conn:
+            row = conn.execute(sql, {"n_limit": n_trades}).fetchone()
         if not row or row[0] is None:
             return 0.0
         return float(row[0])
 
     @property
     def total_trades(self) -> int:
-        """SELECT COUNT(*) FROM outcomes"""
-        row = self._conn.execute("SELECT COUNT(*) FROM outcomes").fetchone()
-        return int(row[0]) if row else 0
+        """SELECT COUNT(*) FROM ml_outcomes"""
+        with self._Session() as session:
+            count = session.query(func.count(MLOutcome.trade_id)).scalar()
+        return int(count) if count else 0
 
     @property
     def overall_accuracy(self) -> float:
-        """SELECT AVG(actual_profitable::INT) FROM outcomes"""
-        row = self._conn.execute(
-            "SELECT AVG(CASE WHEN actual_profitable THEN 1.0 ELSE 0.0 END) FROM outcomes"
-        ).fetchone()
+        """Average win rate across all outcomes."""
+        sql = text(
+            "SELECT AVG(CASE WHEN actual_profitable THEN 1.0 ELSE 0.0 END) FROM ml_outcomes"
+        )
+        with self._engine.connect() as conn:
+            row = conn.execute(sql).fetchone()
         if not row or row[0] is None:
             return 0.0
         return float(row[0])
 
     def get_model_lineage(self, trade_id: str) -> dict:
         """Full lineage: trade -> prediction -> model_version -> feature_hash."""
-        row = self._conn.execute(
-            """
-            SELECT p.prediction_id, p.model_version, p.feature_hash,
-                   p.timestamp, p.strategy_name
-            FROM predictions p
-            WHERE p.trade_id = ?
-            """,
-            [trade_id],
-        ).fetchone()
+        with self._Session() as session:
+            pred = (
+                session.query(MLPrediction)
+                .filter(MLPrediction.trade_id == trade_id)
+                .first()
+            )
 
-        if not row:
-            return {"trade_id": trade_id, "found": False}
+            if not pred:
+                return {"trade_id": trade_id, "found": False}
 
-        features = self._conn.execute(
-            "SELECT feature_name, feature_value FROM feature_snapshots WHERE trade_id = ?",
-            [trade_id],
-        ).fetchall()
+            features = (
+                session.query(
+                    MLFeatureSnapshotExp.feature_name,
+                    MLFeatureSnapshotExp.feature_value,
+                )
+                .filter(MLFeatureSnapshotExp.trade_id == trade_id)
+                .all()
+            )
 
         return {
             "trade_id": trade_id,
             "found": True,
-            "prediction_id": row[0],
-            "model_version": row[1],
-            "feature_hash": row[2],
-            "timestamp": row[3],
-            "strategy_name": row[4],
+            "prediction_id": pred.prediction_id,
+            "model_version": pred.model_version,
+            "feature_hash": pred.feature_hash,
+            "timestamp": pred.timestamp,
+            "strategy_name": pred.strategy_name,
             "feature_count": len(features),
             "features": {f[0]: f[1] for f in features},
         }
@@ -618,25 +546,25 @@ class ExperienceDatabase:
 
         Returns PSI (Population Stability Index) per feature.
         """
-        recent_df = self._conn.execute(
-            """
-            SELECT fs.feature_name, fs.feature_value
-            FROM feature_snapshots fs
-            JOIN outcomes o ON fs.trade_id = o.trade_id
-            WHERE o.created_at >= CURRENT_TIMESTAMP - INTERVAL ? DAY
-            """,
-            [window_days],
-        ).fetchdf()
+        cutoff = datetime.now(timezone.utc) - timedelta(days=window_days)
 
-        historical_df = self._conn.execute(
-            """
+        recent_sql = text("""
             SELECT fs.feature_name, fs.feature_value
-            FROM feature_snapshots fs
-            JOIN outcomes o ON fs.trade_id = o.trade_id
-            WHERE o.created_at < CURRENT_TIMESTAMP - INTERVAL ? DAY
-            """,
-            [window_days],
-        ).fetchdf()
+            FROM ml_feature_snapshots_exp fs
+            JOIN ml_outcomes o ON fs.trade_id = o.trade_id
+            WHERE o.created_at >= :cutoff
+        """)
+
+        historical_sql = text("""
+            SELECT fs.feature_name, fs.feature_value
+            FROM ml_feature_snapshots_exp fs
+            JOIN ml_outcomes o ON fs.trade_id = o.trade_id
+            WHERE o.created_at < :cutoff
+        """)
+
+        with self._engine.connect() as conn:
+            recent_df = pd.read_sql(recent_sql, conn, params={"cutoff": cutoff})
+            historical_df = pd.read_sql(historical_sql, conn, params={"cutoff": cutoff})
 
         if recent_df.empty or historical_df.empty:
             return {"psi": {}, "window_days": window_days, "status": "insufficient_data"}

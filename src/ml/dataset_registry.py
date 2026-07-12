@@ -14,9 +14,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-import duckdb
 import pandas as pd
+from sqlalchemy import func
+from sqlalchemy.orm import sessionmaker
 
+from src.ml.models import MLBase, MLDataset, MLModelLineage, MLPredictionRecord
+from src.utils.database import create_db_engine
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -72,78 +75,23 @@ class PredictionRecord:
 class DatasetRegistry:
     """Registry for dataset versions, model lineage, and prediction tracking."""
 
-    def __init__(self, storage_path: str = "data_cache/datasets") -> None:
+    def __init__(self, storage_path: str = "data_cache/datasets", database_url: str = None) -> None:
         self._storage_path = Path(storage_path)
         self._snapshots_path = self._storage_path / "snapshots"
-        self._db_path = self._storage_path / "lineage.duckdb"
         self._write_lock = threading.Lock()
 
         self._storage_path.mkdir(parents=True, exist_ok=True)
         self._snapshots_path.mkdir(parents=True, exist_ok=True)
 
-        self._conn = duckdb.connect(str(self._db_path))
-        self._init_schema()
-        logger.info("dataset_registry_initialized", storage_path=storage_path)
+        if database_url:
+            self._engine = create_db_engine(database_url)
+        else:
+            db_path = self._storage_path / "lineage.db"
+            self._engine = create_db_engine(f"sqlite:///{db_path}")
 
-    def _init_schema(self) -> None:
-        self._conn.execute("""
-            CREATE TABLE IF NOT EXISTS datasets (
-                dataset_id TEXT PRIMARY KEY,
-                version INTEGER NOT NULL,
-                symbols TEXT NOT NULL,
-                timeframe TEXT NOT NULL,
-                start_date TIMESTAMP,
-                end_date TIMESTAMP,
-                row_count INTEGER NOT NULL,
-                feature_version_id TEXT,
-                data_hash TEXT NOT NULL,
-                source TEXT DEFAULT 'broker_historical',
-                description TEXT DEFAULT '',
-                parent_dataset_id TEXT,
-                parquet_path TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        self._conn.execute("""
-            CREATE TABLE IF NOT EXISTS model_lineage (
-                model_version TEXT PRIMARY KEY,
-                dataset_id TEXT NOT NULL,
-                feature_version_id TEXT NOT NULL,
-                training_pipeline_id TEXT,
-                parent_model_version TEXT,
-                hyperparameters TEXT,
-                training_metrics TEXT,
-                training_duration_seconds DOUBLE DEFAULT 0.0,
-                training_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                promotion_timestamp TIMESTAMP,
-                demotion_timestamp TIMESTAMP,
-                status TEXT DEFAULT 'registered'
-            )
-        """)
-        self._conn.execute("""
-            CREATE TABLE IF NOT EXISTS prediction_records (
-                prediction_id TEXT PRIMARY KEY,
-                model_version TEXT NOT NULL,
-                feature_version_id TEXT NOT NULL,
-                feature_snapshot_id TEXT,
-                symbol TEXT NOT NULL,
-                timestamp TIMESTAMP NOT NULL,
-                predicted_direction TEXT,
-                predicted_confidence DOUBLE,
-                trade_id TEXT,
-                outcome_profitable BOOLEAN,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_predictions_model ON prediction_records(model_version)"
-        )
-        self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_predictions_trade ON prediction_records(trade_id)"
-        )
-        self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_lineage_status ON model_lineage(status)"
-        )
+        MLBase.metadata.create_all(self._engine)
+        self._Session = sessionmaker(bind=self._engine)
+        logger.info("dataset_registry_initialized", storage_path=storage_path)
 
     def _compute_hash(self, data: pd.DataFrame) -> str:
         """Compute SHA256 hash of sorted DataFrame bytes."""
@@ -152,8 +100,9 @@ class DatasetRegistry:
         return hashlib.sha256(content).hexdigest()
 
     def _next_version(self) -> int:
-        result = self._conn.execute("SELECT COALESCE(MAX(version), 0) FROM datasets").fetchone()
-        return result[0] + 1
+        with self._Session() as session:
+            result = session.query(func.max(MLDataset.version)).scalar()
+            return (result or 0) + 1
 
     # --- Dataset Registration ---
 
@@ -198,21 +147,26 @@ class DatasetRegistry:
                 )
 
             now = datetime.now(timezone.utc)
-            self._conn.execute(
-                """
-                INSERT INTO datasets (
-                    dataset_id, version, symbols, timeframe, start_date, end_date,
-                    row_count, feature_version_id, data_hash, source, description,
-                    parent_dataset_id, parquet_path, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                [
-                    dataset_id, version, json.dumps(symbols), timeframe,
-                    start_date, end_date, len(data), feature_version_id,
-                    data_hash, source, description, parent_dataset_id,
-                    parquet_path, now,
-                ],
+            record = MLDataset(
+                dataset_id=dataset_id,
+                version=version,
+                symbols=json.dumps(symbols),
+                timeframe=timeframe,
+                start_date=start_date,
+                end_date=end_date,
+                row_count=len(data),
+                feature_version_id=feature_version_id,
+                data_hash=data_hash,
+                source=source,
+                description=description,
+                parent_dataset_id=parent_dataset_id,
+                parquet_path=parquet_path,
+                created_at=now,
             )
+            with self._Session() as session:
+                session.add(record)
+                session.commit()
+
             logger.info(
                 "dataset_registered",
                 dataset_id=dataset_id,
@@ -224,21 +178,25 @@ class DatasetRegistry:
 
     def get_dataset(self, dataset_id: str) -> Optional[DatasetVersion]:
         """Retrieve dataset metadata."""
-        row = self._conn.execute(
-            "SELECT * FROM datasets WHERE dataset_id = ?", [dataset_id]
-        ).fetchone()
-        if row is None:
-            return None
-        return self._row_to_dataset_version(row)
+        with self._Session() as session:
+            row = session.query(MLDataset).filter(
+                MLDataset.dataset_id == dataset_id
+            ).first()
+            if row is None:
+                return None
+            return self._row_to_dataset_version(row)
 
     def load_dataset(self, dataset_id: str) -> Optional[pd.DataFrame]:
         """Load the actual dataset file (Parquet or CSV fallback)."""
-        row = self._conn.execute(
-            "SELECT parquet_path FROM datasets WHERE dataset_id = ?", [dataset_id]
-        ).fetchone()
-        if row is None or row[0] is None:
-            return None
-        path = Path(row[0])
+        with self._Session() as session:
+            row = session.query(MLDataset.parquet_path).filter(
+                MLDataset.dataset_id == dataset_id
+            ).first()
+            if row is None or row[0] is None:
+                return None
+            parquet_path = row[0]
+
+        path = Path(parquet_path)
         if not path.exists():
             logger.warning("dataset_file_missing", dataset_id=dataset_id, path=str(path))
             return None
@@ -252,28 +210,29 @@ class DatasetRegistry:
 
     def get_latest_dataset(self) -> Optional[DatasetVersion]:
         """Get the most recent dataset version."""
-        row = self._conn.execute(
-            "SELECT * FROM datasets ORDER BY version DESC LIMIT 1"
-        ).fetchone()
-        if row is None:
-            return None
-        return self._row_to_dataset_version(row)
+        with self._Session() as session:
+            row = session.query(MLDataset).order_by(
+                MLDataset.version.desc()
+            ).first()
+            if row is None:
+                return None
+            return self._row_to_dataset_version(row)
 
-    def _row_to_dataset_version(self, row: tuple) -> DatasetVersion:
+    def _row_to_dataset_version(self, row: MLDataset) -> DatasetVersion:
         return DatasetVersion(
-            dataset_id=row[0],
-            version=row[1],
-            symbols=json.loads(row[2]),
-            timeframe=row[3],
-            start_date=row[4],
-            end_date=row[5],
-            row_count=row[6],
-            feature_version_id=row[7],
-            data_hash=row[8],
-            source=row[9],
-            description=row[10],
-            parent_dataset_id=row[11],
-            created_at=row[13],
+            dataset_id=row.dataset_id,
+            version=row.version,
+            symbols=json.loads(row.symbols),
+            timeframe=row.timeframe,
+            start_date=row.start_date,
+            end_date=row.end_date,
+            row_count=row.row_count,
+            feature_version_id=row.feature_version_id,
+            data_hash=row.data_hash,
+            source=row.source,
+            description=row.description,
+            parent_dataset_id=row.parent_dataset_id,
+            created_at=row.created_at,
         )
 
     # --- Model Lineage ---
@@ -292,23 +251,22 @@ class DatasetRegistry:
         """Register a model with its full training lineage."""
         with self._write_lock:
             now = datetime.now(timezone.utc)
-            self._conn.execute(
-                """
-                INSERT INTO model_lineage (
-                    model_version, dataset_id, feature_version_id,
-                    training_pipeline_id, parent_model_version,
-                    hyperparameters, training_metrics,
-                    training_duration_seconds, training_timestamp, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'registered')
-                """,
-                [
-                    model_version, dataset_id, feature_version_id,
-                    pipeline_id, parent_model_version,
-                    json.dumps(hyperparameters or {}),
-                    json.dumps(training_metrics or {}),
-                    training_duration, now,
-                ],
+            record = MLModelLineage(
+                model_version=model_version,
+                dataset_id=dataset_id,
+                feature_version_id=feature_version_id,
+                training_pipeline_id=pipeline_id,
+                parent_model_version=parent_model_version,
+                hyperparameters=json.dumps(hyperparameters or {}),
+                training_metrics=json.dumps(training_metrics or {}),
+                training_duration_seconds=training_duration,
+                training_timestamp=now,
+                status="registered",
             )
+            with self._Session() as session:
+                session.add(record)
+                session.commit()
+
             logger.info(
                 "model_registered",
                 model_version=model_version,
@@ -317,82 +275,82 @@ class DatasetRegistry:
 
     def get_model_lineage(self, model_version: str) -> Optional[ModelLineage]:
         """Get full lineage for a model version."""
-        row = self._conn.execute(
-            "SELECT * FROM model_lineage WHERE model_version = ?", [model_version]
-        ).fetchone()
-        if row is None:
-            return None
-        return self._row_to_model_lineage(row)
+        with self._Session() as session:
+            row = session.query(MLModelLineage).filter(
+                MLModelLineage.model_version == model_version
+            ).first()
+            if row is None:
+                return None
+            return self._row_to_model_lineage(row)
 
     def set_model_status(self, model_version: str, status: str) -> None:
         """Update model status (active, demoted, rolled_back)."""
         with self._write_lock:
             now = datetime.now(timezone.utc)
-            if status == "active":
-                # Demote current active model
-                self._conn.execute(
-                    """
-                    UPDATE model_lineage
-                    SET status = 'demoted', demotion_timestamp = ?
-                    WHERE status = 'active'
-                    """,
-                    [now],
-                )
-                self._conn.execute(
-                    """
-                    UPDATE model_lineage
-                    SET status = ?, promotion_timestamp = ?
-                    WHERE model_version = ?
-                    """,
-                    [status, now, model_version],
-                )
-            elif status == "demoted":
-                self._conn.execute(
-                    """
-                    UPDATE model_lineage
-                    SET status = ?, demotion_timestamp = ?
-                    WHERE model_version = ?
-                    """,
-                    [status, now, model_version],
-                )
-            else:
-                self._conn.execute(
-                    "UPDATE model_lineage SET status = ? WHERE model_version = ?",
-                    [status, model_version],
-                )
+            with self._Session() as session:
+                if status == "active":
+                    # Demote current active model
+                    session.query(MLModelLineage).filter(
+                        MLModelLineage.status == "active"
+                    ).update({
+                        MLModelLineage.status: "demoted",
+                        MLModelLineage.demotion_timestamp: now,
+                    })
+                    session.query(MLModelLineage).filter(
+                        MLModelLineage.model_version == model_version
+                    ).update({
+                        MLModelLineage.status: status,
+                        MLModelLineage.promotion_timestamp: now,
+                    })
+                elif status == "demoted":
+                    session.query(MLModelLineage).filter(
+                        MLModelLineage.model_version == model_version
+                    ).update({
+                        MLModelLineage.status: status,
+                        MLModelLineage.demotion_timestamp: now,
+                    })
+                else:
+                    session.query(MLModelLineage).filter(
+                        MLModelLineage.model_version == model_version
+                    ).update({
+                        MLModelLineage.status: status,
+                    })
+                session.commit()
+
             logger.info("model_status_updated", model_version=model_version, status=status)
 
     def get_active_model(self) -> Optional[ModelLineage]:
         """Get the currently active model's lineage."""
-        row = self._conn.execute(
-            "SELECT * FROM model_lineage WHERE status = 'active' LIMIT 1"
-        ).fetchone()
-        if row is None:
-            return None
-        return self._row_to_model_lineage(row)
+        with self._Session() as session:
+            row = session.query(MLModelLineage).filter(
+                MLModelLineage.status == "active"
+            ).first()
+            if row is None:
+                return None
+            return self._row_to_model_lineage(row)
 
     def get_model_history(self, limit: int = 20) -> list[ModelLineage]:
         """Get model version history ordered by training timestamp."""
-        rows = self._conn.execute(
-            "SELECT * FROM model_lineage ORDER BY training_timestamp DESC LIMIT ?",
-            [limit],
-        ).fetchall()
-        return [self._row_to_model_lineage(r) for r in rows]
+        with self._Session() as session:
+            rows = session.query(MLModelLineage).order_by(
+                MLModelLineage.training_timestamp.desc()
+            ).limit(limit).all()
+            return [self._row_to_model_lineage(r) for r in rows]
 
-    def _row_to_model_lineage(self, row: tuple) -> ModelLineage:
+    def _row_to_model_lineage(self, row: MLModelLineage) -> ModelLineage:
         return ModelLineage(
-            model_version=row[0],
-            dataset_id=row[1],
-            feature_version_id=row[2],
-            training_pipeline_id=row[3],
-            parent_model_version=row[4],
-            hyperparameters=json.loads(row[5]) if row[5] else {},
-            training_metrics=json.loads(row[6]) if row[6] else {},
-            training_duration_seconds=row[7] or 0.0,
-            training_timestamp=row[8],
-            promotion_timestamp=row[9],
-            demotion_timestamp=row[10],
-            status=row[11],
+            model_version=row.model_version,
+            dataset_id=row.dataset_id,
+            feature_version_id=row.feature_version_id,
+            training_pipeline_id=row.training_pipeline_id,
+            parent_model_version=row.parent_model_version,
+            hyperparameters=json.loads(row.hyperparameters) if row.hyperparameters else {},
+            training_metrics=json.loads(row.training_metrics) if row.training_metrics else {},
+            training_duration_seconds=row.training_duration_seconds or 0.0,
+            training_timestamp=row.training_timestamp,
+            promotion_timestamp=row.promotion_timestamp,
+            demotion_timestamp=row.demotion_timestamp,
+            status=row.status,
         )
 
     # --- Prediction Tracking ---
@@ -410,131 +368,119 @@ class DatasetRegistry:
         """Record a prediction for lineage tracking."""
         with self._write_lock:
             now = datetime.now(timezone.utc)
-            self._conn.execute(
-                """
-                INSERT INTO prediction_records (
-                    prediction_id, model_version, feature_version_id,
-                    feature_snapshot_id, symbol, timestamp,
-                    predicted_direction, predicted_confidence, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                [
-                    prediction_id, model_version, feature_version_id,
-                    feature_snapshot_id, symbol, now,
-                    predicted_direction, predicted_confidence, now,
-                ],
+            record = MLPredictionRecord(
+                prediction_id=prediction_id,
+                model_version=model_version,
+                feature_version_id=feature_version_id,
+                feature_snapshot_id=feature_snapshot_id,
+                symbol=symbol,
+                timestamp=now,
+                predicted_direction=predicted_direction,
+                predicted_confidence=predicted_confidence,
+                created_at=now,
             )
+            with self._Session() as session:
+                session.add(record)
+                session.commit()
 
     def link_prediction_to_trade(self, prediction_id: str, trade_id: str) -> None:
         """Link a prediction to its executed trade."""
         with self._write_lock:
-            self._conn.execute(
-                "UPDATE prediction_records SET trade_id = ? WHERE prediction_id = ?",
-                [trade_id, prediction_id],
-            )
+            with self._Session() as session:
+                session.query(MLPredictionRecord).filter(
+                    MLPredictionRecord.prediction_id == prediction_id
+                ).update({MLPredictionRecord.trade_id: trade_id})
+                session.commit()
 
     def record_prediction_outcome(self, prediction_id: str, profitable: bool) -> None:
         """Record whether prediction was correct."""
         with self._write_lock:
-            self._conn.execute(
-                "UPDATE prediction_records SET outcome_profitable = ? WHERE prediction_id = ?",
-                [profitable, prediction_id],
-            )
+            with self._Session() as session:
+                session.query(MLPredictionRecord).filter(
+                    MLPredictionRecord.prediction_id == prediction_id
+                ).update({MLPredictionRecord.outcome_profitable: profitable})
+                session.commit()
 
     def get_prediction_lineage(self, trade_id: str) -> Optional[dict]:
         """Full lineage from trade back to dataset."""
-        row = self._conn.execute(
-            """
-            SELECT
-                p.trade_id,
-                p.prediction_id,
-                p.model_version,
-                p.feature_version_id,
-                p.feature_snapshot_id,
-                m.dataset_id,
-                m.training_timestamp,
-                d.source,
-                d.row_count
-            FROM prediction_records p
-            LEFT JOIN model_lineage m ON p.model_version = m.model_version
-            LEFT JOIN datasets d ON m.dataset_id = d.dataset_id
-            WHERE p.trade_id = ?
-            LIMIT 1
-            """,
-            [trade_id],
-        ).fetchone()
-        if row is None:
-            return None
-        return {
-            "trade_id": row[0],
-            "prediction_id": row[1],
-            "model_version": row[2],
-            "feature_version": row[3],
-            "feature_snapshot_id": row[4],
-            "model_trained_on": row[5],
-            "training_timestamp": str(row[6]) if row[6] else None,
-            "dataset_source": row[7],
-            "dataset_row_count": row[8],
-        }
+        with self._Session() as session:
+            pred = session.query(MLPredictionRecord).filter(
+                MLPredictionRecord.trade_id == trade_id
+            ).first()
+            if pred is None:
+                return None
+
+            model = session.query(MLModelLineage).filter(
+                MLModelLineage.model_version == pred.model_version
+            ).first()
+
+            dataset = None
+            if model:
+                dataset = session.query(MLDataset).filter(
+                    MLDataset.dataset_id == model.dataset_id
+                ).first()
+
+            return {
+                "trade_id": pred.trade_id,
+                "prediction_id": pred.prediction_id,
+                "model_version": pred.model_version,
+                "feature_version": pred.feature_version_id,
+                "feature_snapshot_id": pred.feature_snapshot_id,
+                "model_trained_on": model.dataset_id if model else None,
+                "training_timestamp": str(model.training_timestamp) if model and model.training_timestamp else None,
+                "dataset_source": dataset.source if dataset else None,
+                "dataset_row_count": dataset.row_count if dataset else None,
+            }
 
     def reproduce_prediction(self, prediction_id: str) -> dict:
         """Load everything needed to reproduce a historical prediction."""
-        row = self._conn.execute(
-            """
-            SELECT
-                p.prediction_id,
-                p.model_version,
-                p.feature_version_id,
-                p.feature_snapshot_id,
-                p.symbol,
-                p.predicted_direction,
-                p.predicted_confidence,
-                p.timestamp,
-                m.dataset_id,
-                m.hyperparameters,
-                m.training_pipeline_id,
-                d.parquet_path,
-                d.data_hash
-            FROM prediction_records p
-            LEFT JOIN model_lineage m ON p.model_version = m.model_version
-            LEFT JOIN datasets d ON m.dataset_id = d.dataset_id
-            WHERE p.prediction_id = ?
-            LIMIT 1
-            """,
-            [prediction_id],
-        ).fetchone()
-        if row is None:
-            return {}
-        return {
-            "prediction_id": row[0],
-            "model_version": row[1],
-            "feature_version_id": row[2],
-            "feature_snapshot_id": row[3],
-            "symbol": row[4],
-            "predicted_direction": row[5],
-            "predicted_confidence": row[6],
-            "prediction_timestamp": str(row[7]) if row[7] else None,
-            "dataset_id": row[8],
-            "hyperparameters": json.loads(row[9]) if row[9] else {},
-            "training_pipeline_id": row[10],
-            "parquet_path": row[11],
-            "dataset_hash": row[12],
-        }
+        with self._Session() as session:
+            pred = session.query(MLPredictionRecord).filter(
+                MLPredictionRecord.prediction_id == prediction_id
+            ).first()
+            if pred is None:
+                return {}
+
+            model = session.query(MLModelLineage).filter(
+                MLModelLineage.model_version == pred.model_version
+            ).first()
+
+            dataset = None
+            if model:
+                dataset = session.query(MLDataset).filter(
+                    MLDataset.dataset_id == model.dataset_id
+                ).first()
+
+            return {
+                "prediction_id": pred.prediction_id,
+                "model_version": pred.model_version,
+                "feature_version_id": pred.feature_version_id,
+                "feature_snapshot_id": pred.feature_snapshot_id,
+                "symbol": pred.symbol,
+                "predicted_direction": pred.predicted_direction,
+                "predicted_confidence": pred.predicted_confidence,
+                "prediction_timestamp": str(pred.timestamp) if pred.timestamp else None,
+                "dataset_id": model.dataset_id if model else None,
+                "hyperparameters": json.loads(model.hyperparameters) if model and model.hyperparameters else {},
+                "training_pipeline_id": model.training_pipeline_id if model else None,
+                "parquet_path": dataset.parquet_path if dataset else None,
+                "dataset_hash": dataset.data_hash if dataset else None,
+            }
 
     @property
     def dataset_count(self) -> int:
-        result = self._conn.execute("SELECT COUNT(*) FROM datasets").fetchone()
-        return result[0]
+        with self._Session() as session:
+            return session.query(func.count(MLDataset.dataset_id)).scalar()
 
     @property
     def model_count(self) -> int:
-        result = self._conn.execute("SELECT COUNT(*) FROM model_lineage").fetchone()
-        return result[0]
+        with self._Session() as session:
+            return session.query(func.count(MLModelLineage.model_version)).scalar()
 
     @property
     def prediction_count(self) -> int:
-        result = self._conn.execute("SELECT COUNT(*) FROM prediction_records").fetchone()
-        return result[0]
+        with self._Session() as session:
+            return session.query(func.count(MLPredictionRecord.prediction_id)).scalar()
 
     # --- Convenience Integration API ---
 
