@@ -81,6 +81,70 @@ if hasattr(signal, 'SIGBREAK'):
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# Startup Preflight Check
+# ──────────────────────────────────────────────────────────────────────────
+
+def _preflight_check(log):
+    """Verify critical runtime dependencies and credentials at startup.
+
+    Fails fast with actionable error messages so container crashes are
+    immediately diagnosable from logs rather than producing opaque tracebacks.
+    """
+    issues = []
+
+    # 1. Timezone data — the exact failure that caused the 6-day crash loop
+    try:
+        from zoneinfo import ZoneInfo
+        ZoneInfo("US/Eastern")
+        ZoneInfo("America/New_York")
+    except Exception as e:
+        issues.append(
+            f"Timezone data unavailable ({type(e).__name__}: {e}). "
+            "Install 'tzdata' package or use a non-slim base image."
+        )
+
+    # 2. Alpaca API credentials
+    api_key = (settings.alpaca_live_api_key
+               if settings.trading_mode == TradingMode.LIVE
+               else settings.alpaca_paper_api_key)
+    secret = (settings.alpaca_live_secret_key
+              if settings.trading_mode == TradingMode.LIVE
+              else settings.alpaca_paper_secret_key)
+
+    if not api_key or not secret or api_key.startswith("your_"):
+        issues.append(
+            f"Alpaca {'LIVE' if settings.trading_mode == TradingMode.LIVE else 'PAPER'} "
+            "API credentials are missing or placeholder."
+        )
+
+    # 3. Telegram bot token (warn only — bot can run without it)
+    if not settings.telegram_bot_token:
+        log.warning("preflight.telegram_token_missing",
+                    msg="Telegram bot disabled — no TELEGRAM_BOT_TOKEN set")
+    elif not settings.telegram_chat_id:
+        log.warning("preflight.telegram_chat_id_missing",
+                    msg="Telegram notifications disabled — no TELEGRAM_CHAT_ID set")
+
+    # 4. Critical imports that have caused container failures before
+    try:
+        import pandas
+        import numpy
+        import httpx
+    except ImportError as e:
+        issues.append(f"Critical dependency missing: {e}")
+
+    # Report results
+    if issues:
+        for issue in issues:
+            log.error("preflight.FAILED", issue=issue)
+        log.error("preflight.abort",
+                  msg=f"{len(issues)} preflight check(s) failed — aborting startup")
+        sys.exit(1)
+
+    log.info("preflight.passed", checks=4)
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # Strategy Factory
 # ──────────────────────────────────────────────────────────────────────────
 
@@ -335,7 +399,7 @@ def cmd_run(
     broker: AlpacaBroker, strategy_name: str, symbols: list[str],
     timeframe: str, lookback: int, interval: int, dry_run: bool,
     notifier: NotificationManager, enable_telegram: bool = True,
-    enable_streaming: bool = True
+    enable_streaming: bool = True, config_service=None
 ):
     """Main trading loop."""
 
@@ -871,6 +935,7 @@ def cmd_run(
             authorized_users=set(chat_ids),
             runtime_lock=_tg_runtime_lock,
             runtime_changes=_tg_runtime_changes,
+            config_service=config_service,
         )
 
         # Register runtime capabilities commands router
@@ -1668,6 +1733,9 @@ Examples:
     setup_logging(settings.log_level, settings.log_file)
     logger = get_logger("main")
 
+    # Fail fast on missing runtime dependencies or credentials
+    _preflight_check(logger)
+
     # Initialize configuration service (load persisted DB configs)
     logger.info("main.initializing_configuration_service")
     try:
@@ -1753,7 +1821,8 @@ Examples:
         cmd_run(broker, args.strategy, symbols, args.timeframe,
                 args.lookback, args.interval, args.dry_run, notifier,
                 enable_telegram=not args.no_telegram,
-                enable_streaming=not getattr(args, 'no_stream', False))
+                enable_streaming=not getattr(args, 'no_stream', False),
+                config_service=config_service)
 
 
 if __name__ == "__main__":
