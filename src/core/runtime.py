@@ -19,6 +19,7 @@ Capabilities:
 """
 
 import threading
+import re
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
@@ -36,6 +37,11 @@ from backtesting.runner import BacktestRunner
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+_SYMBOL_PATTERN = re.compile(r"^[A-Z0-9/]{1,10}$")
+_STRATEGY_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
+_MODEL_VERSION_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+_TIMEFRAME_WHITELIST = {"1Min", "5Min", "15Min", "30Min", "1Hour", "4Hour", "1Day", "1Week"}
 
 
 class RuntimeManager:
@@ -79,12 +85,20 @@ class RuntimeManager:
         from src.ml.feedback_loop import ExperienceDatabase
         from src.ml.promotion_engine import ModelPromotionEngine
         from src.ml.dataset_registry import DatasetRegistry
-        self._experience_db = ExperienceDatabase()
+        try:
+            self._experience_db = ExperienceDatabase()
+        except Exception as e:
+            self._experience_db = None
+            logger.warning("runtime_manager.experience_db_unavailable", error=str(e))
         self._promotion_engine = ModelPromotionEngine(
             min_evaluation_trades=30,
             min_improvement_pct=5.0,
         )
-        self._dataset_registry = DatasetRegistry()
+        try:
+            self._dataset_registry = DatasetRegistry()
+        except Exception as e:
+            self._dataset_registry = None
+            logger.warning("runtime_manager.dataset_registry_unavailable", error=str(e))
 
         self._predictor = ModelPredictor(
             registry=self._registry,
@@ -189,14 +203,32 @@ class RuntimeManager:
             Dict with run_id (async) or full results (blocking).
         """
         symbols = symbols or settings.symbols_list
+        normalized_strategies = self._validate_strategy_names(strategy_names)
+        normalized_symbols = self._validate_symbols(symbols)
+        normalized_timeframe = self._validate_timeframe(timeframe)
+        normalized_lookback = self._validate_lookback(lookback, field="lookback", maximum=10000)
+
         if not self._strategy_factory:
             raise RuntimeError("No strategy_factory configured")
+        logger.info(
+            "runtime.backtest.started",
+            strategies=normalized_strategies,
+            symbols=normalized_symbols,
+            timeframe=normalized_timeframe,
+            lookback=normalized_lookback,
+            blocking=blocking,
+        )
 
         # Create strategy instances
         strategies = []
-        for name in strategy_names:
+        for name in normalized_strategies:
             try:
-                strategy = self._strategy_factory(name, symbols, timeframe, lookback)
+                strategy = self._strategy_factory(
+                    name,
+                    normalized_symbols,
+                    normalized_timeframe,
+                    normalized_lookback,
+                )
                 strategies.append(strategy)
             except Exception as e:
                 logger.error("runtime.backtest.strategy_creation_failed", name=name, error=str(e))
@@ -207,9 +239,9 @@ class RuntimeManager:
         # Fetch data
         data = {}
         broker = self._broker_manager.broker
-        for symbol in symbols:
+        for symbol in normalized_symbols:
             try:
-                df = broker.get_bars_df(symbol, timeframe, lookback)
+                df = broker.get_bars_df(symbol, normalized_timeframe, normalized_lookback)
                 if df is not None and len(df) >= 50:
                     data[symbol] = df
             except Exception as e:
@@ -221,6 +253,13 @@ class RuntimeManager:
         # Run
         if blocking:
             result = self._backtest_runner.run_multiple(strategies, data)
+            logger.info(
+                "runtime.backtest.completed",
+                run_id=result.run_id,
+                status=result.status.value,
+                strategies=len(normalized_strategies),
+                symbols=len(data),
+            )
             return {
                 "run_id": result.run_id,
                 "status": result.status.value,
@@ -230,7 +269,13 @@ class RuntimeManager:
             }
         else:
             run_id = self._backtest_runner.run_async(strategies, data, callback=callback)
-            return {"run_id": run_id, "status": "running", "strategies": strategy_names}
+            logger.info(
+                "runtime.backtest.launched",
+                run_id=run_id,
+                strategies=len(normalized_strategies),
+                symbols=len(data),
+            )
+            return {"run_id": run_id, "status": "running", "strategies": normalized_strategies}
 
     def get_backtest_status(self, run_id: str) -> Optional[dict]:
         """Get status of a running backtest."""
@@ -270,23 +315,41 @@ class RuntimeManager:
             Dict with pipeline_id for tracking.
         """
         symbols = symbols or settings.symbols_list
+        normalized_symbols = self._validate_symbols(symbols)
+        normalized_timeframe = self._validate_timeframe(timeframe)
+        normalized_lookback = self._validate_lookback(
+            lookback_bars,
+            field="lookback_bars",
+            minimum=50,
+            maximum=50000,
+        )
+        normalized_trigger = (trigger or "manual").strip()
+        if not normalized_trigger or len(normalized_trigger) > 64:
+            raise ValueError("trigger must be between 1 and 64 characters")
 
         # Update broker reference in pipeline (may have been swapped)
         self._training_pipeline._broker = self._broker_manager.broker
 
+        logger.info(
+            "runtime.training.started",
+            symbols=normalized_symbols,
+            timeframe=normalized_timeframe,
+            lookback_bars=normalized_lookback,
+            trigger=normalized_trigger,
+        )
         pipeline_id = self._training_pipeline.train(
-            symbols=symbols,
-            timeframe=timeframe,
-            lookback_bars=lookback_bars,
-            trigger=trigger,
+            symbols=normalized_symbols,
+            timeframe=normalized_timeframe,
+            lookback_bars=normalized_lookback,
+            trigger=normalized_trigger,
             callback=callback,
         )
 
         return {
             "pipeline_id": pipeline_id,
             "status": "running",
-            "symbols": symbols,
-            "trigger": trigger,
+            "symbols": normalized_symbols,
+            "trigger": normalized_trigger,
         }
 
     def get_training_progress(self) -> Optional[dict]:
@@ -312,10 +375,13 @@ class RuntimeManager:
         The model is transparently reloaded in all strategies
         that use the ModelPredictor.
         """
+        normalized_version = self._validate_model_version(version)
+        logger.info("runtime.model_swap.started", version=normalized_version)
         # Update registry active version
-        self._registry.rollback(version)
+        self._registry.rollback(normalized_version)
         # Force predictor reload
-        result = self._predictor.swap_model(version)
+        result = self._predictor.swap_model(normalized_version)
+        logger.info("runtime.model_swap.completed", version=normalized_version)
         return result
 
     def get_model_status(self) -> dict:
@@ -356,15 +422,96 @@ class RuntimeManager:
         Returns:
             Dict with test_id.
         """
-        mode_enum = ABTestMode(mode)
+        normalized_version = self._validate_model_version(challenger_version)
+        if not (0.0 < allocation_pct <= 1.0):
+            raise ValueError("allocation_pct must be in (0, 1]")
+        if not (1 <= min_trades <= 100000):
+            raise ValueError("min_trades must be between 1 and 100000")
+        mode_name = mode.strip().lower()
+        try:
+            mode_enum = ABTestMode(mode_name)
+        except ValueError:
+            valid = ", ".join(m.value for m in ABTestMode)
+            raise ValueError(f"Invalid A/B test mode: {mode}. Must be one of: {valid}") from None
+
+        logger.info(
+            "runtime.ab_test.started",
+            challenger_version=normalized_version,
+            mode=mode_enum.value,
+            allocation_pct=allocation_pct,
+            min_trades=min_trades,
+            auto_promote=auto_promote,
+        )
         test_id = self._ab_manager.start_test(
-            challenger_version=challenger_version,
+            challenger_version=normalized_version,
             mode=mode_enum,
             allocation_pct=allocation_pct,
             min_trades=min_trades,
             auto_promote=auto_promote,
         )
-        return {"test_id": test_id, "status": "active", "mode": mode}
+        return {"test_id": test_id, "status": "active", "mode": mode_enum.value}
+
+    @staticmethod
+    def _validate_strategy_names(strategy_names: list[str]) -> list[str]:
+        if not strategy_names:
+            raise ValueError("At least one strategy name is required")
+        if len(strategy_names) > 20:
+            raise ValueError("No more than 20 strategy names are allowed")
+        normalized = []
+        for name in strategy_names:
+            strategy_name = (name or "").strip().lower()
+            if not _STRATEGY_PATTERN.match(strategy_name):
+                raise ValueError(
+                    f"Invalid strategy name '{name}'. Use lowercase letters, digits, underscores (max 32 chars)."
+                )
+            normalized.append(strategy_name)
+        return normalized
+
+    @staticmethod
+    def _validate_symbols(symbols: list[str]) -> list[str]:
+        if not symbols:
+            raise ValueError("At least one symbol is required")
+        if len(symbols) > 100:
+            raise ValueError("No more than 100 symbols are allowed")
+        normalized = []
+        for raw_symbol in symbols:
+            symbol = (raw_symbol or "").strip().upper()
+            if not _SYMBOL_PATTERN.match(symbol):
+                raise ValueError(
+                    f"Invalid symbol '{raw_symbol}'. Use uppercase letters, digits, and / (max 10 chars)."
+                )
+            normalized.append(symbol)
+        return normalized
+
+    @staticmethod
+    def _validate_timeframe(timeframe: str) -> str:
+        normalized = (timeframe or "").strip()
+        if normalized not in _TIMEFRAME_WHITELIST:
+            allowed = ", ".join(sorted(_TIMEFRAME_WHITELIST))
+            raise ValueError(f"Invalid timeframe '{timeframe}'. Allowed: {allowed}")
+        return normalized
+
+    @staticmethod
+    def _validate_lookback(
+        value: int,
+        field: str = "lookback",
+        minimum: int = 1,
+        maximum: int = 10000,
+    ) -> int:
+        if not isinstance(value, int):
+            raise ValueError(f"{field} must be an integer")
+        if value < minimum or value > maximum:
+            raise ValueError(f"{field} must be between {minimum} and {maximum}")
+        return value
+
+    @staticmethod
+    def _validate_model_version(version: str) -> str:
+        normalized = (version or "").strip()
+        if not _MODEL_VERSION_PATTERN.match(normalized):
+            raise ValueError(
+                "Invalid model version. Use letters, digits, dot, underscore, or hyphen (max 64 chars)."
+            )
+        return normalized
 
     def record_ab_trade(self, model_version: str, trade_result: dict) -> None:
         """Record a trade for A/B test evaluation."""
@@ -510,5 +657,17 @@ class RuntimeManager:
     def shutdown(self):
         """Clean shutdown of all runtime components."""
         logger.info("runtime_manager.shutting_down")
+        try:
+            self._training_pipeline.stop()
+        except Exception as e:
+            logger.warning("runtime_manager.training_stop_failed", error=str(e))
+        try:
+            self._ab_manager.cancel_test(reason="runtime_shutdown")
+        except Exception as e:
+            logger.warning("runtime_manager.ab_cancel_failed", error=str(e))
+        try:
+            self._backtest_runner.stop()
+        except Exception as e:
+            logger.warning("runtime_manager.backtest_stop_failed", error=str(e))
         self._predictor.stop()
         logger.info("runtime_manager.shutdown_complete")

@@ -756,6 +756,21 @@ class ExecutionEngine:
             trade_lifecycle.transition(TradeState.SUBMITTED, "order submitted to broker")
 
         # Place the order — use contract SL/TP (system-determined) not strategy hints
+        order_type = "bracket" if (final_stop_loss and final_take_profit) else "market"
+        logger.info(
+            "engine.order_attempt",
+            symbol=signal.symbol,
+            side=side,
+            qty=final_qty,
+            price=observed_price,
+            order_type=order_type,
+            stop_loss=final_stop_loss,
+            take_profit=final_take_profit,
+            signal_id=signal.signal_id,
+            strategy=signal.strategy_id,
+            confidence=f"{effective_confidence:.3f}",
+            contract_id=decision_contract.contract_id if decision_contract else "",
+        )
         try:
             if final_stop_loss and final_take_profit:
                 order = self.broker.bracket_order(

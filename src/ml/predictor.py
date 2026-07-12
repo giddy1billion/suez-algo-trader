@@ -332,12 +332,29 @@ class ModelPredictor:
         """
         with self._lock:
             old_version = self._version
-            self._load_version(version)
+            try:
+                self._load_version(version)
+            except Exception as e:
+                logger.error(
+                    "predictor.swap_failed",
+                    target_version=version,
+                    current_version=old_version,
+                    error=str(e),
+                )
+                self._errors.append({
+                    "time": datetime.now(timezone.utc).isoformat(),
+                    "error": f"swap_failed: {e}",
+                    "version": version,
+                })
+                if len(self._errors) > self._max_errors:
+                    self._errors = self._errors[-self._max_errors:]
+                raise
             self._swap_count += 1
 
             result = {
                 "old_version": old_version,
                 "new_version": version,
+                "swap_count": self._swap_count,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
 
@@ -439,6 +456,8 @@ class ModelPredictor:
         self._stop_event.set()
         if self._watcher_thread and self._watcher_thread.is_alive():
             self._watcher_thread.join(timeout=5.0)
+            if self._watcher_thread.is_alive():
+                logger.warning("predictor.stop_timeout", timeout=5.0)
 
     # ──────────────────────────────────────────────────────────────────────
     # Internal
@@ -552,6 +571,12 @@ class ModelPredictor:
             try:
                 self._load_version(active)
                 self._swap_count += 1
+                logger.info(
+                    "predictor.auto_reload_success",
+                    old_version=old_version,
+                    new_version=active,
+                    swap_count=self._swap_count,
+                )
                 if self._event_bus:
                     from src.core.events import ModelSwapped
                     self._event_bus.publish(ModelSwapped(
@@ -562,7 +587,20 @@ class ModelPredictor:
                         source="model_predictor",
                     ))
             except Exception as e:
-                logger.error("predictor.auto_swap_failed", error=str(e))
+                self._errors.append({
+                    "time": datetime.now(timezone.utc).isoformat(),
+                    "error": f"auto_swap_failed: {e}",
+                    "version": active,
+                })
+                if len(self._errors) > self._max_errors:
+                    self._errors = self._errors[-self._max_errors:]
+                logger.error(
+                    "predictor.auto_swap_failed",
+                    target_version=active,
+                    current_version=self._version,
+                    error=str(e),
+                    error_count=len(self._errors),
+                )
 
     def _start_watcher(self):
         """Start background thread that watches for model version changes."""

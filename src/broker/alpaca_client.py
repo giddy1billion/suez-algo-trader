@@ -118,13 +118,32 @@ def _retry(max_retries: int = 3, base_delay: float = 1.0):
                     return fn(*args, **kwargs)
                 except Exception as exc:
                     last_exc = exc
-                    if attempt == max_retries or not _is_retryable(exc):
+                    retryable = _is_retryable(exc)
+                    if attempt == max_retries or not retryable:
+                        # Emit explicit exhaustion/non-retryable signal
+                        if attempt == max_retries and retryable:
+                            logger.error(
+                                "api.retries_exhausted",
+                                method=fn.__name__,
+                                attempts=max_retries + 1,
+                                error=str(exc),
+                                retryable=True,
+                            )
+                        elif not retryable:
+                            logger.error(
+                                "api.non_retryable_failure",
+                                method=fn.__name__,
+                                attempt=attempt + 1,
+                                error=str(exc),
+                                retryable=False,
+                            )
                         raise
                     delay = base_delay * (2 ** attempt) + random.uniform(0, 0.5)
                     logger.warning(
                         "api.retry",
                         method=fn.__name__,
                         attempt=attempt + 1,
+                        max_retries=max_retries,
                         delay=round(delay, 2),
                         error=str(exc),
                     )
@@ -924,7 +943,27 @@ class AlpacaBroker:
             except Exception as e:
                 logger.debug("trade_stream.stop_error", error=str(e))
             self._trade_stream = None
+        if self._trade_stream_thread and self._trade_stream_thread.is_alive():
+            self._trade_stream_thread.join(timeout=5.0)
+            if self._trade_stream_thread.is_alive():
+                logger.warning("trade_stream.stop_timeout", timeout=5.0)
+        self._trade_stream_thread = None
         logger.info("trade_stream.stopped")
+
+    def stop_market_data_streams(self):
+        """Stop stock/crypto market-data WebSocket streams."""
+        if self._stock_stream:
+            try:
+                self._stock_stream.stop()
+            except Exception as e:
+                logger.debug("stock_stream.stop_error", error=str(e))
+            self._stock_stream = None
+        if self._crypto_stream:
+            try:
+                self._crypto_stream.stop()
+            except Exception as e:
+                logger.debug("crypto_stream.stop_error", error=str(e))
+            self._crypto_stream = None
 
     # ──────────────────────────────────────────────────────────────────────
     # Asset Discovery

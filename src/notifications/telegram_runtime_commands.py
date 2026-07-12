@@ -15,6 +15,7 @@ These commands require RuntimeManager to be injected via set_runtime_components(
 """
 
 import threading
+import re
 from datetime import datetime
 
 from aiogram import Router, F
@@ -32,6 +33,9 @@ runtime_router = Router()
 _runtime_manager = None
 _authorized_users: set[int] = set()
 _broker_lock = threading.Lock()
+_SYMBOL_PATTERN = re.compile(r"^[A-Z0-9/]{1,10}$")
+_STRATEGY_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
+_MODEL_VERSION_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 
 
 def set_runtime_components(
@@ -46,9 +50,61 @@ def set_runtime_components(
 
 
 def _is_authorized(message: Message) -> bool:
+    user_id = message.from_user.id if message.from_user else None
     if not _authorized_users:
+        logger.warning("telegram.runtime.unauthorized", user_id=user_id, reason="no_authorized_users")
         return False
-    return message.from_user.id in _authorized_users
+    is_allowed = bool(user_id and user_id in _authorized_users)
+    if not is_allowed:
+        logger.warning("telegram.runtime.unauthorized", user_id=user_id, reason="user_not_allowlisted")
+    return is_allowed
+
+
+def _actor(message: Message) -> str:
+    return f"telegram:{message.from_user.id}" if message.from_user else "telegram:unknown"
+
+
+def _normalize_symbols(raw_symbols: list[str]) -> list[str]:
+    if not raw_symbols:
+        raise ValueError("At least one symbol is required.")
+    if len(raw_symbols) > 100:
+        raise ValueError("No more than 100 symbols are allowed.")
+
+    normalized = []
+    for raw in raw_symbols:
+        symbol = (raw or "").strip().upper()
+        if not _SYMBOL_PATTERN.match(symbol):
+            raise ValueError(
+                f"Invalid symbol '{raw}'. Use uppercase letters, digits, and / (max 10 chars)."
+            )
+        normalized.append(symbol)
+    return normalized
+
+
+def _normalize_strategy_names(raw_strategies: list[str]) -> list[str]:
+    if not raw_strategies:
+        raise ValueError("At least one strategy is required.")
+    if len(raw_strategies) > 20:
+        raise ValueError("No more than 20 strategies are allowed.")
+
+    normalized = []
+    for raw in raw_strategies:
+        name = (raw or "").strip().lower()
+        if not _STRATEGY_PATTERN.match(name):
+            raise ValueError(
+                f"Invalid strategy '{raw}'. Use lowercase letters, digits, underscores (max 32 chars)."
+            )
+        normalized.append(name)
+    return normalized
+
+
+def _normalize_model_version(version: str) -> str:
+    normalized = (version or "").strip()
+    if not _MODEL_VERSION_PATTERN.match(normalized):
+        raise ValueError(
+            "Invalid model version. Use letters, digits, dot, underscore, or hyphen (max 64 chars)."
+        )
+    return normalized
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -164,6 +220,7 @@ async def cmd_rbacktest(message: Message):
         await message.answer("Runtime manager not initialized.")
         return
 
+    actor = _actor(message)
     parts = message.text.split(maxsplit=2)
     strategies = ["momentum", "mean_reversion", "ml"]
     symbols = None
@@ -172,6 +229,20 @@ async def cmd_rbacktest(message: Message):
         strategies = [s.strip() for s in parts[1].split(",") if s.strip()]
     if len(parts) >= 3:
         symbols = [s.strip() for s in parts[2].split(",") if s.strip()]
+    try:
+        strategies = _normalize_strategy_names(strategies)
+        if symbols is not None:
+            symbols = _normalize_symbols(symbols)
+    except ValueError as e:
+        await message.answer(f"❌ {e}")
+        return
+
+    logger.info(
+        "telegram.runtime.rbacktest.requested",
+        actor=actor,
+        strategies=strategies,
+        symbols=symbols,
+    )
 
     await message.answer(
         f"<b>Starting concurrent backtest...</b>\n"
@@ -187,6 +258,13 @@ async def cmd_rbacktest(message: Message):
             symbols=symbols,
             blocking=False,
         )
+        logger.info(
+            "telegram.runtime.rbacktest.started",
+            actor=actor,
+            run_id=result.get("run_id"),
+            strategies=strategies,
+            symbols=symbols,
+        )
         await message.answer(
             f"<b>Backtest Launched</b>\n"
             f"Run ID: <code>{result['run_id'][:12]}</code>\n"
@@ -195,6 +273,7 @@ async def cmd_rbacktest(message: Message):
             parse_mode=ParseMode.HTML,
         )
     except Exception as e:
+        logger.error("telegram.runtime.rbacktest.failed", actor=actor, error=str(e))
         await message.answer(f"Backtest failed: {e}")
 
 
@@ -252,6 +331,7 @@ async def cmd_rtrain(message: Message):
         await message.answer("Runtime manager not initialized.")
         return
 
+    actor = _actor(message)
     if _runtime_manager.is_training():
         progress = _runtime_manager.get_training_progress()
         await message.answer(
@@ -266,6 +346,14 @@ async def cmd_rtrain(message: Message):
     symbols = None
     if len(parts) >= 2:
         symbols = [s.strip() for s in parts[1].split(",") if s.strip()]
+    try:
+        if symbols is not None:
+            symbols = _normalize_symbols(symbols)
+    except ValueError as e:
+        await message.answer(f"❌ {e}")
+        return
+
+    logger.info("telegram.runtime.rtrain.requested", actor=actor, symbols=symbols)
 
     await message.answer(
         f"<b>ML Training Pipeline Started</b>\n"
@@ -280,12 +368,19 @@ async def cmd_rtrain(message: Message):
             symbols=symbols,
             trigger="telegram",
         )
+        logger.info(
+            "telegram.runtime.rtrain.started",
+            actor=actor,
+            pipeline_id=result.get("pipeline_id"),
+            symbols=result.get("symbols"),
+        )
         await message.answer(
             f"Pipeline ID: <code>{result['pipeline_id'][:12]}</code>\n"
             f"Status: {result['status']}",
             parse_mode=ParseMode.HTML,
         )
     except Exception as e:
+        logger.error("telegram.runtime.rtrain.failed", actor=actor, error=str(e))
         await message.answer(f"Training failed to start: {e}")
 
 
@@ -352,6 +447,7 @@ async def cmd_modelswap(message: Message):
         await message.answer("Runtime manager not initialized.")
         return
 
+    actor = _actor(message)
     parts = message.text.split(maxsplit=1)
 
     if len(parts) < 2:
@@ -378,9 +474,15 @@ async def cmd_modelswap(message: Message):
             await message.answer(f"Error: {e}")
         return
 
-    version = parts[1].strip()
     try:
+        version = _normalize_model_version(parts[1])
+    except ValueError as e:
+        await message.answer(f"❌ {e}")
+        return
+    try:
+        logger.info("telegram.runtime.modelswap.requested", actor=actor, version=version)
         result = _runtime_manager.swap_model(version)
+        logger.info("telegram.runtime.modelswap.completed", actor=actor, version=version)
         await message.answer(
             f"<b>Model Swapped</b>\n"
             f"Version: <code>{version}</code>\n"
@@ -389,6 +491,7 @@ async def cmd_modelswap(message: Message):
             parse_mode=ParseMode.HTML,
         )
     except Exception as e:
+        logger.error("telegram.runtime.modelswap.failed", actor=actor, version=version, error=str(e))
         await message.answer(f"Model swap failed: {e}")
 
 
@@ -411,6 +514,7 @@ async def cmd_abtest(message: Message):
         await message.answer("Runtime manager not initialized.")
         return
 
+    actor = _actor(message)
     parts = message.text.split()
 
     if len(parts) < 2:
@@ -474,17 +578,34 @@ async def cmd_abtest(message: Message):
             await message.answer("Usage: /abtest start VERSION [mode]\nModes: shadow, split, interleaved")
             return
 
-        version = parts[2]
-        mode = parts[3] if len(parts) > 3 else "shadow"
+        try:
+            version = _normalize_model_version(parts[2])
+        except ValueError as e:
+            await message.answer(f"❌ {e}")
+            return
+        mode = (parts[3] if len(parts) > 3 else "shadow").lower()
 
         if mode not in ("shadow", "split", "interleaved"):
             await message.answer("Invalid mode. Use: shadow, split, or interleaved")
             return
 
         try:
+            logger.info(
+                "telegram.runtime.abtest.start_requested",
+                actor=actor,
+                version=version,
+                mode=mode,
+            )
             result = _runtime_manager.start_ab_test(
                 challenger_version=version,
                 mode=mode,
+            )
+            logger.info(
+                "telegram.runtime.abtest.started",
+                actor=actor,
+                version=version,
+                mode=mode,
+                test_id=result.get("test_id"),
             )
             await message.answer(
                 f"<b>A/B Test Started</b>\n"
@@ -495,6 +616,13 @@ async def cmd_abtest(message: Message):
                 parse_mode=ParseMode.HTML,
             )
         except Exception as e:
+            logger.error(
+                "telegram.runtime.abtest.start_failed",
+                actor=actor,
+                version=version,
+                mode=mode,
+                error=str(e),
+            )
             await message.answer(f"A/B test start failed: {e}")
         return
 

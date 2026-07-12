@@ -135,12 +135,14 @@ class ActivityGraph:
 
     def get_activity(self, name: str) -> Optional[ActivityNode]:
         """Get activity by name."""
-        return self._nodes.get(name)
+        with self._lock:
+            return self._nodes.get(name)
 
     @property
     def activities(self) -> list[ActivityNode]:
         """All activity nodes."""
-        return list(self._nodes.values())
+        with self._lock:
+            return list(self._nodes.values())
 
     def get_ready_activities(
         self,
@@ -192,13 +194,21 @@ class ActivityGraph:
         **kwargs,
     ) -> ActivityResult:
         """Execute a single activity and record the result."""
-        node._status = ActivityStatus.RUNNING
-        started = datetime.now(timezone.utc)
-        trigger_reasons = [t.description() for t in node.triggers if t.evaluate(context)]
+        with self._lock:
+            if node._status == ActivityStatus.RUNNING:
+                return ActivityResult(
+                    activity_id=node.name,
+                    status=ActivityStatus.SKIPPED,
+                    started_at=datetime.now(timezone.utc),
+                    completed_at=datetime.now(timezone.utc),
+                    error="activity_already_running",
+                )
+            node._status = ActivityStatus.RUNNING
+            started = datetime.now(timezone.utc)
+            trigger_reasons = [t.description() for t in node.triggers if t.evaluate(context)]
 
         try:
             result = node.callable(**kwargs)
-            node._status = ActivityStatus.COMPLETED
             activity_result = ActivityResult(
                 activity_id=node.name,
                 status=ActivityStatus.COMPLETED,
@@ -208,7 +218,6 @@ class ActivityGraph:
                 trigger_reason=", ".join(trigger_reasons),
             )
         except Exception as e:
-            node._status = ActivityStatus.FAILED
             activity_result = ActivityResult(
                 activity_id=node.name,
                 status=ActivityStatus.FAILED,
@@ -219,12 +228,12 @@ class ActivityGraph:
             )
             logger.error("activity_graph.execution_failed", activity=node.name, error=str(e))
 
-        node._last_run = activity_result.completed_at
-        node._last_result = activity_result
-        node._run_count += 1
-        node.reset_triggers(context)
-
         with self._lock:
+            node._status = activity_result.status
+            node._last_run = activity_result.completed_at
+            node._last_result = activity_result
+            node._run_count += 1
+            node.reset_triggers(context)
             self._execution_history.append(activity_result)
             # Keep history bounded
             if len(self._execution_history) > 1000:
@@ -245,23 +254,24 @@ class ActivityGraph:
 
     def get_topology_order(self) -> list[str]:
         """Return activity names in topological (dependency) order."""
-        visited: set[str] = set()
-        order: list[str] = []
+        with self._lock:
+            visited: set[str] = set()
+            order: list[str] = []
 
-        def _visit(name: str) -> None:
-            if name in visited:
-                return
-            visited.add(name)
-            node = self._nodes.get(name)
-            if node:
-                for dep in node.dependencies:
-                    _visit(dep)
-            order.append(name)
+            def _visit(name: str) -> None:
+                if name in visited:
+                    return
+                visited.add(name)
+                node = self._nodes.get(name)
+                if node:
+                    for dep in node.dependencies:
+                        _visit(dep)
+                order.append(name)
 
-        for name in self._nodes:
-            _visit(name)
+            for name in self._nodes:
+                _visit(name)
 
-        return order
+            return order
 
     def summary(self) -> dict[str, Any]:
         """Get a summary of the graph state."""

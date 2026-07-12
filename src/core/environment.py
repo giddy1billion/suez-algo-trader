@@ -153,6 +153,55 @@ class BrokerManager:
                 "timestamp": self._last_switch_time.isoformat(),
             }
 
+    def restore_broker(
+        self,
+        broker: BrokerProtocol,
+        reason: str = "rollback",
+        publish_event: bool = True,
+    ) -> dict:
+        """
+        Restore a previously active broker instance without draining positions.
+
+        This is intended for compensating rollback paths after a failed switch.
+        """
+        with self._lock:
+            previous = self._broker
+            if previous is broker:
+                return {
+                    "success": True,
+                    "old_broker": previous.name,
+                    "new_broker": broker.name,
+                    "restored": False,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+
+            self._broker = broker
+            self._switch_count += 1
+            self._last_switch_time = datetime.now(timezone.utc)
+
+            logger.warning(
+                "broker_manager.restored",
+                old=previous.name,
+                new=broker.name,
+                reason=reason,
+            )
+
+            if self._event_bus and publish_event:
+                self._event_bus.publish(BrokerSwitched(
+                    old_broker=previous.name,
+                    new_broker=broker.name,
+                    open_positions_migrated=0,
+                    source="broker_manager:restore",
+                ))
+
+            return {
+                "success": True,
+                "old_broker": previous.name,
+                "new_broker": broker.name,
+                "restored": True,
+                "timestamp": self._last_switch_time.isoformat(),
+            }
+
     def _drain_positions(self, broker: BrokerProtocol, timeout: float) -> int:
         """
         Close all open positions on a broker. Returns count closed.
@@ -311,12 +360,15 @@ class EnvironmentManager:
                 }
 
             old_mode = self._current_mode
+            old_settings_mode = settings.trading_mode
+            old_broker = self._broker_manager.broker
             result = {
                 "old_mode": old_mode.value,
                 "new_mode": target_mode.value,
                 "reason": reason,
                 "started_at": datetime.now(timezone.utc).isoformat(),
             }
+            broker_swapped = False
 
             try:
                 # Phase 1: Validate
@@ -340,6 +392,7 @@ class EnvironmentManager:
                     new_broker,
                     drain_positions=drain_positions,
                 )
+                broker_swapped = True
 
                 # Phase 4: Update settings in-memory
                 settings.trading_mode = target_mode
@@ -377,6 +430,34 @@ class EnvironmentManager:
                 self._state = SwitchState.FAILED
                 result["success"] = False
                 result["error"] = str(e)
+                rollback_performed = False
+                rollback_errors: list[str] = []
+
+                if broker_swapped:
+                    rollback_performed = True
+                    try:
+                        self._broker_manager.restore_broker(
+                            old_broker,
+                            reason=f"env_switch_failed:{target_mode.value}",
+                            publish_event=False,
+                        )
+                    except Exception as rollback_exc:
+                        rollback_errors.append(f"broker_restore_failed:{rollback_exc}")
+
+                if self._current_mode != old_mode:
+                    rollback_performed = True
+                    self._current_mode = old_mode
+
+                if settings.trading_mode != old_settings_mode:
+                    rollback_performed = True
+                    settings.trading_mode = old_settings_mode
+
+                if rollback_performed:
+                    result["rollback_performed"] = True
+                    result["rollback_success"] = len(rollback_errors) == 0
+                    if rollback_errors:
+                        result["rollback_errors"] = rollback_errors
+
                 self._switch_history.append(result)
 
                 logger.error(
@@ -384,10 +465,16 @@ class EnvironmentManager:
                     error=str(e),
                     old_mode=old_mode.value,
                     target_mode=target_mode.value,
+                    rollback_performed=rollback_performed,
+                    rollback_errors=rollback_errors,
                 )
 
                 # Reset state after brief delay
                 self._state = SwitchState.IDLE
+                if rollback_errors:
+                    raise RuntimeError(
+                        f"Environment switch failed: {e}; rollback issues: {'; '.join(rollback_errors)}"
+                    ) from e
                 raise RuntimeError(f"Environment switch failed: {e}") from e
 
     def _validate_live_readiness(self):

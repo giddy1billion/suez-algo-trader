@@ -137,6 +137,7 @@ class TrainingPipeline:
         self._max_history: int = 50  # Cap to prevent memory leak
         self._lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
 
     # ──────────────────────────────────────────────────────────────────────
     # Public API
@@ -174,6 +175,7 @@ class TrainingPipeline:
                     f"Pipeline already running: {self._current.pipeline_id} "
                     f"(step: {self._current.current_step})"
                 )
+            self._stop_event.clear()
 
             pipeline_id = uuid.uuid4().hex[:12]
             progress = PipelineProgress(
@@ -280,6 +282,19 @@ class TrainingPipeline:
         with self._lock:
             return [p.to_dict() for p in self._history[-limit:]]
 
+    def stop(self, timeout: float = 10.0) -> None:
+        """
+        Request pipeline shutdown and join the worker thread when present.
+
+        The request is cooperative; the current run exits at safe checkpoints.
+        """
+        self._stop_event.set()
+        thread = self._thread
+        if thread and thread.is_alive():
+            thread.join(timeout=timeout)
+            if thread.is_alive():
+                logger.warning("training_pipeline.stop_timeout", timeout=timeout)
+
     # ──────────────────────────────────────────────────────────────────────
     # Pipeline Execution
     # ──────────────────────────────────────────────────────────────────────
@@ -296,6 +311,7 @@ class TrainingPipeline:
         progress.started_at = datetime.now(timezone.utc)
         progress.status = PipelineStatus.FETCHING_DATA
         train_start = time.perf_counter()
+        self._raise_if_stopping()
 
         # Pre-flight: check optional dependencies
         try:
@@ -315,6 +331,7 @@ class TrainingPipeline:
             data = data_override
         else:
             data = self._fetch_data(symbols, timeframe, lookback_bars)
+        self._raise_if_stopping()
 
         if not data:
             raise RuntimeError("No data fetched for any symbol")
@@ -329,6 +346,7 @@ class TrainingPipeline:
         from src.ml.features import engineer_features
         feature_data = {}
         for symbol, df in data.items():
+            self._raise_if_stopping()
             try:
                 featured_df = engineer_features(df, include_target=False)
                 if len(featured_df) >= self._min_samples:
@@ -345,6 +363,7 @@ class TrainingPipeline:
 
         if not feature_data:
             raise RuntimeError("Feature engineering produced no usable data")
+        self._raise_if_stopping()
 
         progress.steps_completed = 2
 
@@ -357,6 +376,7 @@ class TrainingPipeline:
         logger.info("training_pipeline.step", step="train_model")
 
         model, metrics, feature_cols = self._train_model(feature_data)
+        self._raise_if_stopping()
         progress.metrics = metrics
         progress.steps_completed = 3
 
@@ -491,6 +511,7 @@ class TrainingPipeline:
 
         data = {}
         for symbol in symbols:
+            self._raise_if_stopping()
             try:
                 df = self._broker.get_bars_df(symbol, timeframe, lookback_bars)
                 if df is not None and len(df) > 0:
@@ -989,3 +1010,7 @@ class TrainingPipeline:
         except Exception as e:
             logger.error("training_pipeline.rollback_failed", error=str(e))
         return False
+
+    def _raise_if_stopping(self) -> None:
+        if self._stop_event.is_set():
+            raise RuntimeError("training_pipeline.stop_requested")

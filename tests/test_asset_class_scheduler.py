@@ -1,6 +1,7 @@
 """Tests for Asset-Class Scheduler (Phase 1)."""
 
 import time
+import threading
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
@@ -178,6 +179,41 @@ class TestActivityGraph:
         result = graph.execute_activity(node, context)
         assert result.status == ActivityStatus.FAILED
         assert "oops" in result.error
+
+    def test_execute_activity_skips_when_already_running(self):
+        graph = ActivityGraph()
+        trigger = ManualTrigger()
+        trigger.activate()
+        started = threading.Event()
+        release = threading.Event()
+        call_count = {"n": 0}
+
+        def slow_callable():
+            call_count["n"] += 1
+            started.set()
+            release.wait(timeout=1.0)
+            return "ok"
+
+        node = ActivityNode(name="slow", callable=slow_callable, triggers=[trigger])
+        graph.add_activity(node)
+        context = TriggerContext()
+        first_result = {}
+
+        def _run_first():
+            first_result["value"] = graph.execute_activity(node, context)
+
+        thread = threading.Thread(target=_run_first)
+        thread.start()
+        assert started.wait(timeout=1.0)
+
+        second_result = graph.execute_activity(node, context)
+        release.set()
+        thread.join(timeout=1.0)
+
+        assert first_result["value"].status == ActivityStatus.COMPLETED
+        assert second_result.status == ActivityStatus.SKIPPED
+        assert second_result.error == "activity_already_running"
+        assert call_count["n"] == 1
 
     def test_asset_class_gating(self):
         graph = ActivityGraph()

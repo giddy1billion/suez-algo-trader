@@ -159,6 +159,7 @@ class BacktestRunner:
         self._active_runs: dict[str, MultiBacktestResult] = {}
         self._executor: Optional[ThreadPoolExecutor] = None
         self._lock = threading.Lock()
+        self._async_threads: dict[str, threading.Thread] = {}
 
     # ──────────────────────────────────────────────────────────────────────
     # Synchronous API (blocking)
@@ -289,12 +290,17 @@ class BacktestRunner:
                     callback(result)
             except Exception as e:
                 logger.error("backtest_runner.async_failed", run_id=run_id, error=str(e))
+            finally:
+                with self._lock:
+                    self._async_threads.pop(run_id, None)
 
         thread = threading.Thread(
             target=_background,
             name=f"backtest-{run_id}",
             daemon=True,
         )
+        with self._lock:
+            self._async_threads[run_id] = thread
         thread.start()
 
         logger.info(
@@ -305,6 +311,16 @@ class BacktestRunner:
         )
 
         return run_id
+
+    def stop(self, timeout: float = 10.0) -> None:
+        """Join active async backtest threads for deterministic shutdown."""
+        with self._lock:
+            threads = list(self._async_threads.items())
+        for run_id, thread in threads:
+            if thread.is_alive():
+                thread.join(timeout=timeout)
+                if thread.is_alive():
+                    logger.warning("backtest_runner.stop_timeout", run_id=run_id, timeout=timeout)
 
     # ──────────────────────────────────────────────────────────────────────
     # Status & Management

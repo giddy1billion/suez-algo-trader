@@ -84,3 +84,29 @@ class TestOperationalModes:
     def test_status_includes_operational_mode(self, runtime_manager):
         status = runtime_manager.get_status()
         assert "operational_mode" in status["environment"]
+
+    def test_run_backtest_rejects_invalid_symbol(self, runtime_manager):
+        with pytest.raises(ValueError, match="Invalid symbol"):
+            runtime_manager.run_backtest(
+                strategy_names=["momentum"],
+                symbols=["bad symbol"],
+            )
+
+    def test_train_model_rejects_invalid_timeframe(self, runtime_manager):
+        with pytest.raises(ValueError, match="Invalid timeframe"):
+            runtime_manager.train_model(
+                symbols=["AAPL"],
+                timeframe="2Min",
+            )
+
+    def test_swap_model_rejects_invalid_version(self, runtime_manager):
+        with pytest.raises(ValueError, match="Invalid model version"):
+            runtime_manager.swap_model("bad version!")
+
+    def test_start_ab_test_rejects_invalid_allocation(self, runtime_manager):
+        with pytest.raises(ValueError, match="allocation_pct must be in"):
+            runtime_manager.start_ab_test(
+                challenger_version="v003",
+                mode="shadow",
+                allocation_pct=0.0,
+            )
