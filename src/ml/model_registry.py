@@ -11,11 +11,14 @@ import shutil
 import tempfile
 import threading
 from datetime import datetime
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import joblib
 
 from src.utils.logger import get_logger
+
+if TYPE_CHECKING:
+    from src.utils.blob_storage import ArtifactStore
 
 logger = get_logger(__name__)
 
@@ -30,10 +33,12 @@ class ModelRegistry:
     registry.json manifest that tracks all versions and their metadata.
     """
 
-    def __init__(self, models_dir: str = "models"):
+    def __init__(self, models_dir: str = "models", artifact_store: Optional["ArtifactStore"] = None):
         self.models_dir = models_dir
         self.registry_path = os.path.join(models_dir, "registry.json")
         self.latest_path = os.path.join(models_dir, "latest_model.joblib")
+        self._artifact_store = artifact_store
+        self._blob_container = "models"
         os.makedirs(models_dir, exist_ok=True)
 
         # Self-heal: recover orphaned models if registry is missing
@@ -86,11 +91,37 @@ class ModelRegistry:
             }
             joblib.dump(artifact, filepath)
 
+            # Upload to blob storage if configured
+            if self._artifact_store:
+                try:
+                    with open(filepath, "rb") as f:
+                        self._artifact_store.upload(
+                            self._blob_container, filename, f.read()
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "ml.registry.blob_upload_failed",
+                        version=version_str,
+                        error=str(exc),
+                    )
+
             # Only update latest_model.joblib when governance approves activation.
             # This prevents rejected models from being picked up by the predictor's
             # fallback path (_load_active_model → latest_model.joblib).
             if activate:
                 shutil.copy2(filepath, self.latest_path)
+                # Sync latest to blob
+                if self._artifact_store:
+                    try:
+                        with open(self.latest_path, "rb") as f:
+                            self._artifact_store.upload(
+                                self._blob_container, "latest_model.joblib", f.read()
+                            )
+                    except Exception as exc:
+                        logger.warning(
+                            "ml.registry.blob_latest_upload_failed",
+                            error=str(exc),
+                        )
 
             if activate:
                 # Mark all previous versions as inactive
@@ -183,6 +214,28 @@ class ModelRegistry:
         entry = self._find_entry(registry, version_str)
 
         filepath = os.path.join(self.models_dir, entry["filename"])
+
+        # Try blob first, download to local if missing locally
+        if not os.path.exists(filepath) and self._artifact_store:
+            try:
+                data = self._artifact_store.download(
+                    self._blob_container, entry["filename"]
+                )
+                os.makedirs(os.path.dirname(filepath) or ".", exist_ok=True)
+                with open(filepath, "wb") as f:
+                    f.write(data)
+                logger.info(
+                    "ml.registry.blob_download_restored",
+                    version=version_str,
+                    filename=entry["filename"],
+                )
+            except Exception as exc:
+                logger.warning(
+                    "ml.registry.blob_download_failed",
+                    version=version_str,
+                    error=str(exc),
+                )
+
         if not os.path.exists(filepath):
             raise FileNotFoundError(
                 f"Model file not found: {filepath}"

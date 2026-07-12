@@ -67,6 +67,7 @@ jobs:
               TELEGRAM_CHAT_ID="${{ secrets.TELEGRAM_CHAT_ID }}" \
               DATABASE_URL="${{ secrets.DATABASE_URL }}" \
               REDIS_URL="${{ secrets.REDIS_URL }}" \
+              BLOB_STORAGE_URL="${{ secrets.BLOB_STORAGE_URL }}" \
             --log-analytics-workspace "${{ secrets.LOG_ANALYTICS_WORKSPACE_ID }}" \
             --log-analytics-workspace-key "${{ secrets.LOG_ANALYTICS_WORKSPACE_KEY }}" \
             --command-line "python main.py --interval 60"

@@ -135,6 +135,7 @@ class Settings(BaseSettings):
 
     # --- Azure Blob Storage (optional — falls back to local filesystem) ---
     blob_storage_account_url: str = ""
+    blob_storage_container_prefix: str = "suez-trader"
 
     # --- Azure Key Vault (optional — falls back to env vars) ---
     key_vault_url: str = ""

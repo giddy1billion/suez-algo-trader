@@ -75,10 +75,12 @@ class PredictionRecord:
 class DatasetRegistry:
     """Registry for dataset versions, model lineage, and prediction tracking."""
 
-    def __init__(self, storage_path: str = "data_cache/datasets", database_url: str = None) -> None:
+    def __init__(self, storage_path: str = "data_cache/datasets", database_url: str = None, artifact_store=None) -> None:
         self._storage_path = Path(storage_path)
         self._snapshots_path = self._storage_path / "snapshots"
         self._write_lock = threading.Lock()
+        self._artifact_store = artifact_store
+        self._blob_container = "datasets"
 
         self._storage_path.mkdir(parents=True, exist_ok=True)
         self._snapshots_path.mkdir(parents=True, exist_ok=True)
@@ -146,6 +148,21 @@ class DatasetRegistry:
                     dataset_id=dataset_id,
                 )
 
+            # Upload snapshot to blob storage if configured
+            if self._artifact_store:
+                try:
+                    snapshot_file = Path(parquet_path)
+                    blob_name = snapshot_file.name
+                    self._artifact_store.upload(
+                        self._blob_container, blob_name, snapshot_file.read_bytes()
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "dataset_registry.blob_upload_failed",
+                        dataset_id=dataset_id,
+                        error=str(exc),
+                    )
+
             now = datetime.now(timezone.utc)
             record = MLDataset(
                 dataset_id=dataset_id,
@@ -187,7 +204,7 @@ class DatasetRegistry:
             return self._row_to_dataset_version(row)
 
     def load_dataset(self, dataset_id: str) -> Optional[pd.DataFrame]:
-        """Load the actual dataset file (Parquet or CSV fallback)."""
+        """Load the actual dataset file (Parquet or CSV fallback). Checks blob if local missing."""
         with self._Session() as session:
             row = session.query(MLDataset.parquet_path).filter(
                 MLDataset.dataset_id == dataset_id
@@ -197,6 +214,26 @@ class DatasetRegistry:
             parquet_path = row[0]
 
         path = Path(parquet_path)
+
+        # If local file missing, try to restore from blob
+        if not path.exists() and self._artifact_store:
+            try:
+                blob_name = path.name
+                data = self._artifact_store.download(self._blob_container, blob_name)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(data)
+                logger.info(
+                    "dataset_registry.blob_download_restored",
+                    dataset_id=dataset_id,
+                    blob_name=blob_name,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "dataset_registry.blob_download_failed",
+                    dataset_id=dataset_id,
+                    error=str(exc),
+                )
+
         if not path.exists():
             logger.warning("dataset_file_missing", dataset_id=dataset_id, path=str(path))
             return None
