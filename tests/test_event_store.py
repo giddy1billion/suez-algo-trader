@@ -195,15 +195,22 @@ class TestEventStoreReplay:
         assert events[1].pnl == 500.0
 
     def test_replay_unknown_type_falls_back(self, store):
-        # Manually insert an event with unknown type
+        # Manually insert an event with unknown type via SQLAlchemy session
         import json
+        from src.core.event_store import EventRecord
 
         payload = json.dumps({"timestamp": datetime.now(timezone.utc).isoformat(), "source": "x", "event_id": "e1"})
-        store._conn.execute(
-            "INSERT INTO events (event_type, event_id, timestamp, source, payload, session_id) VALUES (?, ?, ?, ?, ?, ?)",
-            ("UnknownEvent", "e1", datetime.now(timezone.utc).isoformat(), "x", payload, "test-session-001"),
-        )
-        store._conn.commit()
+        with store._get_session() as session:
+            record = EventRecord(
+                event_type="UnknownEvent",
+                event_id="e1",
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                source="x",
+                payload=payload,
+                session_id="test-session-001",
+            )
+            session.add(record)
+            session.commit()
 
         events = store.replay_session("test-session-001")
         assert len(events) == 1

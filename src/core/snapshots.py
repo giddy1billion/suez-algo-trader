@@ -6,77 +6,67 @@ Instead of replaying the entire event history:
 
 Use snapshots:
   Latest snapshot + events since → fast startup
+
+Supports both PostgreSQL and SQLite via SQLAlchemy.
 """
 
 import json
-import sqlite3
 import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from sqlalchemy import Column, Integer, String, Text, Index
+from sqlalchemy.orm import DeclarativeBase, sessionmaker
+
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+
+class SnapshotBase(DeclarativeBase):
+    pass
+
+
+class SnapshotRecord(SnapshotBase):
+    """Persisted state snapshot."""
+    __tablename__ = "snapshots"
+    __table_args__ = (
+        Index("idx_snapshots_session", "session_id"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    session_id = Column(String(64), nullable=False)
+    timestamp = Column(String(64), nullable=False)
+    last_event_id = Column(Integer, nullable=False)
+    state = Column(Text, nullable=False)
+    schema_version = Column(String(20), nullable=False, default="1")
+    engine_version = Column(String(20), nullable=False, default="1.0.0")
+    config_hash = Column(String(64), nullable=False, default="")
+    created_at = Column(String(64), default=lambda: datetime.now(timezone.utc).isoformat())
 
 
 class SnapshotStore:
     """
     Persists periodic state snapshots for fast recovery.
 
-    Stores snapshots in SQLite with:
-    - snapshot_id (auto)
-    - session_id
-    - timestamp
-    - last_event_id (the event store row ID of the last processed event)
-    - state (JSON blob of the ReadModelManager state)
+    Supports PostgreSQL and SQLite via the shared engine factory.
     """
 
-    def __init__(self, db_path: str = "data_cache/snapshots.db"):
-        self.db_path = db_path
+    def __init__(self, db_path: str = "data_cache/snapshots.db", database_url: Optional[str] = None):
         self._lock = threading.Lock()
-        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(db_path, check_same_thread=False)
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA synchronous=NORMAL")
-        self._create_tables()
-        self._run_migrations()
 
-    def _create_tables(self):
-        self._conn.execute("""
-            CREATE TABLE IF NOT EXISTS snapshots (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT NOT NULL,
-                timestamp TEXT NOT NULL,
-                last_event_id INTEGER NOT NULL,
-                state TEXT NOT NULL,
-                schema_version TEXT NOT NULL DEFAULT '1',
-                engine_version TEXT NOT NULL DEFAULT '1.0.0',
-                config_hash TEXT NOT NULL DEFAULT '',
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        self._conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_snapshots_session ON snapshots(session_id)
-        """)
-        self._conn.commit()
+        if database_url:
+            url = database_url
+        else:
+            Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+            url = f"sqlite:///{db_path}"
 
-    def _run_migrations(self):
-        """Ensure snapshot schema is up-to-date for pre-existing databases."""
-        # Add versioning columns if they don't exist (safe for fresh DBs too)
-        for col, default in [
-            ("schema_version", "'1'"),
-            ("engine_version", "'1.0.0'"),
-            ("config_hash", "''"),
-        ]:
-            try:
-                self._conn.execute(
-                    f"ALTER TABLE snapshots ADD COLUMN {col} TEXT NOT NULL DEFAULT {default}"
-                )
-            except sqlite3.OperationalError:
-                pass  # Column already exists
-        self._conn.commit()
+        from src.utils.database import create_db_engine
+        self._engine = create_db_engine(url)
+        SnapshotBase.metadata.create_all(self._engine)
+        self._session_factory = sessionmaker(bind=self._engine)
 
     def save_snapshot(
         self,
@@ -89,87 +79,77 @@ class SnapshotStore:
     ) -> int:
         """Save a state snapshot with versioning metadata. Returns the snapshot ID."""
         with self._lock:
-            cursor = self._conn.execute(
-                """INSERT INTO snapshots
-                   (session_id, timestamp, last_event_id, state, schema_version, engine_version, config_hash)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    session_id,
-                    datetime.now(timezone.utc).isoformat(),
-                    last_event_id,
-                    json.dumps(state, default=str),
-                    schema_version,
-                    engine_version,
-                    config_hash,
+            with self._session_factory() as session:
+                record = SnapshotRecord(
+                    session_id=session_id,
+                    timestamp=datetime.now(timezone.utc).isoformat(),
+                    last_event_id=last_event_id,
+                    state=json.dumps(state, default=str),
+                    schema_version=schema_version,
+                    engine_version=engine_version,
+                    config_hash=config_hash,
                 )
-            )
-            self._conn.commit()
-            snapshot_id = cursor.lastrowid
-            logger.info("snapshot.saved", snapshot_id=snapshot_id, last_event_id=last_event_id)
-            return snapshot_id
+                session.add(record)
+                session.commit()
+                session.refresh(record)
+                snapshot_id = record.id
+                logger.info("snapshot.saved", snapshot_id=snapshot_id, last_event_id=last_event_id)
+                return snapshot_id
 
     def get_latest_snapshot(self, session_id: Optional[str] = None) -> Optional[dict]:
-        """Get the most recent snapshot, optionally filtered by session.
-
-        Returns dict with keys: id, session_id, timestamp, last_event_id, state,
-        schema_version, engine_version, config_hash.
-        """
+        """Get the most recent snapshot, optionally filtered by session."""
         with self._lock:
-            if session_id:
-                cursor = self._conn.execute(
-                    "SELECT id, session_id, timestamp, last_event_id, state, "
-                    "schema_version, engine_version, config_hash "
-                    "FROM snapshots WHERE session_id = ? ORDER BY id DESC LIMIT 1",
-                    (session_id,)
-                )
-            else:
-                cursor = self._conn.execute(
-                    "SELECT id, session_id, timestamp, last_event_id, state, "
-                    "schema_version, engine_version, config_hash "
-                    "FROM snapshots ORDER BY id DESC LIMIT 1"
-                )
-            row = cursor.fetchone()
-            if row is None:
-                return None
-            return {
-                "id": row[0],
-                "session_id": row[1],
-                "timestamp": row[2],
-                "last_event_id": row[3],
-                "state": json.loads(row[4]),
-                "schema_version": row[5] if len(row) > 5 else "1",
-                "engine_version": row[6] if len(row) > 6 else "1.0.0",
-                "config_hash": row[7] if len(row) > 7 else "",
-            }
+            with self._session_factory() as session:
+                q = session.query(SnapshotRecord)
+                if session_id:
+                    q = q.filter_by(session_id=session_id)
+                record = q.order_by(SnapshotRecord.id.desc()).first()
+                if record is None:
+                    return None
+                return {
+                    "id": record.id,
+                    "session_id": record.session_id,
+                    "timestamp": record.timestamp,
+                    "last_event_id": record.last_event_id,
+                    "state": json.loads(record.state),
+                    "schema_version": record.schema_version or "1",
+                    "engine_version": record.engine_version or "1.0.0",
+                    "config_hash": record.config_hash or "",
+                }
 
     def get_snapshot_count(self, session_id: Optional[str] = None) -> int:
         with self._lock:
-            if session_id:
-                cursor = self._conn.execute(
-                    "SELECT COUNT(*) FROM snapshots WHERE session_id = ?", (session_id,)
-                )
-            else:
-                cursor = self._conn.execute("SELECT COUNT(*) FROM snapshots")
-            return cursor.fetchone()[0]
+            with self._session_factory() as session:
+                q = session.query(SnapshotRecord)
+                if session_id:
+                    q = q.filter_by(session_id=session_id)
+                return q.count()
 
     def cleanup_old_snapshots(self, keep_latest: int = 10) -> int:
         """Delete old snapshots, keeping the N most recent."""
         with self._lock:
-            cursor = self._conn.execute("SELECT COUNT(*) FROM snapshots")
-            total = cursor.fetchone()[0]
-            if total <= keep_latest:
-                return 0
-            delete_count = total - keep_latest
-            self._conn.execute(
-                "DELETE FROM snapshots WHERE id IN (SELECT id FROM snapshots ORDER BY id ASC LIMIT ?)",
-                (delete_count,)
-            )
-            self._conn.commit()
-            logger.info("snapshot.cleanup", deleted=delete_count, remaining=keep_latest)
-            return delete_count
+            with self._session_factory() as session:
+                total = session.query(SnapshotRecord).count()
+                if total <= keep_latest:
+                    return 0
+                delete_count = total - keep_latest
+                # Get IDs of records to delete (oldest first)
+                old_ids = [
+                    r.id for r in session.query(SnapshotRecord.id)
+                    .order_by(SnapshotRecord.id.asc())
+                    .limit(delete_count)
+                    .all()
+                ]
+                if old_ids:
+                    session.query(SnapshotRecord).filter(
+                        SnapshotRecord.id.in_(old_ids)
+                    ).delete(synchronize_session=False)
+                    session.commit()
+                logger.info("snapshot.cleanup", deleted=delete_count, remaining=keep_latest)
+                return delete_count
 
     def close(self):
-        self._conn.close()
+        self._engine.dispose()
 
 
 class SnapshotManager:

@@ -1,17 +1,20 @@
 """
-Persistent Event Store — SQLite-backed durable event log.
+Persistent Event Store — Database-backed durable event log.
 
 Persists ALL events published through the EventBus for auditing,
-replay, and debugging purposes.
+replay, and debugging purposes. Supports both PostgreSQL and SQLite
+backends via SQLAlchemy.
 """
 
 import json
-import sqlite3
 import threading
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import List, Optional
+
+from sqlalchemy import Column, Integer, String, Text, Index, text
+from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from src.core.events import (
     Event,
@@ -31,6 +34,34 @@ from src.core.events import (
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# ORM Model
+# ---------------------------------------------------------------------------
+
+class EventBase(DeclarativeBase):
+    pass
+
+
+class EventRecord(EventBase):
+    """Persisted event record."""
+    __tablename__ = "events"
+    __table_args__ = (
+        Index("idx_events_session", "session_id"),
+        Index("idx_events_type", "event_type"),
+        Index("idx_events_timestamp", "timestamp"),
+        Index("idx_events_event_id", "event_id", unique=True),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    event_type = Column(String(100), nullable=False)
+    event_id = Column(String(64), nullable=False, unique=True)
+    timestamp = Column(String(64), nullable=False)
+    source = Column(String(100), default="")
+    payload = Column(Text, nullable=False)
+    session_id = Column(String(64), nullable=False)
+
 
 # ---------------------------------------------------------------------------
 # Event Class Registry
@@ -64,7 +95,6 @@ def _reconstruct_event(event_type: str, payload: dict) -> Event:
     try:
         return cls.from_dict(payload)
     except Exception:
-        # Fallback: return base Event if subclass deserialization fails
         logger.warning("Failed to reconstruct %s, falling back to base Event", event_type)
         return Event.from_dict(payload)
 
@@ -75,55 +105,34 @@ def _reconstruct_event(event_type: str, payload: dict) -> Event:
 
 class EventStore:
     """
-    SQLite-backed persistent event store.
+    Database-backed persistent event store.
 
     Stores all events with metadata for later retrieval, replay, and auditing.
-    Thread-safe with WAL mode for concurrent read/write performance.
+    Supports PostgreSQL and SQLite via the shared engine factory.
     """
 
-    def __init__(self, db_path: str = "data_cache/events.db", session_id: Optional[str] = None):
-        self.db_path = db_path
+    def __init__(self, db_path: str = "data_cache/events.db", session_id: Optional[str] = None,
+                 database_url: Optional[str] = None):
         self.session_id = session_id or uuid.uuid4().hex
         self._lock = threading.Lock()
 
-        # Ensure directory exists
-        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+        # If an explicit database_url is provided (e.g., postgresql://), use it.
+        # Otherwise fall back to SQLite file path for backward compatibility.
+        if database_url:
+            url = database_url
+        else:
+            Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+            url = f"sqlite:///{db_path}"
 
-        # Create connection (thread-safe)
-        self._conn = sqlite3.connect(db_path, check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA synchronous=NORMAL")
+        from src.utils.database import create_db_engine
+        self._engine = create_db_engine(url)
+        EventBase.metadata.create_all(self._engine)
+        self._session_factory = sessionmaker(bind=self._engine)
 
-        self._create_tables()
-        logger.info("EventStore initialized", db_path=db_path, session_id=self.session_id)
+        logger.info("EventStore initialized", session_id=self.session_id)
 
-    def _create_tables(self) -> None:
-        """Create the events table if it doesn't exist."""
-        self._conn.execute("""
-            CREATE TABLE IF NOT EXISTS events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                event_type TEXT NOT NULL,
-                event_id TEXT NOT NULL,
-                timestamp TEXT NOT NULL,
-                source TEXT DEFAULT '',
-                payload TEXT NOT NULL,
-                session_id TEXT NOT NULL
-            )
-        """)
-        self._conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id)
-        """)
-        self._conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type)
-        """)
-        self._conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_events_timestamp ON events(timestamp)
-        """)
-        self._conn.execute("""
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_events_event_id ON events(event_id)
-        """)
-        self._conn.commit()
+    def _get_session(self) -> Session:
+        return self._session_factory()
 
     def persist(self, event: Event) -> None:
         """Persist an event to the database. Deduplicates by event_id."""
@@ -133,19 +142,24 @@ class EventStore:
             payload_json = json.dumps(data, default=str)
 
             with self._lock:
-                self._conn.execute(
-                    """INSERT OR IGNORE INTO events (event_type, event_id, timestamp, source, payload, session_id)
-                       VALUES (?, ?, ?, ?, ?, ?)""",
-                    (
-                        event_type,
-                        event.event_id,
-                        event.timestamp.isoformat() if isinstance(event.timestamp, datetime) else str(event.timestamp),
-                        event.source,
-                        payload_json,
-                        self.session_id,
-                    ),
-                )
-                self._conn.commit()
+                with self._get_session() as session:
+                    # Check if event already exists (dedup)
+                    existing = session.query(EventRecord.id).filter_by(
+                        event_id=event.event_id
+                    ).first()
+                    if existing:
+                        return
+
+                    record = EventRecord(
+                        event_type=event_type,
+                        event_id=event.event_id,
+                        timestamp=event.timestamp.isoformat() if isinstance(event.timestamp, datetime) else str(event.timestamp),
+                        source=event.source,
+                        payload=payload_json,
+                        session_id=self.session_id,
+                    )
+                    session.add(record)
+                    session.commit()
         except Exception:
             logger.exception("Failed to persist event %s", type(event).__name__)
             raise
@@ -153,54 +167,52 @@ class EventStore:
     def get_session_events(self, session_id: str) -> List[dict]:
         """Get all events from a specific session."""
         with self._lock:
-            cursor = self._conn.execute(
-                "SELECT * FROM events WHERE session_id = ? ORDER BY id ASC",
-                (session_id,),
-            )
-            return [self._row_to_dict(row) for row in cursor.fetchall()]
+            with self._get_session() as session:
+                records = session.query(EventRecord).filter_by(
+                    session_id=session_id
+                ).order_by(EventRecord.id.asc()).all()
+                return [self._record_to_dict(r) for r in records]
 
     def get_events_by_type(self, event_type: str, limit: int = 100) -> List[dict]:
         """Get events filtered by type."""
         with self._lock:
-            cursor = self._conn.execute(
-                "SELECT * FROM events WHERE event_type = ? ORDER BY id DESC LIMIT ?",
-                (event_type, limit),
-            )
-            return [self._row_to_dict(row) for row in cursor.fetchall()]
+            with self._get_session() as session:
+                records = session.query(EventRecord).filter_by(
+                    event_type=event_type
+                ).order_by(EventRecord.id.desc()).limit(limit).all()
+                return [self._record_to_dict(r) for r in records]
 
     def get_events_since(self, timestamp: datetime) -> List[dict]:
         """Get all events since a given timestamp."""
         ts_str = timestamp.isoformat()
         with self._lock:
-            cursor = self._conn.execute(
-                "SELECT * FROM events WHERE timestamp >= ? ORDER BY id ASC",
-                (ts_str,),
-            )
-            return [self._row_to_dict(row) for row in cursor.fetchall()]
+            with self._get_session() as session:
+                records = session.query(EventRecord).filter(
+                    EventRecord.timestamp >= ts_str
+                ).order_by(EventRecord.id.asc()).all()
+                return [self._record_to_dict(r) for r in records]
 
     def get_latest_events(self, limit: int = 50) -> List[dict]:
         """Get the most recent events."""
         with self._lock:
-            cursor = self._conn.execute(
-                "SELECT * FROM events ORDER BY id DESC LIMIT ?",
-                (limit,),
-            )
-            return [self._row_to_dict(row) for row in cursor.fetchall()]
+            with self._get_session() as session:
+                records = session.query(EventRecord).order_by(
+                    EventRecord.id.desc()
+                ).limit(limit).all()
+                return [self._record_to_dict(r) for r in records]
 
     def replay_session(self, session_id: str) -> List[Event]:
         """Replay a session by deserializing events back to typed objects."""
         with self._lock:
-            cursor = self._conn.execute(
-                "SELECT * FROM events WHERE session_id = ? ORDER BY id ASC",
-                (session_id,),
-            )
-            rows = cursor.fetchall()
+            with self._get_session() as session:
+                records = session.query(EventRecord).filter_by(
+                    session_id=session_id
+                ).order_by(EventRecord.id.asc()).all()
+                rows = [self._record_to_dict(r) for r in records]
 
         events = []
-        for row in rows:
-            row_dict = self._row_to_dict(row)
+        for row_dict in rows:
             payload = json.loads(row_dict["payload"])
-            # Ensure _type is in payload for from_dict
             payload["_type"] = row_dict["event_type"]
             event = _reconstruct_event(row_dict["event_type"], payload)
             events.append(event)
@@ -209,35 +221,63 @@ class EventStore:
     def count_events(self, session_id: Optional[str] = None) -> int:
         """Count total events, optionally filtered by session."""
         with self._lock:
-            if session_id:
-                cursor = self._conn.execute(
-                    "SELECT COUNT(*) FROM events WHERE session_id = ?",
-                    (session_id,),
-                )
-            else:
-                cursor = self._conn.execute("SELECT COUNT(*) FROM events")
-            return cursor.fetchone()[0]
+            with self._get_session() as session:
+                q = session.query(EventRecord)
+                if session_id:
+                    q = q.filter_by(session_id=session_id)
+                return q.count()
 
     def cleanup_old_events(self, days: int = 30) -> None:
         """Delete events older than N days."""
         cutoff = datetime.now(timezone.utc) - timedelta(days=days)
         cutoff_str = cutoff.isoformat()
         with self._lock:
-            self._conn.execute(
-                "DELETE FROM events WHERE timestamp < ?",
-                (cutoff_str,),
-            )
-            self._conn.commit()
+            with self._get_session() as session:
+                session.query(EventRecord).filter(
+                    EventRecord.timestamp < cutoff_str
+                ).delete(synchronize_session=False)
+                session.commit()
         logger.info("Cleaned up events older than %d days", days)
 
-    def close(self) -> None:
-        """Close the database connection."""
+    def list_sessions(self, limit: int = 20) -> List[dict]:
+        """List available sessions with event counts and time ranges."""
+        from sqlalchemy import func
         with self._lock:
-            self._conn.close()
+            with self._get_session() as session:
+                results = session.query(
+                    EventRecord.session_id,
+                    func.count(EventRecord.id).label("event_count"),
+                    func.min(EventRecord.timestamp).label("first_event"),
+                    func.max(EventRecord.timestamp).label("last_event"),
+                ).group_by(EventRecord.session_id).order_by(
+                    func.max(EventRecord.id).desc()
+                ).limit(limit).all()
+                return [
+                    {
+                        "session_id": r.session_id,
+                        "event_count": r.event_count,
+                        "first_event": r.first_event,
+                        "last_event": r.last_event,
+                    }
+                    for r in results
+                ]
 
-    def _row_to_dict(self, row: sqlite3.Row) -> dict:
-        """Convert a sqlite3.Row to a plain dict."""
-        return dict(row)
+    def close(self) -> None:
+        """Dispose of the engine connection pool."""
+        self._engine.dispose()
+
+    @staticmethod
+    def _record_to_dict(record: EventRecord) -> dict:
+        """Convert an EventRecord ORM object to a plain dict."""
+        return {
+            "id": record.id,
+            "event_type": record.event_type,
+            "event_id": record.event_id,
+            "timestamp": record.timestamp,
+            "source": record.source,
+            "payload": record.payload,
+            "session_id": record.session_id,
+        }
 
 
 # ---------------------------------------------------------------------------

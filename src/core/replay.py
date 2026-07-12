@@ -97,26 +97,7 @@ class ReplayEngine:
     def list_sessions(self, limit: int = 20) -> List[dict]:
         """List available sessions with event counts and time ranges."""
         with self._lock:
-            conn = self._store._conn
-            cursor = conn.execute("""
-                SELECT session_id, 
-                       COUNT(*) as event_count,
-                       MIN(timestamp) as first_event,
-                       MAX(timestamp) as last_event
-                FROM events 
-                GROUP BY session_id 
-                ORDER BY MAX(id) DESC 
-                LIMIT ?
-            """, (limit,))
-            return [
-                {
-                    "session_id": row[0],
-                    "event_count": row[1],
-                    "first_event": row[2],
-                    "last_event": row[3],
-                }
-                for row in cursor.fetchall()
-            ]
+            return self._store.list_sessions(limit=limit)
 
     def replay(
         self,

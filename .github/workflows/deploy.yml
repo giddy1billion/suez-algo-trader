@@ -65,6 +65,8 @@ jobs:
               ALPACA_LIVE_SECRET_KEY="${{ secrets.ALPACA_LIVE_SECRET_KEY }}" \
               TELEGRAM_BOT_TOKEN="${{ secrets.TELEGRAM_BOT_TOKEN }}" \
               TELEGRAM_CHAT_ID="${{ secrets.TELEGRAM_CHAT_ID }}" \
+              DATABASE_URL="${{ secrets.DATABASE_URL }}" \
+              REDIS_URL="${{ secrets.REDIS_URL }}" \
             --log-analytics-workspace "${{ secrets.LOG_ANALYTICS_WORKSPACE_ID }}" \
             --log-analytics-workspace-key "${{ secrets.LOG_ANALYTICS_WORKSPACE_KEY }}" \
             --command-line "python main.py --interval 60"

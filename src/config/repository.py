@@ -6,9 +6,7 @@ import json
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
-from sqlalchemy.pool import StaticPool
 
 from src.config.models import ConfigBase, SystemConfiguration, ConfigurationAuditLog
 
@@ -21,29 +19,9 @@ class ConfigurationRepository:
     """
 
     def __init__(self, database_url: str = "sqlite:///data_cache/trading.db"):
-        engine_kwargs = {"echo": False}
-        if "sqlite" in database_url:
-            engine_kwargs["connect_args"] = {
-                "check_same_thread": False,
-                "timeout": 30,
-            }
-            engine_kwargs["poolclass"] = StaticPool
+        from src.utils.database import create_db_engine
 
-        self._engine = create_engine(database_url, **engine_kwargs)
-
-        # Set SQLite pragmas
-        if "sqlite" in database_url:
-            from sqlalchemy import event as sa_event
-
-            @sa_event.listens_for(self._engine, "connect")
-            def _set_sqlite_pragmas(dbapi_conn, connection_record):
-                cursor = dbapi_conn.cursor()
-                cursor.execute("PRAGMA journal_mode=WAL")
-                cursor.execute("PRAGMA busy_timeout=30000")
-                cursor.execute("PRAGMA synchronous=NORMAL")
-                cursor.execute("PRAGMA foreign_keys=ON")
-                cursor.close()
-
+        self._engine = create_db_engine(database_url)
         ConfigBase.metadata.create_all(self._engine)
         self._session_factory = sessionmaker(bind=self._engine)
 

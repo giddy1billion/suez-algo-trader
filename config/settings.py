@@ -125,7 +125,19 @@ class Settings(BaseSettings):
     notify_on_signal: bool = False
 
     # --- Database ---
+    # Supports both PostgreSQL and SQLite:
+    #   PostgreSQL: "postgresql://user:pass@host:5432/dbname?sslmode=require"
+    #   SQLite:     "sqlite:///data_cache/trading.db"
     database_url: str = "sqlite:///data_cache/trading.db"
+
+    # --- Redis (optional — graceful fallback to in-memory if empty) ---
+    redis_url: str = ""
+
+    # --- Azure Blob Storage (optional — falls back to local filesystem) ---
+    blob_storage_account_url: str = ""
+
+    # --- Azure Key Vault (optional — falls back to env vars) ---
+    key_vault_url: str = ""
 
     # --- Logging ---
     log_level: str = "INFO"
