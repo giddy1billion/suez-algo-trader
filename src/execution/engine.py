@@ -1075,8 +1075,8 @@ class ExecutionEngine:
                 "symbol": signal.symbol,
                 "strategy": self._current_strategy_name,
                 "signal": signal.side.value if hasattr(signal, 'side') else "UNKNOWN",
-                "confidence": signal.signal_strength if hasattr(signal, 'signal_strength') else 0.0,
-                "price_at_signal": signal.features.get("observed_price", 0.0) if hasattr(signal, 'features') else 0.0,
+                "confidence": float(signal.signal_strength) if hasattr(signal, 'signal_strength') else 0.0,
+                "price_at_signal": float(signal.features.get("observed_price", 0.0)) if hasattr(signal, 'features') else 0.0,
                 "indicators": json.dumps(signal.indicators if hasattr(signal, 'indicators') else {}),
                 "was_executed": executed,
             })
@@ -1091,7 +1091,7 @@ class ExecutionEngine:
             extended_indicators = dict(signal.indicators)
             extended_indicators["_signal_id"] = signal.signal_id
             if intelligence_decision:
-                extended_indicators["_intelligence_score"] = round(intelligence_decision.final_score, 4)
+                extended_indicators["_intelligence_score"] = round(float(intelligence_decision.final_score), 4)
                 extended_indicators["_intelligence_regime"] = getattr(
                     intelligence_decision, 'market_state', None
                 ) and intelligence_decision.market_state.overall_regime or ""
@@ -1100,8 +1100,8 @@ class ExecutionEngine:
                 "symbol": signal.symbol,
                 "strategy": signal.strategy_id,
                 "signal": signal.side.value,
-                "confidence": signal.signal_strength,
-                "price_at_signal": signal.features.get("observed_price", 0.0),
+                "confidence": float(signal.signal_strength),
+                "price_at_signal": float(signal.features.get("observed_price", 0.0)),
                 "indicators": json.dumps(extended_indicators),
                 "was_executed": executed,
             })

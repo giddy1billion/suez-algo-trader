@@ -173,9 +173,10 @@ class DatabaseManager:
     # --- Trades ---
 
     def record_trade(self, trade_data: dict) -> Trade:
-        """Insert a new trade record."""
+        """Insert a new trade record. Converts numpy types for PostgreSQL compat."""
+        sanitized = {k: v.item() if hasattr(v, 'item') else v for k, v in trade_data.items()}
         with self.get_session() as session:
-            trade = Trade(**trade_data)
+            trade = Trade(**sanitized)
             session.add(trade)
             session.commit()
             session.refresh(trade)
@@ -216,9 +217,16 @@ class DatabaseManager:
     # --- Signals ---
 
     def log_signal(self, signal_data: dict) -> SignalLog:
-        """Log a generated signal."""
+        """Log a generated signal. Converts numpy types to native Python for PostgreSQL compat."""
+        # Sanitize numpy scalars that psycopg2 cannot serialize
+        sanitized = {}
+        for k, v in signal_data.items():
+            if hasattr(v, 'item'):  # numpy scalar → native Python
+                sanitized[k] = v.item()
+            else:
+                sanitized[k] = v
         with self.get_session() as session:
-            sig = SignalLog(**signal_data)
+            sig = SignalLog(**sanitized)
             session.add(sig)
             session.commit()
             return sig
@@ -226,9 +234,10 @@ class DatabaseManager:
     # --- Portfolio ---
 
     def snapshot_portfolio(self, snapshot_data: dict) -> PortfolioSnapshot:
-        """Record a portfolio snapshot."""
+        """Record a portfolio snapshot. Converts numpy types for PostgreSQL compat."""
+        sanitized = {k: v.item() if hasattr(v, 'item') else v for k, v in snapshot_data.items()}
         with self.get_session() as session:
-            snap = PortfolioSnapshot(**snapshot_data)
+            snap = PortfolioSnapshot(**sanitized)
             session.add(snap)
             session.commit()
             return snap
