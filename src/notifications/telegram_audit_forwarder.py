@@ -11,7 +11,9 @@ but system events (health, errors) are still sent.
 """
 
 import asyncio
+import hashlib
 import logging
+import math
 import queue
 import threading
 import time
@@ -36,6 +38,10 @@ from src.core.events import (
     TradeOpened,
 )
 from src.core.runtime_state import RuntimeState
+from src.market.constraints import get_constraints
+from src.market.registry import classify_symbol
+from src.ml.model_registry import ModelRegistry
+from src.notifications.signal_formatter import SignalPackage, format_signal_message
 
 logger = logging.getLogger(__name__)
 
@@ -202,9 +208,7 @@ def _format_generic(event: Event) -> str:
 
 # Formatter dispatch table
 _FORMATTERS: dict[type, Callable] = {
-    SignalGenerated: _format_signal,
     DecisionContractCreated: _format_decision_contract,
-    RiskEvaluated: _format_risk_evaluated,
     OrderSubmitted: _format_order_submitted,
     OrderAccepted: _format_order_accepted,
     OrderPartialFill: _format_order_partial_fill,
@@ -238,6 +242,8 @@ class TelegramAuditForwarder:
         self,
         send_func: Callable[[str], None],
         runtime_state: Optional[RuntimeState] = None,
+        risk_verdict_timeout_seconds: float = 60.0,
+        bracket_orders_supported_provider: Optional[Callable[[], bool]] = None,
     ) -> None:
         """
         Args:
@@ -260,6 +266,13 @@ class TelegramAuditForwarder:
         self._events_sent = 0
         self._events_dropped = 0
         self._events_suppressed = 0
+        self._risk_verdict_timeout_seconds = max(1.0, risk_verdict_timeout_seconds)
+        self._bracket_orders_supported_provider = bracket_orders_supported_provider
+        self._signals_by_id: dict[str, SignalGenerated] = {}
+        self._pending_signal_deadlines: dict[str, float] = {}
+        self._contracts_by_signal_id: dict[str, DecisionContractCreated] = {}
+        self._signal_id_by_contract_id: dict[str, str] = {}
+        self._approved_intent_ids_sent: set[str] = set()
         # Track last health status per component to suppress repeated identical notifications
         self._last_health_status: dict[str, str] = {}
 
@@ -270,13 +283,26 @@ class TelegramAuditForwarder:
         but always forwards system events.
         """
         try:
+            self._emit_no_verdict_timeouts()
+
             # Suppress trading events when paused
             if self._runtime_state.is_paused():
-                if isinstance(event, (SignalGenerated, OrderSubmitted, OrderAccepted, 
-                                    OrderFilled, OrderPartialFill, OrderRejected, 
+                if isinstance(event, (SignalGenerated, RiskEvaluated, OrderSubmitted, OrderAccepted,
+                                    OrderFilled, OrderPartialFill, OrderRejected,
                                     TradeOpened, TradeClosed)):
                     self._events_suppressed += 1
                     return  # Skip this event
+
+            if isinstance(event, SignalGenerated):
+                self._track_signal_generated(event)
+                return
+
+            if isinstance(event, DecisionContractCreated):
+                self._track_decision_contract(event)
+
+            if isinstance(event, RiskEvaluated):
+                self._handle_risk_evaluated(event)
+                return
 
             # Suppress health events: only forward status CHANGES to non-healthy
             if isinstance(event, SystemHealth):
@@ -302,6 +328,198 @@ class TelegramAuditForwarder:
                 self._events_dropped += 1
         except Exception:
             pass  # Never allow forwarder to interfere with event processing
+
+    def _track_signal_generated(self, event: SignalGenerated) -> None:
+        signal_id = (getattr(event, "signal_id", "") or "").strip()
+        if not signal_id:
+            signal_id = f"sig:{event.event_id}"
+        self._signals_by_id[signal_id] = event
+        self._pending_signal_deadlines[signal_id] = time.time() + self._risk_verdict_timeout_seconds
+
+    def _track_decision_contract(self, event: DecisionContractCreated) -> None:
+        signal_id = (event.signal_id or "").strip()
+        if signal_id:
+            self._contracts_by_signal_id[signal_id] = event
+        if event.contract_id and signal_id:
+            self._signal_id_by_contract_id[event.contract_id] = signal_id
+
+    def _emit_no_verdict_timeouts(self) -> None:
+        if not self._pending_signal_deadlines:
+            return
+        now = time.time()
+        expired = [
+            signal_id
+            for signal_id, deadline in self._pending_signal_deadlines.items()
+            if deadline <= now
+        ]
+        for signal_id in expired:
+            signal_event = self._signals_by_id.get(signal_id)
+            if signal_event:
+                block = _format_signal(signal_event)
+                warning = (
+                    f"{block}\n"
+                    f"⚠️ NO VERDICT RECEIVED — no action taken "
+                    f"(timeout={int(self._risk_verdict_timeout_seconds)}s)"
+                )
+                self._enqueue_message(warning)
+            self._pending_signal_deadlines.pop(signal_id, None)
+
+    def _handle_risk_evaluated(self, event: RiskEvaluated) -> None:
+        signal_id = (getattr(event, "signal_id", "") or "").strip()
+        if not signal_id and event.contract_id:
+            signal_id = self._signal_id_by_contract_id.get(event.contract_id, "")
+        signal_event = self._signals_by_id.get(signal_id) if signal_id else None
+        contract_event = self._contracts_by_signal_id.get(signal_id) if signal_id else None
+
+        intent = self._build_trade_intent(event, signal_event, contract_event, signal_id)
+        if intent.risk_approved and intent.trade_intent_id in self._approved_intent_ids_sent:
+            return
+
+        rendered = format_signal_message(intent)
+        self._enqueue_message(rendered)
+        if intent.risk_approved:
+            self._approved_intent_ids_sent.add(intent.trade_intent_id)
+
+        if signal_id:
+            self._pending_signal_deadlines.pop(signal_id, None)
+
+    def _build_trade_intent(
+        self,
+        risk_event: RiskEvaluated,
+        signal_event: Optional[SignalGenerated],
+        contract_event: Optional[DecisionContractCreated],
+        signal_id: str,
+    ) -> SignalPackage:
+        symbol = (
+            (signal_event.symbol if signal_event else "")
+            or getattr(risk_event, "symbol", "")
+        )
+        direction = ""
+        if signal_event:
+            direction = (signal_event.side or signal_event.signal or "").upper()
+        confidence = 0.0
+        if signal_event:
+            confidence = (
+                signal_event.signal_strength
+                if signal_event.signal_strength > 0
+                else signal_event.confidence
+            )
+        strategy = signal_event.strategy if signal_event else ""
+        source = signal_event.source if signal_event else getattr(risk_event, "source", "")
+        tags = tuple(getattr(signal_event, "tags", tuple()) or tuple())
+        is_fallback_source = any(str(tag).lower() == "fallback" for tag in tags)
+        provenance = "fallback" if is_fallback_source else (source or "unknown")
+
+        active_model_version = self._get_active_model_version()
+        strategy_version = signal_event.strategy_version if signal_event else ""
+        model_active = bool(active_model_version) and (
+            not strategy_version or active_model_version == strategy_version
+        )
+
+        instrument = classify_symbol(symbol) if symbol else None
+        constraints = get_constraints(instrument) if instrument else None
+        qty_step = constraints.lot_size if constraints else None
+
+        explicit_qty = self._read_finite_positive(
+            getattr(signal_event, "features", {}).get("position_size")
+            if signal_event
+            else None
+        )
+        computed_qty = self._read_finite_positive(getattr(risk_event, "adjusted_qty", None))
+        if computed_qty is not None and constraints is not None:
+            computed_qty = constraints.round_quantity(computed_qty)
+            if computed_qty <= 0:
+                computed_qty = None
+
+        stop_loss = None
+        take_profit = None
+        if contract_event:
+            stop_loss = self._read_finite_positive(contract_event.recommended_stop_loss)
+            take_profit = self._read_finite_positive(contract_event.recommended_take_profit)
+        if stop_loss is None and signal_event:
+            stop_loss = self._read_finite_positive(
+                getattr(signal_event, "features", {}).get("strategy_proposed_stop_loss")
+            )
+        if take_profit is None and signal_event:
+            take_profit = self._read_finite_positive(
+                getattr(signal_event, "features", {}).get("strategy_proposed_take_profit")
+            )
+        if constraints is not None:
+            if stop_loss is not None:
+                stop_loss = constraints.round_price(stop_loss)
+            if take_profit is not None:
+                take_profit = constraints.round_price(take_profit)
+
+        risk_rejection_reason = "; ".join(getattr(risk_event, "reasons", []) or [])
+        intent_id = self._stable_intent_id(risk_event, signal_id, symbol, direction, strategy)
+
+        return SignalPackage(
+            trade_intent_id=intent_id,
+            signal_id=signal_id,
+            symbol=symbol,
+            direction=direction,
+            strength=confidence if isinstance(confidence, (int, float)) else 0.0,
+            strategy=strategy,
+            source=source,
+            provenance=provenance,
+            signal_block=_format_signal(signal_event) if signal_event else _format_generic(risk_event),
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            position_size=explicit_qty,
+            auto_sized_qty=computed_qty,
+            quantity_step=qty_step,
+            model_active=model_active,
+            risk_approved=bool(getattr(risk_event, "approved", False)),
+            risk_rejection_reason=risk_rejection_reason,
+            is_fallback_source=is_fallback_source,
+            bracket_orders_supported=self._get_bracket_orders_supported(),
+        )
+
+    def _enqueue_message(self, message: str) -> None:
+        ts = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+        with_timestamp = f"{message}\n<i>{ts}</i>"
+        try:
+            self._queue.put_nowait(with_timestamp)
+        except queue.Full:
+            self._events_dropped += 1
+
+    def _get_active_model_version(self) -> str:
+        try:
+            return ModelRegistry().get_active_version() or ""
+        except Exception:
+            return ""
+
+    def _get_bracket_orders_supported(self) -> bool:
+        if self._bracket_orders_supported_provider is None:
+            return False
+        try:
+            return bool(self._bracket_orders_supported_provider())
+        except Exception:
+            return False
+
+    @staticmethod
+    def _read_finite_positive(value: Any) -> Optional[float]:
+        if value is None or not isinstance(value, (int, float)):
+            return None
+        if not math.isfinite(float(value)) or float(value) <= 0:
+            return None
+        return float(value)
+
+    @staticmethod
+    def _stable_intent_id(
+        risk_event: RiskEvaluated,
+        signal_id: str,
+        symbol: str,
+        direction: str,
+        strategy: str,
+    ) -> str:
+        if risk_event.contract_id:
+            return f"intent:{risk_event.contract_id}"
+        if signal_id:
+            return f"intent:{signal_id}"
+        raw = f"{symbol}|{direction}|{strategy}"
+        digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+        return f"intent:{digest}"
 
     def _sender_loop(self) -> None:
         """Background thread that drains the queue and sends to Telegram."""

@@ -665,6 +665,7 @@ class ExecutionEngine:
         # Publish risk evaluation event
         self._publish(RiskEvaluated(
             symbol=signal.symbol,
+            signal_id=signal.signal_id,
             approved=decision.approved,
             reasons=decision.reasons,
             adjusted_qty=decision.adjusted_qty,

@@ -15,7 +15,8 @@ Handles:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+import math
 from typing import Optional
 
 
@@ -28,12 +29,18 @@ class SignalPackage:
     with actionable command lines.
     """
 
+    # Canonical intent identity
+    trade_intent_id: str = ""
+    signal_id: str = ""
+
     # Required fields
     symbol: str = ""
     direction: str = ""       # "BUY" or "SELL" (long/short)
     strength: float = 0.0     # Signal strength / confidence (0-1)
     strategy: str = ""
     source: str = ""          # e.g., "ml_predictor", "fallback", etc.
+    provenance: str = ""
+    signal_block: str = ""    # Pre-rendered legacy signal block (verbatim)
 
     # Optional execution parameters
     stop_loss: Optional[float] = None
@@ -51,6 +58,7 @@ class SignalPackage:
 
     # Auto-sizing context (used when position_size is None)
     auto_sized_qty: Optional[float] = None
+    quantity_step: Optional[float] = None  # lot-size / step-size from instrument metadata
 
 
 def format_signal_message(pkg: SignalPackage) -> str:
@@ -67,18 +75,19 @@ def format_signal_message(pkg: SignalPackage) -> str:
         Formatted plain-text message for Telegram.
     """
     side = pkg.direction.upper() if pkg.direction else ""
-    emoji = "📶" if side == "BUY" else "📉" if side == "SELL" else "⏸️"
 
-    # --- Base message (preserves existing style) ---
-    lines = [
-        f"{emoji} Signal: {side} {pkg.symbol}",
-        f"Strength: {pkg.strength:.2f}",
-    ]
-
-    if pkg.strategy:
-        lines.append(f"Strategy: {pkg.strategy}")
-
-    lines.append(f"Source: {pkg.source}")
+    # --- Base message ---
+    if pkg.signal_block:
+        lines = [pkg.signal_block]
+    else:
+        emoji = "📶" if side == "BUY" else "📉" if side == "SELL" else "⏸️"
+        lines = [
+            f"{emoji} Signal: {side} {pkg.symbol}",
+            f"Strength: {pkg.strength:.2f}",
+        ]
+        if pkg.strategy:
+            lines.append(f"Strategy: {pkg.strategy}")
+        lines.append(f"Source: {pkg.source}")
 
     # --- Warning conditions: suppress all commands ---
     warning = _get_warning(pkg)
@@ -90,7 +99,7 @@ def format_signal_message(pkg: SignalPackage) -> str:
     qty, qty_label = _resolve_quantity(pkg)
     if qty is not None and side in ("BUY", "SELL"):
         cmd = "/buy" if side == "BUY" else "/sell"
-        qty_str = _format_qty(qty)
+        qty_str = _format_qty(qty, pkg.quantity_step)
         cmd_line = f"{cmd} {pkg.symbol} {qty_str}"
         if qty_label:
             cmd_line += f" {qty_label}"
@@ -120,6 +129,24 @@ def _get_warning(pkg: SignalPackage) -> Optional[str]:
         reason = pkg.risk_rejection_reason or "risk-control check failed"
         return f"RISK REJECTED — {reason}"
 
+    side = pkg.direction.upper() if pkg.direction else ""
+    if side and side not in ("BUY", "SELL"):
+        return f"INVALID DIRECTION '{pkg.direction}' — no actionable commands"
+
+    for value, label in (
+        (pkg.strength, "strength"),
+        (pkg.position_size, "position size"),
+        (pkg.auto_sized_qty, "auto-sized quantity"),
+        (pkg.stop_loss, "stop-loss"),
+        (pkg.take_profit, "take-profit"),
+    ):
+        if value is None:
+            continue
+        if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+            return f"INVALID {label.upper()} — no actionable commands"
+        if label in ("stop-loss", "take-profit") and float(value) <= 0:
+            return f"INVALID {label.upper()} — no actionable commands"
+
     return None
 
 
@@ -131,18 +158,31 @@ def _resolve_quantity(pkg: SignalPackage) -> tuple[Optional[float], str]:
         (quantity, label) where label is "(auto-sized)" or "" for explicit.
         Returns (None, "") if sizing cannot be determined.
     """
-    if pkg.position_size is not None and pkg.position_size > 0:
-        return (pkg.position_size, "")
+    if (
+        pkg.position_size is not None
+        and isinstance(pkg.position_size, (int, float))
+        and math.isfinite(float(pkg.position_size))
+        and pkg.position_size > 0
+    ):
+        return (float(pkg.position_size), "")
 
-    if pkg.auto_sized_qty is not None and pkg.auto_sized_qty > 0:
-        return (pkg.auto_sized_qty, "(auto-sized)")
+    if (
+        pkg.auto_sized_qty is not None
+        and isinstance(pkg.auto_sized_qty, (int, float))
+        and math.isfinite(float(pkg.auto_sized_qty))
+        and pkg.auto_sized_qty > 0
+    ):
+        return (float(pkg.auto_sized_qty), "(auto-sized)")
 
     # Cannot determine quantity
     return (None, "")
 
 
-def _format_qty(qty: float) -> str:
+def _format_qty(qty: float, qty_step: Optional[float] = None) -> str:
     """Format quantity, removing trailing zeros for clean display."""
+    if qty_step and isinstance(qty_step, (int, float)) and qty_step > 0 and math.isfinite(float(qty_step)):
+        decimals = len(str(qty_step).rstrip("0").split(".")[-1]) if "." in str(qty_step) else 0
+        return f"{qty:.{decimals}f}".rstrip("0").rstrip(".")
     if qty == int(qty):
         return str(int(qty))
     return f"{qty:.4f}".rstrip("0").rstrip(".")
@@ -150,8 +190,18 @@ def _format_qty(qty: float) -> str:
 
 def _format_tp_sl(pkg: SignalPackage) -> Optional[str]:
     """Format TP/SL information based on bracket order support."""
-    has_sl = pkg.stop_loss is not None
-    has_tp = pkg.take_profit is not None
+    has_sl = (
+        pkg.stop_loss is not None
+        and isinstance(pkg.stop_loss, (int, float))
+        and math.isfinite(float(pkg.stop_loss))
+        and pkg.stop_loss > 0
+    )
+    has_tp = (
+        pkg.take_profit is not None
+        and isinstance(pkg.take_profit, (int, float))
+        and math.isfinite(float(pkg.take_profit))
+        and pkg.take_profit > 0
+    )
 
     if not has_sl and not has_tp:
         return None

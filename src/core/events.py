@@ -136,6 +136,7 @@ class RiskEvaluated(Event):
     """Emitted after risk management evaluates a signal."""
 
     symbol: str = ""
+    signal_id: str = ""
     approved: bool = False
     reasons: list[str] = field(default_factory=list)
     adjusted_qty: float = 0.0

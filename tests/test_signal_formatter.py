@@ -667,3 +667,65 @@ class TestEndToEndFormatting:
         # No command for empty direction
         assert "/buy" not in result
         assert "/sell" not in result
+
+
+class TestSignalBlockSnapshotRegression:
+    def test_signal_block_is_preserved_byte_for_byte(self):
+        fixtures = [
+            SignalGenerated(symbol="AAPL", signal="BUY", side="BUY", signal_strength=0.91, strategy="mom", source="engine"),
+            SignalGenerated(symbol="TSLA", signal="SELL", side="SELL", confidence=0.72, strategy="mean", source="engine"),
+        ]
+        for event in fixtures:
+            expected_block = _format_signal(event)
+            pkg = SignalPackage(
+                symbol=event.symbol,
+                direction=event.side or event.signal,
+                strength=event.signal_strength if event.signal_strength > 0 else event.confidence,
+                strategy=event.strategy,
+                source=event.source,
+                signal_block=expected_block,
+                position_size=10,
+            )
+            rendered = format_signal_message(pkg)
+            assert rendered.startswith(expected_block)
+            assert expected_block in rendered
+
+    def test_unknown_direction_rejected_with_warning(self):
+        pkg = SignalPackage(
+            symbol="AAPL",
+            direction="HOLD",
+            strength=0.8,
+            strategy="test",
+            source="active",
+            position_size=10,
+        )
+        result = format_signal_message(pkg)
+        assert "INVALID DIRECTION" in result
+        assert "/buy" not in result
+        assert "/sell" not in result
+
+    def test_non_finite_numeric_input_rejected(self):
+        pkg = SignalPackage(
+            symbol="AAPL",
+            direction="BUY",
+            strength=float("nan"),
+            strategy="test",
+            source="active",
+            position_size=10,
+        )
+        result = format_signal_message(pkg)
+        assert "INVALID STRENGTH" in result
+        assert "/buy" not in result
+
+    def test_quantity_precision_uses_step_size(self):
+        pkg = SignalPackage(
+            symbol="BTC/USD",
+            direction="BUY",
+            strength=0.9,
+            strategy="test",
+            source="active",
+            auto_sized_qty=1.23456,
+            quantity_step=0.001,
+        )
+        result = format_signal_message(pkg)
+        assert "/buy BTC/USD 1.235 (auto-sized)" in result
