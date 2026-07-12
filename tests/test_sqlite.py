@@ -48,3 +48,76 @@ class TestSQLiteHardening:
                         os.remove(path)
                     except PermissionError:
                         pass  # Best-effort cleanup on Windows
+
+
+class TestNumpyScalarSerialization:
+    """Verify that numpy scalars are converted to native Python before DB insertion.
+
+    PostgreSQL's psycopg2 adapter cannot serialize numpy types. Without conversion,
+    np.float64(0.65) renders as a schema-qualified identifier in SQL, causing:
+      psycopg2.errors.InvalidSchemaName: schema "np" does not exist
+    """
+
+    def test_log_signal_with_numpy_floats(self):
+        """log_signal must accept numpy float64 values without error."""
+        import numpy as np
+        from src.data.store import SignalLog
+
+        db = DatabaseManager(database_url="sqlite:///:memory:")
+        db.log_signal({
+            "symbol": "BTC/USD",
+            "strategy": "momentum",
+            "signal": "SELL",
+            "confidence": np.float64(0.65),
+            "price_at_signal": np.float64(60141.2),
+            "indicators": '{"rsi": 50.35}',
+            "was_executed": False,
+        })
+
+        with db.get_session() as s:
+            sig = s.query(SignalLog).first()
+            assert sig is not None
+            assert sig.confidence == pytest.approx(0.65)
+            assert sig.price_at_signal == pytest.approx(60141.2)
+            assert isinstance(sig.confidence, float)
+
+    def test_record_trade_with_numpy_floats(self):
+        """record_trade must accept numpy float64/int64 values."""
+        import numpy as np
+        from src.data.store import Trade
+
+        db = DatabaseManager(database_url="sqlite:///:memory:")
+        db.record_trade({
+            "symbol": "AAPL",
+            "side": "buy",
+            "qty": np.float64(10.0),
+            "price": np.float64(150.25),
+            "strategy": "momentum",
+            "signal_confidence": np.float64(0.8),
+        })
+
+        with db.get_session() as s:
+            trade = s.query(Trade).first()
+            assert trade is not None
+            assert trade.price == pytest.approx(150.25)
+            assert trade.qty == pytest.approx(10.0)
+
+    def test_snapshot_portfolio_with_numpy_values(self):
+        """snapshot_portfolio must accept mixed numpy types."""
+        import numpy as np
+        from src.data.store import PortfolioSnapshot
+
+        db = DatabaseManager(database_url="sqlite:///:memory:")
+        db.snapshot_portfolio({
+            "total_equity": np.float64(100000.0),
+            "cash": np.float64(50000.0),
+            "positions_value": np.float64(50000.0),
+            "unrealized_pnl": np.float64(1234.56),
+            "open_positions": np.int64(3),
+        })
+
+        with db.get_session() as s:
+            snap = s.query(PortfolioSnapshot).first()
+            assert snap is not None
+            assert snap.total_equity == pytest.approx(100000.0)
+            assert snap.open_positions == 3

@@ -1,0 +1,45 @@
+# Version control
+.git
+.gitignore
+
+# Python artifacts
+__pycache__
+*.pyc
+*.pyo
+*.egg-info
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv
+venv
+env/
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+
+# Testing & coverage
+.pytest_cache
+.coverage
+htmlcov/
+.mypy_cache/
+
+# Local environment & secrets
+.env
+.env.local
+.env.*.local
+
+# Runtime data (rebuilt in container)
+logs/
+data_cache/
+*.db
+
+# Documentation & misc
+docs/
+*.md
+!README.md
+LICENSE
