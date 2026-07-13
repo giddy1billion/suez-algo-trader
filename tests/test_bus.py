@@ -139,7 +139,7 @@ class TestCreateBus:
 
     def test_invalid_backend(self):
         with pytest.raises(ValueError, match="Unknown bus backend"):
-            create_bus("redis")
+            create_bus("kafka")
 
     def test_max_history_kwarg(self):
         bus = create_bus("memory", max_history=50)

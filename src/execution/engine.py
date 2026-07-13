@@ -93,6 +93,7 @@ class ExecutionEngine:
         decision_orchestrator: Optional[DecisionOrchestrator] = None,
         contract_store=None,
         signal_dedup_strength_threshold: float = 0.10,
+        cache=None,
     ):
         self.broker = broker
         self.risk = risk_manager
@@ -130,6 +131,7 @@ class ExecutionEngine:
         # Signal deduplication — delegates to standalone SignalDeduplicator
         self._signal_dedup = SignalDeduplicator(
             strength_threshold=signal_dedup_strength_threshold,
+            cache=cache,
         )
 
         # Trade context tracking for closed-loop feedback

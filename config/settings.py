@@ -133,6 +133,8 @@ class Settings(BaseSettings):
 
     # --- Redis (optional — graceful fallback to in-memory if empty) ---
     redis_url: str = ""
+    redis_key_prefix: str = "suez:"
+    redis_default_ttl: int = 3600
 
     # --- Azure Blob Storage (optional — falls back to local filesystem) ---
     blob_storage_account_url: str = ""

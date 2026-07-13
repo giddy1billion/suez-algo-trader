@@ -75,6 +75,9 @@ dill==0.4.1
 # pip install liualgotrader  (requires PostgreSQL)
 # liualgotrader>=0.0.87
 
+# ─── Redis ────────────────────────────────────────────────────────────────────
+redis>=5.0.0
+
 # ─── Azure Storage ────────────────────────────────────────────────────────────
 azure-storage-blob==12.30.0
 azure-identity==1.25.3

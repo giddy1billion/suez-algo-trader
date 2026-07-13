@@ -534,6 +534,13 @@ def cmd_run(
 
     db = DatabaseManager(settings.database_url)
 
+    # Initialize Redis cache (graceful fallback to in-memory if not configured)
+    from src.utils.redis_client import create_cache
+    cache = create_cache(
+        redis_url=settings.redis_url,
+        key_prefix=settings.redis_key_prefix,
+    )
+
     # Initialize event-driven infrastructure
     from src.core.events import EventBus, OrderFilled, OrderRejected
     from src.core.state_machine import TradeManager
@@ -733,6 +740,7 @@ def cmd_run(
         decision_orchestrator=decision_orchestrator,
         contract_store=contract_store,
         signal_dedup_strength_threshold=settings.signal_dedup_strength_threshold,
+        cache=cache,
         intelligence_orchestrator=AdaptiveIntelligenceOrchestrator(
             min_trade_score=settings.intelligence_min_trade_score,
             drift_window=settings.intelligence_drift_window,
@@ -1290,14 +1298,14 @@ def cmd_run(
                 try:
                     from src.ml.model_registry import ModelRegistry
                     _bootstrap_registry = ModelRegistry(settings.ml_models_dir)
-                    _latest = _bootstrap_registry.get_latest_version()
-                    if _latest is not None:
+                    _registry_entries = _bootstrap_registry.list_versions()
+                    if len(_registry_entries) > 0:
                         # Registry has entries — a model was trained recently (even if rejected)
                         _has_recent_training = True
                         logger.info(
                             "scheduler.ml_bootstrap_skipped",
                             msg="No active model but registry has entries — skipping immediate retrain",
-                            latest_version=_latest,
+                            latest_version=_registry_entries[0].get("version", "unknown"),
                         )
                 except Exception as e:
                     logger.debug("scheduler.ml_bootstrap_registry_check_error", error=str(e))
