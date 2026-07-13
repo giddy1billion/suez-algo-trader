@@ -638,18 +638,64 @@ class EventBus:
     """
     Pub/Sub event bus. Thread-safe, supports sync and async handlers.
 
+    Supports two delivery modes:
+    - **blocking** (default): handlers run inline on the publisher thread.
+    - **non-blocking**: handlers run on a bounded thread pool with a per-handler
+      timeout. Slow subscribers are isolated and cannot block the publisher or
+      other handlers.
+
     Usage:
         bus = EventBus()
         bus.subscribe(SignalGenerated, my_handler)
         bus.subscribe(None, audit_all)  # wildcard — receives all events
         bus.publish(SignalGenerated(symbol="BTCUSDT", signal="BUY", ...))
+
+        # Non-blocking mode (isolates slow handlers):
+        bus = EventBus(non_blocking=True, handler_timeout=2.0)
     """
 
-    def __init__(self, max_history: int = 1000) -> None:
+    def __init__(
+        self,
+        max_history: int = 1000,
+        non_blocking: bool = False,
+        handler_timeout: float = 5.0,
+        max_workers: int = 4,
+    ) -> None:
         self._subscribers: dict[Any, list[Callable]] = {}
         self._lock = threading.Lock()
         self._history: deque[Event] = deque(maxlen=max_history)
         self._max_history = max_history
+        self._non_blocking = non_blocking
+        self._handler_timeout = handler_timeout
+        self._max_workers = max_workers
+        self._executor: Optional[Any] = None
+        self._slow_handler_count: int = 0
+        self._timeout_count: int = 0
+
+    @property
+    def non_blocking(self) -> bool:
+        """Whether the bus uses non-blocking delivery."""
+        return self._non_blocking
+
+    @property
+    def timeout_count(self) -> int:
+        """Number of handler invocations that timed out."""
+        return self._timeout_count
+
+    @property
+    def slow_handler_count(self) -> int:
+        """Number of handlers detected as slow (timed out)."""
+        return self._slow_handler_count
+
+    def _get_executor(self):
+        """Lazily create thread pool executor for non-blocking delivery."""
+        if self._executor is None:
+            from concurrent.futures import ThreadPoolExecutor
+            self._executor = ThreadPoolExecutor(
+                max_workers=self._max_workers,
+                thread_name_prefix="eventbus-worker",
+            )
+        return self._executor
 
     # ------------------------------------------------------------------
     # Subscription
@@ -684,18 +730,58 @@ class EventBus:
 
     def publish(self, event: Event) -> None:
         """
-        Publish an event synchronously. All handlers are called in order.
-        Exceptions in handlers are logged but do not propagate.
+        Publish an event. In blocking mode, handlers are called in order.
+        In non-blocking mode, handlers are dispatched to a thread pool with
+        timeout isolation. Exceptions in handlers are logged but do not propagate.
         """
         self._record(event)
         handlers = self._get_handlers(type(event))
+
+        if self._non_blocking:
+            self._publish_non_blocking(handlers, event)
+        else:
+            self._publish_blocking(handlers, event)
+
+    def _publish_blocking(self, handlers: list[Callable], event: Event) -> None:
+        """Dispatch to handlers synchronously (original behavior)."""
         for handler in handlers:
             try:
                 if asyncio.iscoroutinefunction(handler):
-                    # Run async handler in event loop if available
                     self._run_async_handler(handler, event)
                 else:
                     handler(event)
+            except Exception:
+                logger.exception(
+                    "Handler %s raised an exception for event %s",
+                    getattr(handler, "__name__", repr(handler)),
+                    type(event).__name__,
+                )
+
+    def _publish_non_blocking(self, handlers: list[Callable], event: Event) -> None:
+        """Dispatch handlers on thread pool with timeout isolation."""
+        from concurrent.futures import TimeoutError as FuturesTimeout
+
+        executor = self._get_executor()
+        futures = []
+        for handler in handlers:
+            if asyncio.iscoroutinefunction(handler):
+                future = executor.submit(self._run_async_handler, handler, event)
+            else:
+                future = executor.submit(handler, event)
+            futures.append((handler, future))
+
+        for handler, future in futures:
+            try:
+                future.result(timeout=self._handler_timeout)
+            except FuturesTimeout:
+                self._timeout_count += 1
+                self._slow_handler_count += 1
+                logger.warning(
+                    "Handler %s timed out after %.1fs for event %s",
+                    getattr(handler, "__name__", repr(handler)),
+                    self._handler_timeout,
+                    type(event).__name__,
+                )
             except Exception:
                 logger.exception(
                     "Handler %s raised an exception for event %s",
@@ -789,3 +875,9 @@ class EventBus:
 
             t = threading.Thread(target=_run, daemon=True)
             t.start()
+
+    def shutdown(self) -> None:
+        """Shutdown the thread pool executor (if non-blocking mode)."""
+        if self._executor is not None:
+            self._executor.shutdown(wait=False)
+            self._executor = None
