@@ -571,6 +571,52 @@ class ModelAutoRollback(Event):
     reason: str = ""
 
 
+# ---------------------------------------------------------------------------
+# Protective Exit Events
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ProtectiveExitConfigured(Event):
+    """Emitted when protective exit levels are computed for a new position."""
+
+    symbol: str = ""
+    side: str = ""  # "buy" or "sell"
+    entry_price: float = 0.0
+    stop_loss: float = 0.0
+    take_profit: float = 0.0
+    stop_loss_pct: float = 0.0
+    take_profit_pct: float = 0.0
+    risk_reward_ratio: float = 0.0
+    source: str = ""  # "strategy" | "atr" | "default" | "decision_contract"
+    trade_source: str = ""  # "signal" | "manual" | "telegram"
+
+
+@dataclass(frozen=True)
+class ProtectiveExitAdjusted(Event):
+    """Emitted when protective exit levels are adjusted (clamped/enforced)."""
+
+    symbol: str = ""
+    field_adjusted: str = ""  # "stop_loss" | "take_profit"
+    original_value: float = 0.0
+    adjusted_value: float = 0.0
+    reason: str = ""  # "clamped_max" | "clamped_min" | "risk_reward_enforced"
+
+
+@dataclass(frozen=True)
+class ProtectiveExitExecuted(Event):
+    """Emitted when a protective exit order (SL or TP) is filled by the broker."""
+
+    symbol: str = ""
+    exit_type: str = ""  # "stop_loss" | "take_profit"
+    trigger_price: float = 0.0
+    fill_price: float = 0.0
+    qty: float = 0.0
+    pnl: float = 0.0
+    order_id: str = ""
+    trade_id: str = ""
+    broker_acknowledged: bool = False
+
+
 def get_event_class_registry() -> dict[str, type]:
     """Return the auto-populated event class registry (read-only copy).
 
