@@ -3090,11 +3090,15 @@ async def callback_confirm_buy(callback: CallbackQuery):
     try:
         with _broker_lock:
             order = _broker.market_order(symbol, qty, "buy")
-        await callback.message.edit_text(
-            f"BUY order placed: {symbol} x {qty}\nOrder ID: {order['id'][:8]}..."
-        )
+        if order.get("error"):
+            await callback.message.edit_text(f"❌ Order failed: {order.get('message', 'Unknown error')}")
+        else:
+            order_id = order.get("id", "UNKNOWN")
+            await callback.message.edit_text(
+                f"✅ BUY order placed: {symbol} x {qty}\nOrder ID: {order_id[:8]}..."
+            )
     except Exception as e:
-        await callback.message.edit_text(f"Order failed: {e}")
+        await callback.message.edit_text(f"❌ Order failed: {e}")
     await callback.answer()
 
 
@@ -3117,11 +3121,15 @@ async def callback_confirm_sell(callback: CallbackQuery):
     try:
         with _broker_lock:
             order = _broker.market_order(symbol, qty, "sell")
-        await callback.message.edit_text(
-            f"SELL order placed: {symbol} x {qty}\nOrder ID: {order['id'][:8]}..."
-        )
+        if order.get("error"):
+            await callback.message.edit_text(f"❌ Order failed: {order.get('message', 'Unknown error')}")
+        else:
+            order_id = order.get("id", "UNKNOWN")
+            await callback.message.edit_text(
+                f"✅ SELL order placed: {symbol} x {qty}\nOrder ID: {order_id[:8]}..."
+            )
     except Exception as e:
-        await callback.message.edit_text(f"Order failed: {e}")
+        await callback.message.edit_text(f"❌ Order failed: {e}")
     await callback.answer()
 
 
