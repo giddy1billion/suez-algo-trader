@@ -7,7 +7,7 @@ import tempfile
 
 import pytest
 
-from src.ml.governance import ModelGovernance, ModelLineage
+from src.ml.governance import GovernanceViolation, ModelGovernance, ModelLineage
 
 
 @pytest.fixture
@@ -18,12 +18,24 @@ def governance(tmp_path):
 
 @pytest.fixture
 def governance_with_model(governance):
-    """Governance with one recorded model."""
+    """Governance with one recorded model that passes all validation gates."""
+    import pandas as pd
+    import numpy as np
+    df = pd.DataFrame({
+        "close": np.random.randn(200),
+        "volume": np.random.randint(1000, 10000, 200),
+    })
     governance.record_training(
         version="v001",
         features=["rsi_14", "ema_slope_20", "bb_pct", "atr_14"],
+        dataset=df,
         config={"n_estimators": 100, "max_depth": 6},
-        metrics={"cv_accuracy": 0.67, "sharpe": 1.5, "n_trades": 150},
+        metrics={
+            "cv_accuracy": 0.67,
+            "sharpe": 1.5,
+            "n_trades": 150,
+            "max_drawdown": 0.05,
+        },
         hyperparameters={"n_estimators": 100, "max_depth": 6, "learning_rate": 0.1},
         seed=42,
         training_duration=45.2,
@@ -126,11 +138,26 @@ class TestModelGovernance:
         """Deploying a new model retires the old one."""
         governance_with_model.deploy("v001")
 
-        # Record and deploy v002
+        # Record and deploy v002 with valid metrics
+        import pandas as pd
+        import numpy as np
+        df = pd.DataFrame({
+            "close": np.random.randn(200),
+            "volume": np.random.randint(1000, 10000, 200),
+        })
         governance_with_model.record_training(
             version="v002",
             features=["rsi_14", "ema_slope_20", "vol_ratio"],
-            metrics={"cv_accuracy": 0.72},
+            dataset=df,
+            metrics={
+                "cv_accuracy": 0.72,
+                "sharpe": 1.8,
+                "n_trades": 100,
+                "max_drawdown": 0.04,
+            },
+            hyperparameters={"n_estimators": 100},
+            walk_forward_results={"sharpe": 1.5},
+            monte_carlo_results={"probability_of_profit": 0.75},
         )
         governance_with_model.deploy("v002", reason="Higher accuracy")
 

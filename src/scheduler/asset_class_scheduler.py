@@ -66,6 +66,7 @@ class AssetClassScheduler:
         event_bus=None,
         market_status: Optional[MarketStatusService] = None,
         operational_mode: Optional[OperationalMode] = None,
+        alert_callback: Optional[Callable[[str], None]] = None,
     ):
         self._event_bus = event_bus
         self._market_status = market_status or MarketStatusService(
@@ -79,6 +80,16 @@ class AssetClassScheduler:
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self._tick_interval = 30.0  # Evaluate triggers every 30 seconds
+        self._alert_callback = alert_callback
+
+        # Health monitoring
+        self._last_tick_time: Optional[datetime] = None
+        self._consecutive_errors: int = 0
+        self._max_consecutive_errors: int = 5
+        self._health_timeout_seconds: float = 120.0  # Unhealthy if no tick in 2 min
+        self._restart_count: int = 0
+        self._monitor_interval: float = min(max(self._tick_interval / 2.0, 5.0), 30.0)
+        self._monitor_thread: Optional[threading.Thread] = None
 
         # Subscribe to events
         if self._event_bus:
@@ -184,8 +195,12 @@ class AssetClassScheduler:
         if self._running:
             return
         self._running = True
+        with self._lock:
+            self._last_tick_time = datetime.now(timezone.utc)
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
+        self._monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
+        self._monitor_thread.start()
         logger.info("asset_class_scheduler.started")
 
     def stop(self) -> None:
@@ -193,6 +208,8 @@ class AssetClassScheduler:
         self._running = False
         if self._thread:
             self._thread.join(timeout=10)
+        if self._monitor_thread:
+            self._monitor_thread.join(timeout=10)
         logger.info("asset_class_scheduler.stopped")
 
     def _run_loop(self) -> None:
@@ -200,9 +217,44 @@ class AssetClassScheduler:
         while self._running:
             try:
                 self.tick()
+                with self._lock:
+                    self._last_tick_time = datetime.now(timezone.utc)
+                    self._consecutive_errors = 0
             except Exception as e:
                 logger.error("scheduler.tick_error", error=str(e))
+                with self._lock:
+                    self._consecutive_errors += 1
+                    if self._consecutive_errors >= self._max_consecutive_errors:
+                        logger.critical(
+                            "scheduler.too_many_errors",
+                            consecutive_errors=self._consecutive_errors,
+                            action="restarting",
+                        )
+                        self._emit_alert(
+                            f"Scheduler auto-restart after {self._consecutive_errors} consecutive errors"
+                        )
+                        self._attempt_restart(reason="consecutive_errors")
             time.sleep(self._tick_interval)
+
+    def _monitor_loop(self) -> None:
+        """Heartbeat watchdog loop to detect stale scheduler execution."""
+        while self._running:
+            time.sleep(self._monitor_interval)
+            try:
+                health = self.health_check()
+                if not health["healthy"]:
+                    seconds = health.get("seconds_since_last_tick")
+                    msg = (
+                        f"Scheduler heartbeat stale: {seconds:.1f}s since last tick"
+                        if seconds is not None
+                        else "Scheduler heartbeat stale: no tick recorded"
+                    )
+                    logger.critical("scheduler.heartbeat_stale", details=msg)
+                    self._publish_scheduler_event("scheduler_watchdog", "heartbeat_missed")
+                    self._emit_alert(msg)
+                    self._attempt_restart(reason="heartbeat_stale")
+            except Exception as e:
+                logger.error("scheduler.monitor_error", error=str(e))
 
     def tick(self) -> list[ActivityResult]:
         """
@@ -339,15 +391,58 @@ class AssetClassScheduler:
         self._operational_mode = mode
         logger.info("scheduler.mode_changed", old=old.value, new=mode.value)
 
+    def health_check(self) -> dict[str, Any]:
+        """Return scheduler health status with liveness and error metrics."""
+        with self._lock:
+            now = datetime.now(timezone.utc)
+            last_tick = self._last_tick_time
+            if last_tick is not None:
+                seconds_since = (now - last_tick).total_seconds()
+                is_healthy = seconds_since < self._health_timeout_seconds
+            else:
+                seconds_since = None
+                is_healthy = self._running  # Not yet ticked
+
+            return {
+                "healthy": is_healthy,
+                "running": self._running,
+                "seconds_since_last_tick": seconds_since,
+                "consecutive_errors": self._consecutive_errors,
+                "restart_count": self._restart_count,
+                "health_timeout_seconds": self._health_timeout_seconds,
+            }
+
+    def _attempt_restart(self, reason: str = "unknown") -> None:
+        """Attempt to restart the scheduler loop after repeated failures."""
+        with self._lock:
+            self._restart_count += 1
+            self._consecutive_errors = 0
+            self._last_tick_time = datetime.now(timezone.utc)
+        logger.warning(
+            "scheduler.auto_restart",
+            restart_count=self._restart_count,
+            reason=reason,
+        )
+        self._publish_scheduler_event("scheduler_watchdog", "restarted")
+
+    def _emit_alert(self, message: str) -> None:
+        """Emit scheduler alert via callback and event bus."""
+        if self._alert_callback:
+            try:
+                self._alert_callback(message)
+            except Exception as e:
+                logger.warning("scheduler.alert_callback_error", error=str(e))
+
     @property
     def is_running(self) -> bool:
         return self._running
 
     def get_status(self) -> dict[str, Any]:
-        """Get comprehensive scheduler status."""
+        """Get comprehensive scheduler status including health."""
         return {
             "running": self._running,
             "operational_mode": self._operational_mode.value,
+            "health": self.health_check(),
             "market_status": {
                 k: {"phase": v.phase.value, "is_trading": v.is_trading}
                 for k, v in self._market_status.get_all_statuses().items()

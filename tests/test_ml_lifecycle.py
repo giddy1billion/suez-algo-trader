@@ -507,14 +507,21 @@ class TestSelfHealing:
         registry = ModelRegistry(models_dir=str(tmp_path / "models"))
         pipeline = TrainingPipeline(registry=registry, governance=governance)
 
-        # Record a recent model
+        # Record a recent model with passing metrics
         dataset = pd.DataFrame({"close": range(100), "volume": range(100)})
         governance.record_training(
             version="v001",
             features=["rsi_14"],
             dataset=dataset,
-            metrics={"cv_accuracy": 0.65},
+            metrics={
+                "cv_accuracy": 0.65,
+                "sharpe": 1.5,
+                "n_trades": 100,
+                "max_drawdown": 0.05,
+            },
             hyperparameters={"n_estimators": 200},
+            walk_forward_results={"sharpe": 1.0},
+            monte_carlo_results={"probability_of_profit": 0.70},
         )
         governance.deploy("v001", reason="test")
 

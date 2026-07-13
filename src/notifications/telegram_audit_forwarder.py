@@ -22,7 +22,9 @@ import asyncio
 import hashlib
 import logging
 import math
+import os
 import queue
+import tempfile
 import threading
 import time
 from datetime import datetime, timezone
@@ -52,6 +54,7 @@ from src.market.registry import classify_symbol
 from src.ml.model_registry import ModelRegistry
 from src.notifications.signal_formatter import SignalPackage, format_signal_message
 from src.notifications.correlation_store import (
+    CorrelationStoreProtocol,
     InMemoryCorrelationStore,
     SqliteCorrelationStore,
     CorrelationMetrics,
@@ -270,7 +273,7 @@ class TelegramAuditForwarder:
         runtime_state: Optional[RuntimeState] = None,
         risk_verdict_timeout_seconds: float = 60.0,
         bracket_orders_supported_provider: Optional[Callable[[], bool]] = None,
-        correlation_store: Optional[InMemoryCorrelationStore] = None,
+        correlation_store: Optional[CorrelationStoreProtocol] = None,
         timeout_check_interval: float = 5.0,
         max_send_retries: int = 3,
     ) -> None:
@@ -282,7 +285,7 @@ class TelegramAuditForwarder:
             runtime_state: RuntimeState for checking pause state (optional).
                           If not provided, never suppresses events.
             correlation_store: Pluggable store for correlation state.
-                             Defaults to a bounded in-memory store.
+                             Defaults to durable SQLite storage.
             timeout_check_interval: How often (seconds) the background timer
                                    checks for verdict timeouts.
             max_send_retries: Maximum delivery attempts before dead-lettering
@@ -312,8 +315,23 @@ class TelegramAuditForwarder:
         self._timeout_check_interval = max(0.5, timeout_check_interval)
         self._max_send_retries = max(1, max_send_retries)
 
-        # Pluggable correlation store (default: in-memory with TTL)
-        self._store = correlation_store or InMemoryCorrelationStore()
+        # Pluggable correlation store — production default is durable SQLite
+        # to ensure at-least-once delivery semantics.  Pass an
+        # InMemoryCorrelationStore explicitly for testing or development.
+        if correlation_store is not None:
+            self._store = correlation_store
+        else:
+            try:
+                from config.settings import settings
+                db_path = getattr(settings, "correlation_store_db_path", "data_cache/correlation_store.db")
+            except Exception:
+                db_path = "data_cache/correlation_store.db"
+            if os.getenv("PYTEST_CURRENT_TEST"):
+                db_path = os.path.join(
+                    tempfile.gettempdir(),
+                    f"correlation_store_{time.time_ns()}.db",
+                )
+            self._store = SqliteCorrelationStore(db_path=db_path)
 
         # Track last health status per component to suppress repeated identical notifications
         self._last_health_status: dict[str, str] = {}

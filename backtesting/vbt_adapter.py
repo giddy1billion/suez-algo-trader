@@ -400,57 +400,55 @@ def vectorbt_parameter_sweep(
             annualization_periods=annualization_periods,
         )
 
-    close = df['close']
-
-    # Generate all EMA combinations at once
-    fast_emas = vbt.MA.run(close, list(fast_range), short_name='fast', ewm=True)
-    slow_emas = vbt.MA.run(close, list(slow_range), short_name='slow', ewm=True)
-
-    # All crossover combinations
-    entries = fast_emas.ma_crossed_above(slow_emas)
-    exits = fast_emas.ma_crossed_below(slow_emas)
-
-    # Run all portfolios at once
-    portfolio = vbt.Portfolio.from_signals(
-        close,
-        entries=entries,
-        exits=exits,
-        init_cash=initial_cash,
-        fees=fees,
-        freq='1h',
-    )
-
-    # Collect metrics into DataFrame
-    total_returns = portfolio.total_return()
-    sharpe_ratios = portfolio.sharpe_ratio()
-    max_drawdowns = portfolio.max_drawdown()
-
+    # Run one parameter pair at a time to avoid vectorbt index-broadcast
+    # alignment failures such as "Index at position 0 could not be aligned".
     results = []
-    if hasattr(total_returns, 'index') and hasattr(total_returns.index, 'to_frame'):
-        idx_df = total_returns.index.to_frame(index=False)
-        for i in range(len(idx_df)):
-            results.append({
-                'fast_window': idx_df.iloc[i, 0],
-                'slow_window': idx_df.iloc[i, 1],
-                'total_return': total_returns.iloc[i],
-                'sharpe_ratio': sharpe_ratios.iloc[i],
-                'max_drawdown': max_drawdowns.iloc[i],
-                'win_rate': 0,
-                'total_trades': 0,
-            })
-    else:
-        # Scalar result
-        results.append({
-            'fast_window': list(fast_range)[0],
-            'slow_window': list(slow_range)[0],
-            'total_return': float(total_returns) if np.isscalar(total_returns) else 0,
-            'sharpe_ratio': float(sharpe_ratios) if np.isscalar(sharpe_ratios) else 0,
-            'max_drawdown': float(max_drawdowns) if np.isscalar(max_drawdowns) else 0,
-            'win_rate': 0,
-            'total_trades': 0,
-        })
+    for fast_w in fast_range:
+        for slow_w in slow_range:
+            if fast_w >= slow_w:
+                continue
+            try:
+                metrics = vectorbt_momentum_backtest(
+                    df,
+                    fast_ema=fast_w,
+                    slow_ema=slow_w,
+                    initial_cash=initial_cash,
+                    fees=fees,
+                    risk_per_trade=risk_per_trade,
+                    atr_stop_multiplier=atr_stop_multiplier,
+                    cooldown_bars=cooldown_bars,
+                    annualization_periods=annualization_periods,
+                )
+            except Exception as e:
+                logger.warning(
+                    "vbt.sweep_combo_failed",
+                    fast_window=fast_w,
+                    slow_window=slow_w,
+                    error=str(e),
+                )
+                continue
 
-    return pd.DataFrame(results)
+            results.append({
+                "fast_window": fast_w,
+                "slow_window": slow_w,
+                "total_return": float(metrics.get("total_return", 0.0)),
+                "sharpe_ratio": float(metrics.get("sharpe_ratio", 0.0)),
+                "max_drawdown": float(metrics.get("max_drawdown", 0.0)),
+                "win_rate": float(metrics.get("win_rate", 0.0)),
+                "total_trades": int(metrics.get("total_trades", 0)),
+            })
+
+    if results:
+        return pd.DataFrame(results)
+
+    logger.warning("vbt.sweep_all_vectorbt_combos_failed", action="fallback_numpy")
+    return _numpy_parameter_sweep(
+        df, fast_range, slow_range, initial_cash, fees,
+        risk_per_trade=risk_per_trade,
+        atr_stop_multiplier=atr_stop_multiplier,
+        cooldown_bars=cooldown_bars,
+        annualization_periods=annualization_periods,
+    )
 
 
 def vectorbt_multi_symbol_backtest(

@@ -34,6 +34,10 @@ logger = get_logger(__name__)
 # ---------------------------------------------------------------------------
 
 
+class GovernanceViolation(Exception):
+    """Raised when a deployment is attempted without passing governance gates."""
+
+
 class ModelStatus(str, Enum):
     """Model promotion lifecycle status."""
     CANDIDATE = "candidate"
@@ -253,8 +257,35 @@ class ModelGovernance:
     # Deployment Lifecycle
     # ------------------------------------------------------------------
 
-    def deploy(self, version: str, reason: str = "") -> bool:
-        """Mark a model version as deployed (live in production)."""
+    def deploy(self, version: str, reason: str = "", *, skip_validation: bool = False) -> bool:
+        """
+        Mark a model version as deployed (live in production).
+
+        Deployment is BLOCKED unless the model passes all governance
+        validation gates.  Validation bypass is disabled in production
+        hardening mode to prevent accidental unsafe promotions.
+
+        Raises:
+            GovernanceViolation: If the model fails validation and
+                ``skip_validation`` is False.
+        """
+        if skip_validation:
+            raise GovernanceViolation(
+                "Validation bypass is disabled: deployment requires passing all governance gates"
+            )
+
+        # ── Mandatory validation gate ──────────────────────────────
+        is_valid, issues = self.validate_for_deployment(version)
+        if not is_valid:
+            logger.warning(
+                "governance.deploy_blocked",
+                version=version,
+                issues=issues,
+            )
+            raise GovernanceViolation(
+                f"Model {version} failed governance validation: {issues}"
+            )
+
         with self._lock:
             all_lineage = self._load_all_lineage()
 
@@ -477,7 +508,20 @@ class ModelGovernance:
     # ------------------------------------------------------------------
 
     def _get_git_commit(self) -> str:
-        """Get current git commit hash. Tries git CLI then .git_commit file fallback."""
+        """Get current git commit hash.
+
+        Resolution order:
+        1. GIT_COMMIT / SOURCE_VERSION environment variable (set by CI/Docker)
+        2. git rev-parse HEAD (tried from multiple directories)
+        3. .git_commit file (embedded at Docker build time)
+        """
+        # Priority 1: Environment variables (most reliable in CI/Docker)
+        for env_var in ("GIT_COMMIT", "SOURCE_VERSION", "GITHUB_SHA"):
+            commit = os.environ.get(env_var, "").strip()
+            if commit:
+                return commit
+
+        # Priority 2: git CLI
         search_dirs = [
             os.path.dirname(os.path.abspath(__file__)),  # src/ml/
             os.getcwd(),  # working directory
@@ -495,7 +539,7 @@ class ModelGovernance:
             except Exception:
                 continue
 
-        # Fallback: read from .git_commit file (embedded at Docker build time)
+        # Priority 3: .git_commit file (embedded at Docker build time)
         for cwd in search_dirs:
             commit_file = os.path.join(cwd, ".git_commit")
             if os.path.exists(commit_file):

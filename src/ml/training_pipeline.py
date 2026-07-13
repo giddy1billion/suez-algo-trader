@@ -375,7 +375,7 @@ class TrainingPipeline:
         progress.current_step = "Training XGBoost model"
         logger.info("training_pipeline.step", step="train_model")
 
-        model, metrics, feature_cols, X_holdout, y_holdout = self._train_model(feature_data)
+        model, metrics, feature_cols, X_holdout, y_holdout, close_holdout = self._train_model(feature_data)
         self._raise_if_stopping()
         progress.metrics = metrics
         progress.steps_completed = 3
@@ -417,7 +417,7 @@ class TrainingPipeline:
         logger.info("training_pipeline.step", step="validate", version=version)
 
         # Run out-of-sample backtest on HELD-OUT data the model never trained on
-        backtest_results = self._backtest_model_oos(model, feature_cols, X_holdout, y_holdout)
+        backtest_results = self._backtest_model_oos(model, feature_cols, X_holdout, y_holdout, close_holdout)
         # Run genuine walk-forward validation (expanding-window refit + predict)
         walk_forward_results = self._walk_forward_validation(feature_data, feature_cols)
         metrics.update({
@@ -634,12 +634,17 @@ class TrainingPipeline:
 
     def _prepare_training_data(
         self, feature_data: dict[str, pd.DataFrame]
-    ) -> tuple[np.ndarray, np.ndarray, list[str], Optional[np.ndarray], int]:
+    ) -> tuple[np.ndarray, np.ndarray, list[str], Optional[np.ndarray], int, Optional[np.ndarray]]:
         """
         Prepare combined feature matrix from per-symbol DataFrames.
 
         Computes targets per-symbol (avoiding cross-symbol leakage), concatenates,
         drops forward-looking columns, and returns the clean feature matrix.
+
+        Improvements over naive approach:
+        - Volatility-adaptive labeling threshold per symbol (avoids labeling noise as signal)
+        - Symbol one-hot encoding (lets model learn asset-specific patterns)
+        - Feature variance filtering (removes near-constant noise features)
 
         Returns:
             X: Feature matrix (n_samples, n_features)
@@ -650,22 +655,40 @@ class TrainingPipeline:
         """
         # Combine all symbol data
         all_dfs = []
+        symbol_list = sorted(feature_data.keys())
         for symbol, df in feature_data.items():
             df_copy = df.copy()
             df_copy['_symbol'] = symbol
             all_dfs.append(df_copy)
 
         # Compute target per-symbol BEFORE concatenation to avoid cross-symbol leakage
+        # Use VOLATILITY-ADAPTIVE threshold: scale by each symbol's realized volatility
+        # so high-vol assets (BTC, ETH) don't get mislabeled as directional on noise moves
         forward_bars = 5
-        threshold = 0.005
+        base_threshold = 0.005
         for df_copy in all_dfs:
             df_copy['future_return'] = df_copy['close'].shift(-forward_bars) / df_copy['close'] - 1
+            # Adaptive threshold = max(base, 0.5 * rolling 20-bar realized vol * sqrt(forward_bars))
+            # This prevents labeling noise as signal in volatile assets
+            if 'close' in df_copy.columns and len(df_copy) > 20:
+                returns = df_copy['close'].pct_change()
+                rolling_vol = returns.rolling(20, min_periods=10).std().fillna(returns.std())
+                adaptive_threshold = np.maximum(
+                    base_threshold,
+                    0.5 * rolling_vol * np.sqrt(forward_bars)
+                )
+            else:
+                adaptive_threshold = base_threshold
             df_copy['target'] = np.where(
-                df_copy['future_return'] > threshold, 1,
-                np.where(df_copy['future_return'] < -threshold, -1, 0)
+                df_copy['future_return'] > adaptive_threshold, 1,
+                np.where(df_copy['future_return'] < -adaptive_threshold, -1, 0)
             )
 
         combined = pd.concat(all_dfs, ignore_index=True)
+
+        # Add symbol one-hot encoding so model can learn asset-specific patterns
+        for sym in symbol_list:
+            combined[f'_sym_{sym}'] = (combined['_symbol'] == sym).astype(np.float32)
 
         # Get feature columns (exclude meta and target)
         exclude_cols = {'target', 'future_return', '_symbol', '_sample_weight', '_from_experience',
@@ -678,7 +701,7 @@ class TrainingPipeline:
         # Extract sample weights if present (from experience enrichment)
         sample_weights = None
         if '_sample_weight' in combined.columns:
-            sample_weights = combined['_sample_weight'].values
+            sample_weights = combined['_sample_weight'].copy()
             combined = combined.drop(columns=['_sample_weight'], errors='ignore')
         if '_from_experience' in combined.columns:
             combined = combined.drop(columns=['_from_experience'], errors='ignore')
@@ -687,13 +710,19 @@ class TrainingPipeline:
         valid_mask = combined[feature_cols + ['target']].notna().all(axis=1)
         valid = combined[valid_mask].reset_index(drop=True)
         if sample_weights is not None:
-            sample_weights = sample_weights[valid_mask.values]
+            sample_weights = sample_weights.loc[valid_mask].to_numpy()
         if len(valid) < self._min_samples:
             raise RuntimeError(
                 f"Insufficient training samples: {len(valid)} < {self._min_samples}"
             )
 
-        X = valid[feature_cols].values
+        # Feature variance filtering: remove near-constant features (zero-variance = noise)
+        X_raw = valid[feature_cols].values
+        col_std = np.nanstd(X_raw, axis=0)
+        variance_mask = col_std > 1e-8  # Keep features with meaningful variance
+        feature_cols = [fc for fc, keep in zip(feature_cols, variance_mask) if keep]
+        X = X_raw[:, variance_mask]
+
         y = valid['target'].values
 
         # Encode trading labels [-1,0,1] → model classes [0,1,2]
@@ -702,11 +731,14 @@ class TrainingPipeline:
         # Temporal holdout: last 20% reserved for governance backtest (never seen during training)
         holdout_start_idx = int(len(X) * 0.80)
 
-        return X, y, feature_cols, sample_weights, holdout_start_idx
+        # Preserve close prices for realistic OOS backtesting (not used as features)
+        close_prices = valid['close'].values if 'close' in valid.columns else None
+
+        return X, y, feature_cols, sample_weights, holdout_start_idx, close_prices
 
     def _train_model(
         self, feature_data: dict[str, pd.DataFrame]
-    ) -> tuple[Any, dict, list[str], np.ndarray, np.ndarray]:
+    ) -> tuple[Any, dict, list[str], np.ndarray, np.ndarray, Optional[np.ndarray]]:
         """
         Train XGBoost model on prepared feature data.
 
@@ -725,7 +757,7 @@ class TrainingPipeline:
         from sklearn.model_selection import TimeSeriesSplit
         from sklearn.metrics import accuracy_score
 
-        X, y, feature_cols, sample_weights, holdout_start_idx = self._prepare_training_data(feature_data)
+        X, y, feature_cols, sample_weights, holdout_start_idx, close_prices = self._prepare_training_data(feature_data)
 
         # Split into train and holdout — holdout is NEVER used for model fitting
         X_train_all = X[:holdout_start_idx]
@@ -745,11 +777,35 @@ class TrainingPipeline:
         tscv = TimeSeriesSplit(n_splits=5)
         cv_scores = []
 
+        # ── Class-imbalance handling ──────────────────────────────────
+        # Compute per-class sample weights to correct class imbalance.
+        # This ensures the minority direction class (up/down) is not
+        # overwhelmed by the majority (usually flat) in the loss function.
+        from sklearn.utils.class_weight import compute_sample_weight
+        class_sample_weights = compute_sample_weight("balanced", y_train_all)
+        if w_train_all is not None:
+            # Combine with any experience-enrichment weights
+            w_train_all = w_train_all * class_sample_weights
+        else:
+            w_train_all = class_sample_weights
+
+        # Report class distribution for monitoring
+        unique_classes, class_counts = np.unique(y_train_all, return_counts=True)
+        class_dist = dict(zip(unique_classes.tolist(), class_counts.tolist()))
+        total = sum(class_counts)
+        imbalance_ratio = max(class_counts) / max(min(class_counts), 1)
+        logger.info(
+            "training_pipeline.class_distribution",
+            distribution=class_dist,
+            imbalance_ratio=round(float(imbalance_ratio), 2),
+        )
+
         for train_idx, val_idx in tscv.split(X_train_all):
-            # Skip warmup bars at start of test fold to avoid cold-start bias
-            embargo_bars = 100
+            # Adaptive embargo: min(10% of val fold, 50 bars) — avoids destroying
+            # early folds while still preventing autocorrelation leakage
+            embargo_bars = min(max(len(val_idx) // 10, 5), 50)
             val_idx = val_idx[embargo_bars:]
-            if len(val_idx) == 0:
+            if len(val_idx) < 20:
                 continue
 
             X_train, X_val = X_train_all[train_idx], X_train_all[val_idx]
@@ -757,38 +813,64 @@ class TrainingPipeline:
             w_train = w_train_all[train_idx] if w_train_all is not None else None
 
             model = XGBClassifier(
-                n_estimators=200,
-                max_depth=6,
-                learning_rate=0.05,
-                subsample=0.8,
-                colsample_bytree=0.8,
+                n_estimators=500,
+                max_depth=4,
+                learning_rate=0.02,
+                subsample=0.7,
+                colsample_bytree=0.6,
+                min_child_weight=10,
+                gamma=0.1,
+                reg_alpha=0.1,
+                reg_lambda=1.5,
                 use_label_encoder=False,
                 eval_metric='mlogloss',
                 random_state=42,
                 verbosity=0,
+                early_stopping_rounds=30,
             )
             model.fit(X_train, y_train, sample_weight=w_train,
                       eval_set=[(X_val, y_val)], verbose=False)
             score = accuracy_score(y_val, model.predict(X_val))
             cv_scores.append(score)
 
-        # Train final model on training portion ONLY (excludes holdout)
+        # Train final model on training portion ONLY (excludes holdout).
+        # Use early stopping against the holdout to prevent overfitting,
+        # matching the regularisation applied during CV folds.
+        # Reserve a small internal validation split (last 10% of train) for
+        # early-stopping monitoring so the holdout stays truly unseen.
+        es_split = int(len(X_train_all) * 0.90)
+        X_train_es = X_train_all[:es_split]
+        y_train_es = y_train_all[:es_split]
+        X_val_es = X_train_all[es_split:]
+        y_val_es = y_train_all[es_split:]
+        w_train_es = w_train_all[:es_split] if w_train_all is not None else None
+
         final_model = XGBClassifier(
-            n_estimators=200,
-            max_depth=6,
-            learning_rate=0.05,
-            subsample=0.8,
-            colsample_bytree=0.8,
+            n_estimators=500,
+            max_depth=4,
+            learning_rate=0.02,
+            subsample=0.7,
+            colsample_bytree=0.6,
+            min_child_weight=10,
+            gamma=0.1,
+            reg_alpha=0.1,
+            reg_lambda=1.5,
             use_label_encoder=False,
             eval_metric='mlogloss',
             random_state=42,
             verbosity=0,
+            early_stopping_rounds=30,
         )
-        final_model.fit(X_train_all, y_train_all, sample_weight=w_train_all, verbose=False)
+        final_model.fit(
+            X_train_es, y_train_es,
+            sample_weight=w_train_es,
+            eval_set=[(X_val_es, y_val_es)],
+            verbose=False,
+        )
 
         metrics = {
-            "cv_accuracy": float(np.mean(cv_scores)),
-            "cv_std": float(np.std(cv_scores)),
+            "cv_accuracy": float(np.mean(cv_scores)) if cv_scores else 0.0,
+            "cv_std": float(np.std(cv_scores)) if cv_scores else 0.0,
             "n_samples": len(X_train_all),
             "n_holdout_samples": len(X_holdout),
             "n_features": len(feature_cols),
@@ -798,15 +880,24 @@ class TrainingPipeline:
                 "flat": int((y_train_all == DirectionEncoder.FLAT_CLASS).sum()),
                 "down": int((y_train_all == DirectionEncoder.DOWN_CLASS).sum()),
             },
+            "class_imbalance_ratio": float(imbalance_ratio),
             "hyperparameters": {
-                "n_estimators": 200,
-                "max_depth": 6,
-                "learning_rate": 0.05,
-                "subsample": 0.8,
+                "n_estimators": 500,
+                "max_depth": 4,
+                "learning_rate": 0.02,
+                "subsample": 0.7,
+                "colsample_bytree": 0.6,
+                "min_child_weight": 10,
+                "gamma": 0.1,
+                "reg_alpha": 0.1,
+                "reg_lambda": 1.5,
+                "early_stopping_rounds": 30,
             },
         }
 
-        return final_model, metrics, feature_cols, X_holdout, y_holdout
+        close_holdout = close_prices[holdout_start_idx:] if close_prices is not None else None
+
+        return final_model, metrics, feature_cols, X_holdout, y_holdout, close_holdout
 
     def _backtest_model_oos(
         self,
@@ -814,20 +905,25 @@ class TrainingPipeline:
         feature_cols: list[str],
         X_holdout: np.ndarray,
         y_holdout: np.ndarray,
+        close_holdout: Optional[np.ndarray] = None,
+        transaction_cost_bps: float = 10.0,
+        slippage_bps: float = 5.0,
     ) -> dict:
         """
         Run out-of-sample backtest on held-out data the model NEVER trained on.
 
-        Generates NON-OVERLAPPING simulated trades from model predictions on the
-        temporal holdout set. Each trade holds for `hold_bars` and the next trade
-        can only start after the previous exits — ensuring statistical independence
-        of trade returns for valid Sharpe ratio computation.
+        Uses **actual close prices** when available to compute realistic
+        trade returns including round-trip transaction costs and slippage.
+        Falls back to a simplified simulation only when prices are absent.
 
         Args:
             model: Trained model (only trained on first 80% of data).
             feature_cols: Feature column names.
             X_holdout: Feature matrix from the temporal holdout (last 20%).
             y_holdout: True encoded targets from the holdout.
+            close_holdout: Close price array aligned with X_holdout (optional).
+            transaction_cost_bps: Round-trip transaction cost in basis points.
+            slippage_bps: Estimated slippage per side in basis points.
 
         Returns:
             Dict with sharpe, max_drawdown, n_trades, monte_carlo results.
@@ -835,6 +931,7 @@ class TrainingPipeline:
         from backtesting.monte_carlo import monte_carlo_simulation
 
         hold_bars = 5  # Holding period per trade
+        cost_per_trade = (transaction_cost_bps + 2 * slippage_bps) / 10_000.0
 
         # Handle NaN in holdout features
         nan_mask = np.isnan(X_holdout) | np.isinf(X_holdout)
@@ -845,6 +942,8 @@ class TrainingPipeline:
         predictions = model.predict(X_holdout)
         decoded_predictions = DirectionEncoder.decode(predictions)
 
+        use_prices = (close_holdout is not None and len(close_holdout) == len(X_holdout))
+
         # Generate NON-OVERLAPPING trades: after entering, skip forward by hold_bars
         all_trades = []
         i = 0
@@ -854,30 +953,29 @@ class TrainingPipeline:
                 i += 1
                 continue
 
-            # Use true targets to compute hypothetical P&L from the holdout
-            # The target encodes direction: 1=up, -1=down, 0=flat
-            # Trade return = signal * actual_return_over_hold_period
-            # Since we don't have close prices here, use a simplified
-            # trade simulation based on prediction correctness
-            true_direction = DirectionEncoder.decode(np.array([y_holdout[i]]))[0]
-
-            # Reward correct predictions, penalize incorrect ones
-            # This mirrors the actual trading outcome without needing prices
-            if true_direction == signal:
-                # Correct prediction — assume median favorable return
-                trade_return = 0.005 * abs(signal)  # threshold-level return
-            elif true_direction == 0:
-                # Predicted direction but market was flat — small loss (spread/slippage)
-                trade_return = -0.001
+            if use_prices:
+                # ── Realistic price-based return ────────────────────────
+                entry_price = close_holdout[i]
+                exit_price = close_holdout[i + hold_bars]
+                if entry_price > 0:
+                    raw_return = signal * (exit_price / entry_price - 1.0)
+                    trade_return = raw_return - cost_per_trade
+                else:
+                    trade_return = 0.0
             else:
-                # Wrong direction — assume median adverse return
-                trade_return = -0.005 * abs(signal)
+                # ── Fallback: direction-correctness estimate ────────────
+                true_direction = DirectionEncoder.decode(np.array([y_holdout[i]]))[0]
+                if true_direction == signal:
+                    trade_return = 0.005 * abs(signal) - cost_per_trade
+                elif true_direction == 0:
+                    trade_return = -cost_per_trade
+                else:
+                    trade_return = -0.005 * abs(signal) - cost_per_trade
 
             all_trades.append({
                 "pnl": 1000.0 * trade_return,  # Notional $1000 per trade
                 "return": trade_return,
                 "signal": signal,
-                "true_direction": true_direction,
             })
 
             # Skip forward by hold_bars — ensures non-overlapping trades
@@ -965,8 +1063,20 @@ class TrainingPipeline:
         from sklearn.metrics import accuracy_score
 
         hold_bars = 5
+        primary_symbol = next(iter(sorted(feature_data.keys())), "AAPL")
+        try:
+            from src.config.backtest_params import get_backtest_config
+            commission_pct = float(get_backtest_config(primary_symbol).get("fees"))
+        except Exception:
+            commission_pct = 1.0 / 1000.0
+        try:
+            from config.settings import settings
+            slippage_pct = float(settings.backtest_slippage_pct)
+        except Exception:
+            slippage_pct = 1.0 / 2000.0
+        cost_per_trade = commission_pct + (2.0 * slippage_pct)
 
-        X, y, _, sample_weights, _ = self._prepare_training_data(feature_data)
+        X, y, _, sample_weights, _, close_prices = self._prepare_training_data(feature_data)
 
         # Divide into (n_splits + 1) temporal segments
         n_total = len(X)
@@ -978,7 +1088,7 @@ class TrainingPipeline:
                 n_total=n_total,
                 segment_size=segment_size,
             )
-            return {"sharpe": 0.0, "total_return": 0.0, "splits": []}
+            return {"sharpe": 0.0, "total_return": 0.0, "n_trades": 0, "splits": []}
 
         all_wf_trades = []
         split_results = []
@@ -986,8 +1096,9 @@ class TrainingPipeline:
         for split_idx in range(n_splits):
             # Training: all data from start up to end of segment (split_idx + 1)
             train_end = segment_size * (split_idx + 1)
-            # Test: next segment
-            test_start = train_end
+            # Purge gap: skip forward_bars (5) to prevent label leakage at boundary
+            purge_gap = 5
+            test_start = train_end + purge_gap
             test_end = min(train_end + segment_size, n_total)
 
             if test_end - test_start < 20:
@@ -998,14 +1109,23 @@ class TrainingPipeline:
             w_train_wf = sample_weights[:train_end] if sample_weights is not None else None
             X_test_wf = X[test_start:test_end]
             y_test_wf = y[test_start:test_end]
+            close_test_wf = (
+                close_prices[test_start:test_end]
+                if close_prices is not None and len(close_prices) >= test_end
+                else None
+            )
 
             # Train fresh model on expanding window
             wf_model = XGBClassifier(
-                n_estimators=200,
-                max_depth=6,
-                learning_rate=0.05,
-                subsample=0.8,
-                colsample_bytree=0.8,
+                n_estimators=500,
+                max_depth=4,
+                learning_rate=0.02,
+                subsample=0.7,
+                colsample_bytree=0.6,
+                min_child_weight=10,
+                gamma=0.1,
+                reg_alpha=0.1,
+                reg_lambda=1.5,
                 use_label_encoder=False,
                 eval_metric='mlogloss',
                 random_state=42,
@@ -1027,13 +1147,22 @@ class TrainingPipeline:
                     i += 1
                     continue
 
-                true_dir = DirectionEncoder.decode(np.array([y_test_wf[i]]))[0]
-                if true_dir == signal:
-                    trade_return = 0.005 * abs(signal)
-                elif true_dir == 0:
-                    trade_return = -0.001
+                if close_test_wf is not None:
+                    entry_price = close_test_wf[i]
+                    exit_price = close_test_wf[i + hold_bars]
+                    if entry_price > 0:
+                        raw_return = signal * (exit_price / entry_price - 1.0)
+                        trade_return = float(raw_return - cost_per_trade)
+                    else:
+                        trade_return = 0.0
                 else:
-                    trade_return = -0.005 * abs(signal)
+                    true_dir = DirectionEncoder.decode(np.array([y_test_wf[i]]))[0]
+                    if true_dir == signal:
+                        trade_return = 0.005 * abs(signal) - cost_per_trade
+                    elif true_dir == 0:
+                        trade_return = -cost_per_trade
+                    else:
+                        trade_return = -0.005 * abs(signal) - cost_per_trade
 
                 split_trades.append({"return": trade_return, "signal": signal})
                 i += hold_bars
