@@ -851,6 +851,19 @@ class ExecutionEngine:
         if trade_lifecycle:
             trade_lifecycle.transition(TradeState.SUBMITTED, "order submitted to broker")
 
+        # P1-16: Final validation before broker submission - reject NaN/Inf
+        import math as _math
+        if not _math.isfinite(final_qty) or final_qty <= 0:
+            logger.error("engine.invalid_qty_before_submit", qty=final_qty, symbol=signal.symbol)
+            if trade_lifecycle:
+                trade_lifecycle.transition(TradeState.CANCELLED, f"invalid qty: {final_qty}")
+            return None
+        if not _math.isfinite(observed_price) or observed_price <= 0:
+            logger.error("engine.invalid_price_before_submit", price=observed_price, symbol=signal.symbol)
+            if trade_lifecycle:
+                trade_lifecycle.transition(TradeState.CANCELLED, f"invalid price: {observed_price}")
+            return None
+
         # Place the order — use contract SL/TP (system-determined) not strategy hints
         order_type = "bracket" if (final_stop_loss and final_take_profit) else "market"
         logger.info(
@@ -963,6 +976,9 @@ class ExecutionEngine:
                 if trade_lifecycle:
                     trade_lifecycle.transition(TradeState.FILLED, f"filled qty={final_qty}")
                     trade_lifecycle.transition(TradeState.ACTIVE, "position active")
+                    # P1-10: Set broker_qty after fill to prevent reconciliation false positives
+                    trade_lifecycle.metadata['broker_qty'] = final_qty
+                    trade_lifecycle.metadata['avg_fill_price'] = fill_price
 
                 self._publish(OrderFilled(
                     order_id=order.get("id", ""),
@@ -1339,8 +1355,10 @@ class ExecutionEngine:
                         break
 
             # Fallback: check _trade_context for contract_id
-            if not contract_id and trade_id and trade_id in self._trade_context:
-                contract_id = self._trade_context[trade_id].get("contract_id", "")
+            if not contract_id and trade_id:
+                with self._trade_context_lock:
+                    if trade_id in self._trade_context:
+                        contract_id = self._trade_context[trade_id].get("contract_id", "")
 
             self._publish(TradeClosed(
                 trade_id=trade_id,
@@ -1356,7 +1374,8 @@ class ExecutionEngine:
             # Record outcome in contract store
             if contract_id and self._contract_store:
                 try:
-                    side = self._trade_context.get(trade_id, {}).get("side", "buy")
+                    with self._trade_context_lock:
+                        side = self._trade_context.get(trade_id, {}).get("side", "buy")
                     self._contract_store.record_outcome(
                         contract_id=contract_id,
                         trade_id=trade_id,

@@ -263,6 +263,8 @@ class PortfolioRiskLayer:
                     else:
                         pair = tuple(sorted([sym_i, sym_j]))
                         corr = correlation_matrix.get(pair, 0.0)
+                        # P1-02: Bound correlation values to [-1, 1]
+                        corr = max(-1.0, min(1.0, corr))
                     portfolio_variance += vi * vj * corr
             # VaR = z * sqrt(portfolio_variance), 95% confidence
             import math

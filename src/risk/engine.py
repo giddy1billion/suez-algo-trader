@@ -115,7 +115,18 @@ class RiskEngine:
                     layer_decisions=layer_decisions,
                     request=request,
                 )
+            # P1-18: Even with executable contract, enforce minimum confidence threshold
             effective_confidence = contract.final_confidence
+            if effective_confidence <= 0.5:
+                return self._build_decision(
+                    approved=False,
+                    adjusted_qty=0.0,
+                    reasons=[
+                        f"Decision contract confidence {effective_confidence:.3f} below minimum 0.5"
+                    ],
+                    layer_decisions=layer_decisions,
+                    request=request,
+                )
         elif request.confidence_score is not None:
             if not request.confidence_score.approved:
                 return self._build_decision(

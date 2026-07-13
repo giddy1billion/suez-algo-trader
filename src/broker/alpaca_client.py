@@ -81,6 +81,10 @@ def _is_retryable(exc: Exception) -> bool:
         ConnectionError, Timeout, ReadTimeout, ConnectTimeout
     )
 
+    # Programming errors — never retry (fail fast for debugging)
+    if isinstance(exc, (TypeError, AttributeError, KeyError, ValueError, IndexError)):
+        return False
+
     # Network/timeout errors — always retry
     if isinstance(exc, (ConnectionError, Timeout, ReadTimeout, ConnectTimeout, OSError)):
         return True
@@ -102,7 +106,7 @@ def _is_retryable(exc: Exception) -> bool:
         if status in (401, 403, 422):
             return False
 
-    # Unknown errors — retry to be safe
+    # Unknown errors — retry to be safe (likely network-related)
     return True
 
 
@@ -241,9 +245,18 @@ class AlpacaBroker:
         return TimeInForce.DAY
 
     def _call(self, fn, *args, **kwargs):
-        """Execute an API call with rate limiting, retry, and error handling."""
+        """Execute an API call with rate limiting, timeout enforcement, and error handling."""
+        import concurrent.futures
         self._rate_limiter.acquire()
-        return fn(*args, **kwargs)
+        # P1-05: Enforce timeout on all broker API calls
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(fn, *args, **kwargs)
+            try:
+                return future.result(timeout=self.timeout)
+            except concurrent.futures.TimeoutError:
+                raise TimeoutError(
+                    f"Broker API call {fn.__name__} timed out after {self.timeout}s"
+                )
 
     # ──────────────────────────────────────────────────────────────────────
     # Account & Portfolio

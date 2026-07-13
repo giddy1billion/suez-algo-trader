@@ -1087,6 +1087,11 @@ async def cmd_set(message: Message):
     old_value = getattr(settings, field_name, "?")
 
     # Apply to settings object directly (in-memory)
+    # P1-03: Additional safety - only allow setting known settings attributes
+    _ALLOWED_SETTINGS_FIELDS = {spec.get("field", p) for p, spec in SETTABLE_PARAMS.items()}
+    if field_name not in _ALLOWED_SETTINGS_FIELDS:
+        await message.answer(f"Security: field '{field_name}' not in allowed settings whitelist.")
+        return
     try:
         setattr(settings, field_name, value)
     except Exception as e:

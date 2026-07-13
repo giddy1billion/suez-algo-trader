@@ -1645,13 +1645,22 @@ def cmd_run(
             break
         except Exception as e:
             consecutive_errors += 1
-            logger.error("cycle.error", error=str(e), consecutive=consecutive_errors)
+            _total_errors = getattr(_shutdown_event, '_total_errors', 0) + 1
+            _shutdown_event._total_errors = _total_errors
+            logger.error("cycle.error", error=str(e), consecutive=consecutive_errors, total=_total_errors)
             notifier.notify_error(str(e), f"Cycle {cycle_count}")
 
             if consecutive_errors >= settings.max_consecutive_errors:
-                logger.warning("bot.too_many_errors", msg=f"Pausing for {settings.error_cooldown_seconds}s")
-                _shutdown_event.wait(timeout=settings.error_cooldown_seconds)
-                consecutive_errors = 0
+                # P1-14: Exponential backoff instead of fixed cooldown + counter reset
+                backoff_multiplier = min(consecutive_errors // settings.max_consecutive_errors, 5)
+                cooldown = settings.error_cooldown_seconds * (2 ** backoff_multiplier)
+                cooldown = min(cooldown, 300)  # Cap at 5 minutes
+                logger.warning("bot.too_many_errors",
+                              msg=f"Pausing for {cooldown}s (backoff level {backoff_multiplier})",
+                              total_errors=_total_errors)
+                _shutdown_event.wait(timeout=cooldown)
+                # Don't fully reset - reduce by half to allow recovery but maintain pressure
+                consecutive_errors = max(0, consecutive_errors - settings.max_consecutive_errors)
                 continue
 
         # Sleep until next cycle

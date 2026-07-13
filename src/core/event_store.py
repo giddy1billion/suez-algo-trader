@@ -134,6 +134,11 @@ class EventStore:
         # For PostgreSQL, schema is managed by Alembic migrations (bootstrap_database).
         if not url.startswith("postgresql"):
             EventBase.metadata.create_all(self._engine)
+            # P1-08: Enable WAL mode and synchronous=FULL for crash safety
+            with self._engine.connect() as conn:
+                conn.execute(text("PRAGMA journal_mode=WAL"))
+                conn.execute(text("PRAGMA synchronous=FULL"))
+                conn.commit()
         self._session_factory = sessionmaker(bind=self._engine)
 
         logger.info("EventStore initialized", session_id=self.session_id)

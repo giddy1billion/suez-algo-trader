@@ -256,7 +256,25 @@ class HyperparameterTuner:
         from src.ml.label_encoder import DirectionEncoder
         y = DirectionEncoder.encode(y)
 
-        # Handle any remaining NaN/inf
+        # Handle any remaining NaN/inf — log data quality issues
+        nan_count = np.isnan(X).sum()
+        inf_count = np.isinf(X).sum()
+        total_cells = X.size
+        if nan_count > 0 or inf_count > 0:
+            corruption_pct = (nan_count + inf_count) / total_cells * 100
+            logger.warning(
+                "hyperparameter_tuning.data_quality",
+                nan_count=int(nan_count),
+                inf_count=int(inf_count),
+                total_cells=total_cells,
+                corruption_pct=f"{corruption_pct:.2f}%",
+            )
+            if corruption_pct > 5.0:
+                raise ValueError(
+                    f"Data corruption too high ({corruption_pct:.1f}%): "
+                    f"{nan_count} NaN + {inf_count} Inf in {total_cells} cells. "
+                    f"Fix feature engineering before tuning."
+                )
         X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
 
         return X, y
