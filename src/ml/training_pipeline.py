@@ -1138,7 +1138,21 @@ class TrainingPipeline:
                 else None
             )
 
-            # Train fresh model on expanding window
+            # Train fresh model on expanding window with early stopping
+            # Use last 10% of training data as fold-local validation (respects temporal order)
+            embargo_bars = 5  # Same as purge_gap to prevent leakage
+            es_split = int(len(X_train_wf) * 0.90)
+            X_train_fold = X_train_wf[:es_split]
+            y_train_fold = y_train_wf[:es_split]
+            w_train_fold = w_train_wf[:es_split] if w_train_wf is not None else None
+            # Apply embargo gap between fold-local train and validation
+            val_start = es_split + embargo_bars
+            X_val_fold = X_train_wf[val_start:]
+            y_val_fold = y_train_wf[val_start:]
+
+            # If validation set is too small after embargo, use full training without early stopping
+            use_early_stopping = len(X_val_fold) >= 20
+
             wf_model = XGBClassifier(
                 n_estimators=500,
                 max_depth=4,
@@ -1153,8 +1167,15 @@ class TrainingPipeline:
                 eval_metric='mlogloss',
                 random_state=42,
                 verbosity=0,
+                early_stopping_rounds=30 if use_early_stopping else None,
             )
-            wf_model.fit(X_train_wf, y_train_wf, sample_weight=w_train_wf, verbose=False)
+            if use_early_stopping:
+                wf_model.fit(
+                    X_train_fold, y_train_fold, sample_weight=w_train_fold,
+                    eval_set=[(X_val_fold, y_val_fold)], verbose=False,
+                )
+            else:
+                wf_model.fit(X_train_wf, y_train_wf, sample_weight=w_train_wf, verbose=False)
 
             # Predict on unseen segment
             preds = wf_model.predict(X_test_wf)
@@ -1191,12 +1212,15 @@ class TrainingPipeline:
                 i += hold_bars
 
             all_wf_trades.extend(split_trades)
+            best_iteration = getattr(wf_model, 'best_iteration', None) if use_early_stopping else None
             split_results.append({
                 "split": split_idx,
                 "train_size": len(X_train_wf),
                 "test_size": len(X_test_wf),
                 "accuracy": accuracy,
                 "n_trades": len(split_trades),
+                "best_iteration": best_iteration,
+                "early_stopping_used": use_early_stopping,
             })
 
         # Compute walk-forward metrics from all out-of-sample trades
