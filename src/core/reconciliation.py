@@ -203,12 +203,38 @@ class PortfolioReconciler:
         """
         Attempt automatic fixes for safe discrepancies.
 
-        Only fixes MISSING_INTERNAL (creates lifecycle for broker position).
-        Never auto-closes broker positions.
+        Fixes MISSING_INTERNAL (creates lifecycle for broker position).
+        Fixes MISSING_BROKER (closes local position that no longer exists at broker).
         """
         fixes = []
 
         for disc in report.discrepancies:
+            if disc.type == MISSING_BROKER:
+                # Position exists locally but NOT at broker — broker closed it
+                # (e.g., stop-loss filled, liquidation, manual close)
+                symbol = disc.symbol
+                try:
+                    # Find and close the internal trade lifecycle
+                    active_trades = self.trade_manager.get_active_trades()
+                    for trade in active_trades:
+                        if trade.symbol == symbol:
+                            trade.transition(TradeState.CLOSED, "auto-fix: position closed at broker (MISSING_BROKER)")
+                            trade.metadata["auto_closed"] = True
+                            trade.metadata["auto_close_reason"] = "MISSING_BROKER reconciliation"
+                            fixes.append(f"Closed local position for {symbol} (not found at broker)")
+                            logger.warning(
+                                "reconciliation.auto_close_missing_broker",
+                                symbol=symbol,
+                                reason="Position exists locally but not at broker",
+                            )
+                            break
+                    else:
+                        fixes.append(f"MISSING_BROKER {symbol}: no active trade found to close")
+                except Exception as e:
+                    logger.error("Auto-fix MISSING_BROKER failed for %s: %s", symbol, str(e))
+                    fixes.append(f"FAILED to fix MISSING_BROKER {symbol}: {str(e)}")
+                continue
+
             if disc.type != MISSING_INTERNAL:
                 continue
 

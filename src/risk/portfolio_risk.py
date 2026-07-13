@@ -94,6 +94,22 @@ class PortfolioRiskLayer:
         correlation_matrix: Optional[dict],
     ) -> LayerDecision:
         """Core evaluation logic (called under lock)."""
+        import math
+
+        # Input validation: reject if price is invalid (prevents division-by-zero bypass)
+        if request.price <= 0 or math.isnan(request.price) or math.isinf(request.price):
+            return LayerDecision(
+                layer_name="portfolio_risk",
+                action=RiskAction.REJECT,
+                reason=f"Invalid price: {request.price}",
+            )
+        if request.qty <= 0 or math.isnan(request.qty) or math.isinf(request.qty):
+            return LayerDecision(
+                layer_name="portfolio_risk",
+                action=RiskAction.REJECT,
+                reason=f"Invalid quantity: {request.qty}",
+            )
+
         if portfolio_value <= 0:
             return LayerDecision(
                 layer_name="portfolio_risk",

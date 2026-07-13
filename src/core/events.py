@@ -660,6 +660,7 @@ class EventBus:
         non_blocking: bool = False,
         handler_timeout: float = 5.0,
         max_workers: int = 4,
+        max_queue_size: int = 10000,
     ) -> None:
         self._subscribers: dict[Any, list[Callable]] = {}
         self._lock = threading.Lock()
@@ -668,9 +669,13 @@ class EventBus:
         self._non_blocking = non_blocking
         self._handler_timeout = handler_timeout
         self._max_workers = max_workers
+        self._max_queue_size = max_queue_size
         self._executor: Optional[Any] = None
         self._slow_handler_count: int = 0
         self._timeout_count: int = 0
+        self._dropped_events: int = 0
+        self._pending_tasks: int = 0
+        self._pending_lock = threading.Lock()
 
     @property
     def non_blocking(self) -> bool:
@@ -758,8 +763,21 @@ class EventBus:
                 )
 
     def _publish_non_blocking(self, handlers: list[Callable], event: Event) -> None:
-        """Dispatch handlers on thread pool with timeout isolation."""
+        """Dispatch handlers on thread pool with timeout isolation and backpressure."""
         from concurrent.futures import TimeoutError as FuturesTimeout
+
+        # Backpressure: reject non-critical events when queue is full
+        with self._pending_lock:
+            if self._pending_tasks >= self._max_queue_size:
+                self._dropped_events += 1
+                logger.warning(
+                    "EventBus queue full (%d pending), dropping event %s (total dropped: %d)",
+                    self._pending_tasks,
+                    type(event).__name__,
+                    self._dropped_events,
+                )
+                return
+            self._pending_tasks += len(handlers)
 
         executor = self._get_executor()
         futures = []
@@ -788,6 +806,9 @@ class EventBus:
                     getattr(handler, "__name__", repr(handler)),
                     type(event).__name__,
                 )
+            finally:
+                with self._pending_lock:
+                    self._pending_tasks = max(0, self._pending_tasks - 1)
 
     def publish_async(self, event: Event) -> None:
         """
@@ -876,8 +897,18 @@ class EventBus:
             t = threading.Thread(target=_run, daemon=True)
             t.start()
 
-    def shutdown(self) -> None:
-        """Shutdown the thread pool executor (if non-blocking mode)."""
+    def shutdown(self, wait: bool = True, timeout: float = 10.0) -> None:
+        """Shutdown the thread pool executor (if non-blocking mode).
+        
+        Args:
+            wait: If True, wait for pending tasks to complete (up to timeout).
+            timeout: Maximum seconds to wait for pending tasks.
+        """
         if self._executor is not None:
-            self._executor.shutdown(wait=False)
+            self._executor.shutdown(wait=wait)
             self._executor = None
+        if self._dropped_events > 0:
+            logger.warning(
+                "EventBus shutdown: %d events were dropped due to backpressure",
+                self._dropped_events,
+            )

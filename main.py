@@ -76,6 +76,7 @@ def signal_handler(sig, frame):
 
 
 signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
 if hasattr(signal, 'SIGBREAK'):
     signal.signal(signal.SIGBREAK, signal_handler)
 
@@ -712,9 +713,6 @@ def cmd_run(
         except Exception as e:
             logger.debug("feedback_loop.score_error", error=str(e))
 
-    from src.core.events import TradeClosed as _TradeClosed
-    event_bus.subscribe(_TradeClosed, _on_trade_closed)
-
     confidence_gate = ConfidenceGate(ConfidenceGateConfig())
 
     # Decision Contract infrastructure — every trading decision is auditable
@@ -723,6 +721,10 @@ def cmd_run(
         gate_config=ConfidenceGateConfig(),
         validity_minutes=getattr(settings, 'contract_validity_minutes', 5.0),
     )
+
+    # P0-11: Subscribe TradeClosed AFTER all referenced objects are initialized
+    from src.core.events import TradeClosed as _TradeClosed
+    event_bus.subscribe(_TradeClosed, _on_trade_closed)
 
     engine = ExecutionEngine(
         broker=broker,
@@ -1660,9 +1662,18 @@ def cmd_run(
 
     # Shutdown
     logger.info("bot.stopped", cycles=cycle_count)
+
+    # P0-03: Cancel all pending orders before shutdown to prevent orphaned positions
+    try:
+        logger.info("shutdown.cancelling_pending_orders")
+        broker.cancel_all_orders()
+        logger.info("shutdown.orders_cancelled")
+    except Exception as e:
+        logger.error("shutdown.cancel_orders_failed", error=str(e))
+
     runtime_manager.shutdown()
     if _scheduler:
-        _scheduler.shutdown(wait=False)
+        _scheduler.shutdown(wait=True)  # Wait for in-flight jobs to complete
     if enable_streaming:
         try:
             broker.stop_market_data_streams()

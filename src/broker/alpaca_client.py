@@ -320,9 +320,14 @@ class AlpacaBroker:
     def market_order(self, symbol: str, qty: float, side: str, time_in_force: str = "day",
                      client_order_id: str = None) -> dict:
         """Place a market order."""
+        import uuid
         try:
             order_side = OrderSide.BUY if side.lower() == "buy" else OrderSide.SELL
             tif = self._parse_time_in_force(time_in_force)
+
+            # Generate idempotency key if not provided
+            if client_order_id is None:
+                client_order_id = f"suez-{uuid.uuid4().hex[:16]}"
 
             request = MarketOrderRequest(
                 symbol=symbol,
@@ -332,7 +337,8 @@ class AlpacaBroker:
                 client_order_id=client_order_id,
             )
             order = self._call(self.trading_client.submit_order, request)
-            logger.info("order.submitted", symbol=symbol, side=side, qty=qty, type="market", order_id=str(order.id))
+            logger.info("order.submitted", symbol=symbol, side=side, qty=qty, type="market",
+                       order_id=str(order.id), client_order_id=client_order_id)
             return self._order_to_dict(order)
         except Exception as exc:
             logger.error("order.market_failed", symbol=symbol, error=str(exc))

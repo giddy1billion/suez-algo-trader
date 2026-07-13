@@ -710,8 +710,16 @@ class ExecutionEngine:
         try:
             account = self.broker.get_account()
             cash = account.get('cash', 0.0)
-        except Exception:
-            cash = portfolio_value * 0.5
+        except Exception as e:
+            logger.error("engine.account_cash_unavailable", error=str(e), symbol=signal.symbol)
+            self._publish(SignalRejected(
+                signal_id=signal.signal_id,
+                symbol=signal.symbol,
+                reason="Cannot determine account cash — halting trade for safety",
+                stage="account_query",
+                source="engine",
+            ))
+            return None
 
         # Build market_data context for risk engine
         risk_market_data = {}
@@ -859,6 +867,32 @@ class ExecutionEngine:
             confidence=f"{effective_confidence:.3f}",
             contract_id=decision_contract.contract_id if decision_contract else "",
         )
+
+        # P0-04: Write intent record BEFORE broker submission to prevent data loss
+        # on crash between broker confirmation and DB write.
+        import uuid as _uuid
+        _intent_id = f"intent-{_uuid.uuid4().hex[:12]}"
+        try:
+            self.db.record_trade({
+                "symbol": signal.symbol,
+                "side": side,
+                "qty": final_qty,
+                "price": observed_price,
+                "order_type": order_type,
+                "status": "pending_submission",
+                "order_id": _intent_id,
+                "strategy": signal.strategy_id,
+                "signal_id": signal.signal_id,
+                "signal_strength": signal.signal_strength,
+                "stop_loss": final_stop_loss,
+                "take_profit": final_take_profit,
+                "contract_id": decision_contract.contract_id if decision_contract else None,
+                "contract_confidence": decision_contract.final_confidence if decision_contract else None,
+                "contract_decision": decision_contract.decision.value if decision_contract else None,
+            })
+        except Exception as e:
+            logger.error("engine.intent_record_failed", error=str(e), symbol=signal.symbol)
+
         try:
             if final_stop_loss and final_take_profit:
                 order = self.broker.bracket_order(
@@ -968,26 +1002,30 @@ class ExecutionEngine:
                     trade_lifecycle.metadata['expected_qty'] = final_qty
                 logger.info("engine.pending_fill", order_id=order.get("id", ""), qty=final_qty)
 
-            # Record trade to database (full audit trail)
-            self.db.record_trade({
-                "symbol": signal.symbol,
-                "side": side,
-                "qty": final_qty,
-                "price": observed_price,
-                "order_type": "bracket" if final_stop_loss else "market",
-                "status": order.get("status", "submitted"),
-                "order_id": order.get("id"),
-                "strategy": signal.strategy_id,
-                "signal_id": signal.signal_id,
-                "signal_strength": signal.signal_strength,
-                "stop_loss": final_stop_loss,
-                "take_profit": final_take_profit,
-                "sim_slippage_bps": sim_result.get("slippage_bps") if sim_result else None,
-                "sim_fees": fill_fees if sim_result else None,
-                "contract_id": decision_contract.contract_id if decision_contract else None,
-                "contract_confidence": decision_contract.final_confidence if decision_contract else None,
-                "contract_decision": decision_contract.decision.value if decision_contract else None,
-            })
+            # Update the intent record with actual broker response
+            try:
+                self.db.record_trade({
+                    "symbol": signal.symbol,
+                    "side": side,
+                    "qty": final_qty,
+                    "price": observed_price,
+                    "order_type": "bracket" if final_stop_loss else "market",
+                    "status": order.get("status", "submitted"),
+                    "order_id": order.get("id"),
+                    "strategy": signal.strategy_id,
+                    "signal_id": signal.signal_id,
+                    "signal_strength": signal.signal_strength,
+                    "stop_loss": final_stop_loss,
+                    "take_profit": final_take_profit,
+                    "sim_slippage_bps": sim_result.get("slippage_bps") if sim_result else None,
+                    "sim_fees": fill_fees if sim_result else None,
+                    "contract_id": decision_contract.contract_id if decision_contract else None,
+                    "contract_confidence": decision_contract.final_confidence if decision_contract else None,
+                    "contract_decision": decision_contract.decision.value if decision_contract else None,
+                    "intent_id": _intent_id,
+                })
+            except Exception as e:
+                logger.error("engine.trade_record_update_failed", error=str(e), symbol=signal.symbol)
 
             # Journal trade entry for analysis
             journal = _get_journal(self.db)
