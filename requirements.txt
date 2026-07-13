@@ -17,7 +17,7 @@ scikit-learn==1.9.0
 xgboost==2.1.4
 joblib==1.5.3
 imbalanced-learn==0.14.2
-optuna>=4.0.0
+optuna>=4.0.0,<5.0.0
 
 # ─── Reinforcement Learning (optional — heavy, install separately if needed) ─
 # pip install finrl stable-baselines3 gymnasium
@@ -77,7 +77,7 @@ dill==0.4.1
 # liualgotrader>=0.0.87
 
 # ─── Redis ────────────────────────────────────────────────────────────────────
-redis>=5.0.0
+redis>=5.0.0,<6.0.0
 
 # ─── Azure Storage ────────────────────────────────────────────────────────────
 azure-storage-blob==12.30.0
