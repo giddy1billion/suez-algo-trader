@@ -513,10 +513,21 @@ async def cmd_buy(message: Message):
         return
 
     symbol = parts[1].upper()
+    # Validate symbol format
+    if not symbol or len(symbol) > 10 or not all(c.isalnum() or c == '/' for c in symbol):
+        await message.answer("❌ Invalid symbol format. Use 1-10 alphanumeric chars (e.g. AAPL, BTC/USD).")
+        return
+
     try:
         qty = float(parts[2])
     except ValueError:
         await message.answer("Invalid quantity.")
+        return
+
+    # Validate quantity
+    import math
+    if math.isnan(qty) or math.isinf(qty) or qty <= 0:
+        await message.answer("❌ Quantity must be a positive number.")
         return
 
     # Confirmation keyboard
@@ -546,10 +557,21 @@ async def cmd_sell(message: Message):
         return
 
     symbol = parts[1].upper()
+    # Validate symbol format
+    if not symbol or len(symbol) > 10 or not all(c.isalnum() or c == '/' for c in symbol):
+        await message.answer("❌ Invalid symbol format. Use 1-10 alphanumeric chars (e.g. AAPL, BTC/USD).")
+        return
+
     try:
         qty = float(parts[2])
     except ValueError:
         await message.answer("Invalid quantity.")
+        return
+
+    # Validate quantity
+    import math
+    if math.isnan(qty) or math.isinf(qty) or qty <= 0:
+        await message.answer("❌ Quantity must be a positive number.")
         return
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -3090,11 +3112,16 @@ async def callback_confirm_buy(callback: CallbackQuery):
     try:
         with _broker_lock:
             order = _broker.market_order(symbol, qty, "buy")
-        await callback.message.edit_text(
-            f"BUY order placed: {symbol} x {qty}\nOrder ID: {order['id'][:8]}..."
-        )
+        if not order or order.get("error"):
+            error_msg = order.get("message", "Unknown error") if order else "No response"
+            await callback.message.edit_text(f"❌ BUY order failed: {error_msg}")
+        else:
+            order_id = order.get('id', 'unknown')
+            await callback.message.edit_text(
+                f"✅ BUY order placed: {symbol} x {qty}\nOrder ID: {order_id[:8]}..."
+            )
     except Exception as e:
-        await callback.message.edit_text(f"Order failed: {e}")
+        await callback.message.edit_text(f"❌ Order failed: {e}")
     await callback.answer()
 
 
@@ -3117,11 +3144,16 @@ async def callback_confirm_sell(callback: CallbackQuery):
     try:
         with _broker_lock:
             order = _broker.market_order(symbol, qty, "sell")
-        await callback.message.edit_text(
-            f"SELL order placed: {symbol} x {qty}\nOrder ID: {order['id'][:8]}..."
-        )
+        if not order or order.get("error"):
+            error_msg = order.get("message", "Unknown error") if order else "No response"
+            await callback.message.edit_text(f"❌ SELL order failed: {error_msg}")
+        else:
+            order_id = order.get('id', 'unknown')
+            await callback.message.edit_text(
+                f"✅ SELL order placed: {symbol} x {qty}\nOrder ID: {order_id[:8]}..."
+            )
     except Exception as e:
-        await callback.message.edit_text(f"Order failed: {e}")
+        await callback.message.edit_text(f"❌ Order failed: {e}")
     await callback.answer()
 
 

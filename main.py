@@ -1520,12 +1520,14 @@ def cmd_run(
                 crypto_strategy = create_strategy(strategy_name, crypto_only, settings.crypto_timeframe, lookback) if crypto_only else None
 
             if changes.get("trigger_train") and strategy_name == "ml":
-                logger.info("runtime.ml_retrain_triggered")
-                try:
-                    _train_ml_model(broker, symbols, timeframe)
-                    strategy = create_strategy("ml", symbols, timeframe, lookback)
-                except Exception as e:
-                    logger.error("runtime.train_error", error=str(e))
+                if not runtime_manager.is_training():
+                    logger.info("runtime.ml_retrain_triggered")
+                    try:
+                        runtime_manager.train_model(trigger="telegram")
+                    except Exception as e:
+                        logger.error("runtime.train_error", error=str(e))
+                else:
+                    logger.info("runtime.ml_retrain_skipped_already_running")
 
         # Process runtime changes from scheduler (auto_train signals reload)
         with _runtime_lock:
@@ -1544,15 +1546,18 @@ def cmd_run(
             logger.info("runtime.broker_synced", paper=broker.paper)
 
         # Auto-retrain ML model if needed (check every 10 cycles)
+        # Guarded by is_training() to prevent duplicate concurrent training
         if strategy_name == "ml" and cycle_count % 10 == 0:
             if hasattr(strategy, 'needs_retraining') and strategy.needs_retraining():
-                logger.info("ml.auto_retrain_start")
-                try:
-                    _train_ml_model(broker, symbols, timeframe)
-                    strategy = create_strategy("ml", symbols, timeframe, lookback)
-                    logger.info("ml.auto_retrain_complete")
-                except Exception as e:
-                    logger.error("ml.auto_retrain_error", error=str(e))
+                if not runtime_manager.is_training():
+                    logger.info("ml.auto_retrain_start")
+                    try:
+                        runtime_manager.train_model(trigger="performance_decay")
+                        logger.info("ml.auto_retrain_launched")
+                    except Exception as e:
+                        logger.error("ml.auto_retrain_error", error=str(e))
+                else:
+                    logger.debug("ml.auto_retrain_skipped_already_running")
 
         try:
             # Check risk halt and notify
