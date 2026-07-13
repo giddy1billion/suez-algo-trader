@@ -177,7 +177,7 @@ class TestRedisCacheMocked:
 
     def test_set_with_ttl(self, mock_redis):
         mock_redis.set("key", "val", ttl=60)
-        mock_redis._redis.setex.assert_called_with("suez:key", 60, "val")
+        mock_redis._redis.set.assert_called_with("suez:key", "val", ex=60)
 
     def test_set_without_ttl(self, mock_redis):
         mock_redis.set("key", "val")
