@@ -71,7 +71,12 @@ class PaperBroker:
     # --- Account ---
 
     def get_account(self) -> dict:
-        """Get account info including unrealized P&L."""
+        """Get account info including unrealized P&L.
+
+        Returns the same field set as AlpacaBroker.get_account() so that
+        downstream consumers (e.g. /status command) work identically in
+        paper mode.
+        """
         with self._lock:
             unrealized_pl = self._calc_unrealized_pl()
             equity = self._cash + self._position_market_value()
@@ -79,12 +84,20 @@ class PaperBroker:
                 "equity": equity,
                 "buying_power": self._cash,
                 "cash": self._cash,
+                "portfolio_value": equity,
                 "unrealized_pl": unrealized_pl,
                 "starting_equity": self._starting_equity,
+                "last_equity": self._starting_equity,
+                "day_trade_count": 0,
+                "pattern_day_trader": False,
             }
 
     def get_positions(self) -> list[dict]:
-        """Get all open positions."""
+        """Get all open positions.
+
+        Returns the same field set as AlpacaBroker.get_positions() so that
+        downstream consumers (e.g. /positions command) work identically.
+        """
         with self._lock:
             result = []
             for symbol, pos in self._positions.items():
@@ -93,13 +106,18 @@ class PaperBroker:
                     unrealized_pl = (current_price - pos["avg_entry_price"]) * pos["qty"]
                 else:
                     unrealized_pl = (pos["avg_entry_price"] - current_price) * pos["qty"]
+                cost_basis = pos["avg_entry_price"] * pos["qty"]
+                unrealized_plpc = (unrealized_pl / cost_basis) if cost_basis != 0 else 0.0
+                market_value = current_price * pos["qty"]
                 result.append({
                     "symbol": symbol,
                     "qty": pos["qty"],
                     "side": pos["side"],
                     "avg_entry_price": pos["avg_entry_price"],
                     "current_price": current_price,
+                    "market_value": market_value,
                     "unrealized_pl": unrealized_pl,
+                    "unrealized_plpc": unrealized_plpc,
                 })
             return result
 

@@ -1808,6 +1808,15 @@ Examples:
     else:
         mode = TradingMode.PAPER
 
+    # Log active profile and model path at startup
+    logger.info(
+        "main.startup_profile",
+        trading_mode=mode.value,
+        active_strategy=args.strategy,
+        ml_model_path=os.path.abspath(settings.ml_model_path),
+        ml_model_exists=os.path.exists(settings.ml_model_path),
+    )
+
     # Initialize broker
     api_key = settings.alpaca_live_api_key if mode == TradingMode.LIVE else settings.alpaca_paper_api_key
     secret = settings.alpaca_live_secret_key if mode == TradingMode.LIVE else settings.alpaca_paper_secret_key
