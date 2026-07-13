@@ -255,10 +255,10 @@ class Settings(BaseSettings):
     model_max_drawdown_pct: float = 0.20
     model_min_expectancy: float = 0.0           # Positive expectancy required
     model_min_precision: float = 0.50
-    model_min_cv_accuracy: float = 0.52
-    model_min_walk_forward_sharpe: float = 0.0
-    model_min_monte_carlo_prob_profit: float = 0.50
-    model_min_backtest_trades: int = 30
+    model_min_cv_accuracy: float = 0.62
+    model_min_walk_forward_sharpe: float = 0.3
+    model_min_monte_carlo_prob_profit: float = 0.65
+    model_min_backtest_trades: int = 50
 
     # --- Self-Healing ---
     model_max_retries: int = 3                  # Max training retries on failure
