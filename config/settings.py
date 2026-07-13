@@ -260,6 +260,18 @@ class Settings(BaseSettings):
     model_min_monte_carlo_prob_profit: float = 0.65
     model_min_backtest_trades: int = 50
 
+    # --- Live Model Monitoring & Rollback ---
+    live_monitor_sharpe_window: int = 50         # Rolling window for live Sharpe calculation
+    live_monitor_accuracy_window: int = 100      # Rolling window for accuracy tracking
+    live_monitor_min_observations: int = 30      # Min observations before rollback active
+    live_monitor_sharpe_threshold: float = -0.5  # Sustained Sharpe below this triggers rollback
+    live_monitor_sharpe_sustained_periods: int = 3  # Consecutive evaluation periods below threshold
+    live_monitor_accuracy_degradation_pvalue: float = 0.05  # p-value for accuracy degradation test
+    live_monitor_accuracy_baseline: float = 0.52  # Expected minimum accuracy
+    live_monitor_drift_psi_threshold: float = 0.25  # PSI threshold for significant drift
+    live_monitor_evaluation_interval_seconds: float = 300.0  # Evaluate every 5 min
+    live_monitor_max_rollbacks_per_day: int = 3  # Circuit-breaker: max rollbacks/day
+
     # --- Self-Healing ---
     model_max_retries: int = 3                  # Max training retries on failure
     model_retry_backoff_seconds: float = 60.0   # Base backoff between retries
