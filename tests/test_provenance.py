@@ -1,15 +1,17 @@
 """
 Comprehensive tests for model-provenance commit-resolution path.
 
-Covers ALL supported provenance sources and their precedence:
-  1. build_info.py (build-time injected)
-  2. GIT_COMMIT environment variable
-  3. SOURCE_VERSION environment variable
-  4. GITHUB_SHA environment variable
-  5. git rev-parse HEAD (CLI)
-  6. .git_commit file fallback
+After the provenance audit, ALL runtime commit resolution flows through
+the centralized ``src/ml/provenance`` module which reads exclusively from
+``src/ml/build_info.py``.  Legacy fallbacks (env vars, git CLI,
+.git_commit file) have been removed from runtime code — they remain only
+in the build-time injection script (scripts/inject_build_info.py).
 
-Also tests failure modes and the inject_build_info.py script.
+Tests cover:
+  1. build_info.py as the single source of truth
+  2. Strict mode raising when not stamped
+  3. inject_build_info.py script stamping at build time
+  4. Integration with governance and predictor
 """
 
 import os
@@ -52,99 +54,38 @@ def clean_env():
 
 
 class TestProvenancePrecedence:
-    """Verify the strict precedence order of provenance sources."""
+    """Verify that build_info.GIT_COMMIT is the sole runtime source."""
 
-    def test_build_info_takes_highest_priority(self, governance):
-        """build_info.GIT_COMMIT overrides all other sources."""
-        with patch.dict(os.environ, {"GIT_COMMIT": "env_commit_abc"}):
-            with patch("src.ml.build_info.GIT_COMMIT", "build_injected_sha256"):
-                commit = governance._get_git_commit()
+    def test_build_info_is_sole_source(self, governance):
+        """build_info.GIT_COMMIT is returned by _get_git_commit."""
+        with patch("src.ml.build_info.GIT_COMMIT", "build_injected_sha256"):
+            commit = governance._get_git_commit()
         assert commit == "build_injected_sha256"
 
-    def test_env_git_commit_second_priority(self, governance):
-        """GIT_COMMIT env var is used when build_info is empty."""
+    def test_env_vars_are_not_used_at_runtime(self, governance):
+        """Environment variables are ignored — only build_info matters."""
         with patch("src.ml.build_info.GIT_COMMIT", ""):
             with patch.dict(os.environ, {"GIT_COMMIT": "ci_commit_hash"}):
                 commit = governance._get_git_commit()
-        assert commit == "ci_commit_hash"
+        # Env var is NOT used — returns empty when build_info is empty
+        assert commit == ""
 
-    def test_env_source_version_third_priority(self, governance):
-        """SOURCE_VERSION is used when GIT_COMMIT is absent."""
+    def test_empty_build_info_returns_empty(self, governance):
+        """When build_info not stamped, returns empty (no legacy fallback)."""
         with patch("src.ml.build_info.GIT_COMMIT", ""):
-            env = {k: v for k, v in os.environ.items()
-                   if k not in ("GIT_COMMIT",)}
-            env["SOURCE_VERSION"] = "heroku_sha_xyz"
-            with patch.dict(os.environ, env, clear=True):
+            with patch.dict(os.environ, {
+                "GIT_COMMIT": "should_not_use",
+                "SOURCE_VERSION": "should_not_use",
+                "GITHUB_SHA": "should_not_use",
+            }):
                 commit = governance._get_git_commit()
-        assert commit == "heroku_sha_xyz"
-
-    def test_env_github_sha_fourth_priority(self, governance):
-        """GITHUB_SHA is used when higher-priority sources absent."""
-        with patch("src.ml.build_info.GIT_COMMIT", ""):
-            env = {"GITHUB_SHA": "actions_sha_123", "PATH": os.environ.get("PATH", "")}
-            with patch.dict(os.environ, env, clear=True):
-                commit = governance._get_git_commit()
-        assert commit == "actions_sha_123"
-
-    def test_git_cli_fifth_priority(self, governance):
-        """git rev-parse HEAD is used when no env vars available."""
-        with patch("src.ml.build_info.GIT_COMMIT", ""):
-            env = {k: v for k, v in os.environ.items()
-                   if k not in ("GIT_COMMIT", "SOURCE_VERSION", "GITHUB_SHA")}
-            with patch.dict(os.environ, env, clear=True):
-                commit = governance._get_git_commit()
-        # In test env, git should be available
-        if commit:
-            assert len(commit) == 40
-            assert all(c in "0123456789abcdef" for c in commit)
-
-    def test_git_commit_file_last_resort(self, governance, tmp_path):
-        """Falls back to .git_commit file when all else fails."""
-        commit_file = tmp_path / ".git_commit"
-        commit_file.write_text("docker_build_commit_abc123\n")
-
-        with patch("src.ml.build_info.GIT_COMMIT", ""):
-            with patch.dict(os.environ, {"PATH": ""}, clear=True):
-                with patch("subprocess.run", side_effect=FileNotFoundError("git")):
-                    # Patch the search dirs to include our tmp_path
-                    original = governance._get_git_commit
-
-                    def _patched():
-                        """Override search dirs to use tmp_path."""
-                        # Priority 0: build_info
-                        try:
-                            from src.ml.build_info import GIT_COMMIT as _bc
-                            if _bc:
-                                return _bc
-                        except (ImportError, AttributeError):
-                            pass
-                        # Priority 1: env vars
-                        for env_var in ("GIT_COMMIT", "SOURCE_VERSION", "GITHUB_SHA"):
-                            c = os.environ.get(env_var, "").strip()
-                            if c:
-                                return c
-                        # Priority 3: .git_commit file in tmp_path
-                        cf = os.path.join(str(tmp_path), ".git_commit")
-                        if os.path.exists(cf):
-                            with open(cf, "r") as f:
-                                c = f.read().strip()
-                            if c:
-                                return c
-                        return ""
-
-                    with patch.object(governance, "_get_git_commit", side_effect=_patched):
-                        commit = governance._get_git_commit()
-        assert commit == "docker_build_commit_abc123"
+        assert commit == ""
 
     def test_all_sources_fail_returns_empty(self, governance):
-        """Returns empty string when all provenance sources fail."""
+        """Returns empty string when build_info is not stamped."""
         with patch("src.ml.build_info.GIT_COMMIT", ""):
-            with patch.dict(os.environ, {"PATH": ""}, clear=True):
-                with patch("subprocess.run", side_effect=FileNotFoundError("git")):
-                    # No .git_commit file exists in the search paths
-                    commit = governance._get_git_commit()
-        # May still resolve via search paths hitting the actual git repo
-        # but the key assertion is it doesn't crash
+            commit = governance._get_git_commit()
+        assert commit == ""
         assert isinstance(commit, str)
 
 
@@ -153,41 +94,46 @@ class TestProvenancePrecedence:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-class TestEnvironmentVariableHandling:
-    """Test edge cases in environment variable reading."""
+class TestProvenanceModule:
+    """Test the centralized provenance module directly."""
 
-    def test_whitespace_only_env_var_ignored(self, governance):
-        """Env vars that are whitespace-only are treated as absent."""
-        with patch("src.ml.build_info.GIT_COMMIT", ""):
-            with patch.dict(os.environ, {"GIT_COMMIT": "   ", "SOURCE_VERSION": "\t\n"}):
-                # Should fall through to git CLI
-                commit = governance._get_git_commit()
-                # Won't be whitespace
-                assert commit.strip() == commit
+    def test_get_commit_hash_returns_build_info(self):
+        """get_commit_hash reads from build_info module attribute."""
+        from src.ml.provenance import get_commit_hash
+        with patch("src.ml.build_info.GIT_COMMIT", "abc123full"):
+            assert get_commit_hash() == "abc123full"
 
-    def test_env_var_stripped(self, governance):
-        """Env vars with leading/trailing whitespace are stripped."""
+    def test_get_commit_hash_strict_raises(self):
+        """Strict mode raises ProvenanceError when not stamped."""
+        from src.ml.provenance import ProvenanceError, get_commit_hash
         with patch("src.ml.build_info.GIT_COMMIT", ""):
-            with patch.dict(os.environ, {"GIT_COMMIT": "  abc123  "}):
-                commit = governance._get_git_commit()
-        assert commit == "abc123"
+            with pytest.raises(ProvenanceError):
+                get_commit_hash(strict=True)
 
-    def test_env_var_precedence_order(self, governance):
-        """GIT_COMMIT wins over SOURCE_VERSION which wins over GITHUB_SHA."""
+    def test_get_commit_hash_non_strict_returns_empty(self):
+        """Non-strict returns empty when not stamped."""
+        from src.ml.provenance import get_commit_hash
         with patch("src.ml.build_info.GIT_COMMIT", ""):
-            with patch.dict(os.environ, {
-                "GIT_COMMIT": "first",
-                "SOURCE_VERSION": "second",
-                "GITHUB_SHA": "third",
-            }):
-                assert governance._get_git_commit() == "first"
+            assert get_commit_hash() == ""
 
-        with patch("src.ml.build_info.GIT_COMMIT", ""):
-            env = {k: v for k, v in os.environ.items() if k != "GIT_COMMIT"}
-            env["SOURCE_VERSION"] = "second"
-            env["GITHUB_SHA"] = "third"
-            with patch.dict(os.environ, env, clear=True):
-                assert governance._get_git_commit() == "second"
+    def test_get_short_commit(self):
+        """get_short_commit truncates to requested length."""
+        from src.ml.provenance import get_short_commit
+        with patch("src.ml.build_info.GIT_COMMIT", "abcdef1234567890abcdef"):
+            assert get_short_commit() == "abcdef1"
+            assert get_short_commit(length=10) == "abcdef1234"
+
+    def test_get_branch(self):
+        """get_branch reads from build_info."""
+        from src.ml.provenance import get_branch
+        with patch("src.ml.build_info.GIT_BRANCH", "main"):
+            assert get_branch() == "main"
+
+    def test_get_build_timestamp(self):
+        """get_build_timestamp reads from build_info."""
+        from src.ml.provenance import get_build_timestamp
+        with patch("src.ml.build_info.BUILD_TIMESTAMP", "2026-07-13T12:00:00Z"):
+            assert get_build_timestamp() == "2026-07-13T12:00:00Z"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -195,92 +141,39 @@ class TestEnvironmentVariableHandling:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-class TestGitCliFallback:
-    """Test git CLI invocation as a commit source."""
+class TestNoLegacyFallbacks:
+    """Verify that legacy resolution paths (git CLI, env vars, .git_commit) are removed."""
 
-    def test_git_cli_returns_40_char_sha(self, governance):
-        """git rev-parse HEAD returns full 40-char SHA."""
-        with patch("src.ml.build_info.GIT_COMMIT", ""):
-            env = {k: v for k, v in os.environ.items()
-                   if k not in ("GIT_COMMIT", "SOURCE_VERSION", "GITHUB_SHA")}
-            with patch.dict(os.environ, env, clear=True):
+    def test_no_subprocess_calls_in_commit_resolution(self, governance):
+        """_get_git_commit never invokes subprocess."""
+        with patch("src.ml.build_info.GIT_COMMIT", "stamped_hash"):
+            with patch("subprocess.run") as mock_run:
                 commit = governance._get_git_commit()
-        if commit:  # Git may not be available in some CI
-            assert len(commit) == 40
+        mock_run.assert_not_called()
+        assert commit == "stamped_hash"
 
-    def test_git_cli_timeout_handled(self, governance):
-        """subprocess timeout doesn't crash — falls through gracefully."""
+    def test_no_subprocess_when_empty(self, governance):
+        """Even when build_info is empty, no subprocess call is made."""
         with patch("src.ml.build_info.GIT_COMMIT", ""):
-            with patch.dict(os.environ, {}, clear=True):
-                with patch("subprocess.run", side_effect=subprocess.TimeoutExpired("git", 5)):
-                    commit = governance._get_git_commit()
-        assert isinstance(commit, str)
+            with patch("subprocess.run") as mock_run:
+                commit = governance._get_git_commit()
+        mock_run.assert_not_called()
+        assert commit == ""
 
-    def test_git_cli_not_found_handled(self, governance):
-        """Missing git binary doesn't crash."""
-        with patch("src.ml.build_info.GIT_COMMIT", ""):
-            with patch.dict(os.environ, {"PATH": ""}, clear=True):
-                with patch("subprocess.run", side_effect=FileNotFoundError("git")):
-                    commit = governance._get_git_commit()
-        assert isinstance(commit, str)
-
-    def test_git_cli_searches_multiple_dirs(self, governance):
-        """git rev-parse is attempted from src/ml/, cwd, and project root."""
-        calls = []
-        original_run = subprocess.run
-
-        def capture_run(*args, **kwargs):
-            calls.append(kwargs.get("cwd", ""))
-            raise FileNotFoundError("git not found")
+    def test_no_git_commit_file_access(self, governance, tmp_path):
+        """No .git_commit file is accessed at runtime."""
+        commit_file = tmp_path / ".git_commit"
+        commit_file.write_text("should_not_be_read\n")
 
         with patch("src.ml.build_info.GIT_COMMIT", ""):
-            with patch.dict(os.environ, {"PATH": ""}, clear=True):
-                with patch("subprocess.run", side_effect=capture_run):
-                    governance._get_git_commit()
-
-        # Should have tried at least 3 directories
-        assert len(calls) >= 3
+            commit = governance._get_git_commit()
+        # The .git_commit file content is never returned
+        assert commit != "should_not_be_read"
+        assert commit == ""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Test Suite: .git_commit File Fallback
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-class TestGitCommitFileFallback:
-    """Test .git_commit file as last-resort provenance source."""
-
-    def test_empty_file_ignored(self, governance, tmp_path):
-        """Empty .git_commit file is treated as absent."""
-        commit_file = tmp_path / ".git_commit"
-        commit_file.write_text("")
-
-        # Direct file-reading logic test
-        with open(str(commit_file), "r") as f:
-            content = f.read().strip()
-        assert not content  # Empty string is falsy
-
-    def test_whitespace_file_ignored(self, governance, tmp_path):
-        """Whitespace-only .git_commit file is treated as absent."""
-        commit_file = tmp_path / ".git_commit"
-        commit_file.write_text("  \n\t  \n")
-
-        with open(str(commit_file), "r") as f:
-            content = f.read().strip()
-        assert not content
-
-    def test_valid_file_read(self, governance, tmp_path):
-        """Valid .git_commit file content is returned."""
-        commit_file = tmp_path / ".git_commit"
-        commit_file.write_text("abc123def456789\n")
-
-        with open(str(commit_file), "r") as f:
-            content = f.read().strip()
-        assert content == "abc123def456789"
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Test Suite: build_info.py Module
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -289,19 +182,16 @@ class TestBuildInfoModule:
 
     def test_default_build_info_is_empty(self):
         """Unstamped build_info has empty sentinel values."""
-        # Import the actual module (not mocked)
         from src.ml import build_info
-        # In test environment, it should have empty defaults (unless stamped)
         assert isinstance(build_info.GIT_COMMIT, str)
         assert isinstance(build_info.GIT_BRANCH, str)
         assert isinstance(build_info.BUILD_TIMESTAMP, str)
 
-    def test_build_info_import_failure_handled(self, governance):
-        """If build_info.py can't be imported, system falls through gracefully."""
-        with patch.dict(sys.modules, {"src.ml.build_info": None}):
-            with patch.dict(os.environ, {"GIT_COMMIT": "fallback_env"}):
-                commit = governance._get_git_commit()
-        assert commit == "fallback_env"
+    def test_build_info_empty_returns_empty_from_governance(self, governance):
+        """If build_info is empty, governance returns empty (no fallback)."""
+        with patch("src.ml.build_info.GIT_COMMIT", ""):
+            commit = governance._get_git_commit()
+        assert commit == ""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -404,14 +294,14 @@ class TestRecordTrainingProvenance:
     """Test that record_training correctly captures commit hash."""
 
     def test_record_training_populates_git_commit(self, governance):
-        """Training always records a commit hash (at least in dev env)."""
-        lineage = governance.record_training(
-            version="v_test_001",
-            features=["rsi_14", "ema_20"],
-            metrics={"cv_accuracy": 0.6},
-        )
-        # In a git repo, this should always be populated
-        assert lineage.git_commit != ""
+        """Training records commit hash from build_info."""
+        with patch("src.ml.build_info.GIT_COMMIT", "abc123def456"):
+            lineage = governance.record_training(
+                version="v_test_001",
+                features=["rsi_14", "ema_20"],
+                metrics={"cv_accuracy": 0.6},
+            )
+        assert lineage.git_commit == "abc123def456"
 
     def test_record_training_with_build_info(self, governance):
         """Training uses build_info commit when available."""
@@ -453,7 +343,7 @@ class TestRecordTrainingProvenance:
 
 
 class TestPredictorCommitResolution:
-    """Test predictor's commit resolution also checks build_info."""
+    """Test predictor's commit resolution uses provenance module only."""
 
     def test_predictor_uses_build_info(self):
         """Predictor reads build_info for short commit hash."""
@@ -463,8 +353,8 @@ class TestPredictorCommitResolution:
             result = predictor._get_git_commit()
         assert result == "abcdef1"  # First 7 chars
 
-    def test_predictor_falls_back_to_git_cli(self):
-        """Predictor falls back to git CLI when build_info empty."""
+    def test_predictor_returns_empty_without_build_info(self):
+        """Predictor returns empty when build_info is not stamped (no git fallback)."""
         from src.ml.predictor import ModelPredictor
         predictor = ModelPredictor.__new__(ModelPredictor)
         # Clear cached value
@@ -472,6 +362,18 @@ class TestPredictorCommitResolution:
             del predictor._cached_git_commit
         with patch("src.ml.build_info.GIT_COMMIT", ""):
             result = predictor._get_git_commit()
-        # In test env with git available, should get short hash
-        if result:
-            assert len(result) == 7
+        assert result == ""
+
+    def test_predictor_no_subprocess_call(self):
+        """Predictor never calls subprocess for commit resolution."""
+        from src.ml.predictor import ModelPredictor
+        predictor = ModelPredictor.__new__(ModelPredictor)
+        if hasattr(predictor, '_cached_git_commit'):
+            del predictor._cached_git_commit
+        with patch("src.ml.build_info.GIT_COMMIT", "xyz789"):
+            with patch("subprocess.run") as mock_run:
+                with patch("subprocess.check_output") as mock_co:
+                    result = predictor._get_git_commit()
+        mock_run.assert_not_called()
+        mock_co.assert_not_called()
+        assert result == "xyz789"

@@ -3,7 +3,7 @@ Tests for ML governance pipeline: commit metadata, governance metrics computatio
 and paper trading activation safety.
 
 Covers:
-1. Git commit hash is always recorded (env var, git CLI, .git_commit file)
+1. Git commit hash is always recorded via build_info.py (single source of truth)
 2. Governance metrics (CV accuracy, walk-forward Sharpe, Monte Carlo, OOS Sharpe) 
    are computed correctly and validated against thresholds
 3. Approved models activate paper trading; rejected models cannot
@@ -20,6 +20,9 @@ import pytest
 from src.ml.governance import GovernanceViolation, ModelGovernance, ModelLineage, ModelStatus, ValidationResult
 from src.ml.label_encoder import DirectionEncoder
 
+# Stable commit hash for all tests (simulates stamped build)
+_TEST_COMMIT = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
+
 
 class _PicklableModel:
     """Module-level picklable model for registry tests."""
@@ -30,6 +33,14 @@ class _PicklableModel:
 # ─────────────────────────────────────────────────────────────────────────────
 # Fixtures
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.fixture(autouse=True)
+def _stamp_build_info():
+    """Simulate a stamped production build for all tests in this module."""
+    with patch("src.ml.build_info.GIT_COMMIT", _TEST_COMMIT):
+        with patch("src.ml.build_info.GIT_BRANCH", "main"):
+            yield
 
 
 @pytest.fixture
@@ -104,85 +115,35 @@ def failing_model(governance):
 
 
 class TestCommitMetadata:
-    """Verify that git commit hash is always captured via one of the fallback paths."""
+    """Verify that git commit hash is always captured from build_info (single source)."""
 
-    def test_commit_from_env_var_git_commit(self, governance):
-        """GIT_COMMIT env var is used when available (CI environments)."""
-        with patch.dict(os.environ, {"GIT_COMMIT": "abc123def456"}):
-            commit = governance._get_git_commit()
-        assert commit == "abc123def456"
+    def test_commit_from_build_info(self, governance):
+        """build_info.GIT_COMMIT is the sole source of commit hash."""
+        commit = governance._get_git_commit()
+        assert commit == _TEST_COMMIT
 
-    def test_commit_from_env_var_source_version(self, governance):
-        """SOURCE_VERSION env var is used (Heroku/Docker deployments)."""
-        with patch.dict(os.environ, {"SOURCE_VERSION": "deadbeef1234"}, clear=False):
-            # Clear GIT_COMMIT to test fallback order
-            env = {k: v for k, v in os.environ.items() if k != "GIT_COMMIT"}
-            env["SOURCE_VERSION"] = "deadbeef1234"
-            with patch.dict(os.environ, env, clear=True):
+    def test_env_vars_are_not_used(self, governance):
+        """Environment variables are no longer used for runtime commit resolution."""
+        with patch("src.ml.build_info.GIT_COMMIT", ""):
+            with patch.dict(os.environ, {"GIT_COMMIT": "should_not_use"}):
                 commit = governance._get_git_commit()
-        assert commit == "deadbeef1234"
-
-    def test_commit_from_env_var_github_sha(self, governance):
-        """GITHUB_SHA env var is used (GitHub Actions)."""
-        env = {"GITHUB_SHA": "ghsha12345678", "PATH": os.environ.get("PATH", "")}
-        with patch.dict(os.environ, env, clear=True):
-            commit = governance._get_git_commit()
-        assert commit == "ghsha12345678"
-
-    def test_commit_from_git_cli(self, governance):
-        """Falls back to git rev-parse HEAD when env vars not set."""
-        # In the test environment, git should be available
-        env = {k: v for k, v in os.environ.items()
-               if k not in ("GIT_COMMIT", "SOURCE_VERSION", "GITHUB_SHA")}
-        with patch.dict(os.environ, env, clear=True):
-            commit = governance._get_git_commit()
-        # Should be a 40-char hex string if git is available
-        if commit:  # Git may not be available in all CI environments
-            assert len(commit) == 40
-            assert all(c in "0123456789abcdef" for c in commit)
-
-    def test_commit_from_dotfile_fallback(self, governance, tmp_path):
-        """Falls back to .git_commit file when git CLI unavailable."""
-        # Create a .git_commit file in a search directory
-        commit_file = tmp_path / ".git_commit"
-        commit_file.write_text("fallback_commit_hash_from_docker_build")
-
-        # Mock subprocess to fail (simulating no git available)
-        with patch("subprocess.run", side_effect=FileNotFoundError("git not found")):
-            with patch.dict(os.environ, {}, clear=True):
-                # Patch search dirs to include our temp path
-                with patch.object(
-                    governance, "_get_git_commit",
-                    wraps=governance._get_git_commit
-                ):
-                    # Directly test the file-reading logic
-                    search_dirs = [str(tmp_path)]
-                    for cwd in search_dirs:
-                        cf = os.path.join(cwd, ".git_commit")
-                        if os.path.exists(cf):
-                            with open(cf, "r") as f:
-                                result = f.read().strip()
-                            assert result == "fallback_commit_hash_from_docker_build"
-                            break
+        assert commit == ""
 
     def test_record_training_includes_commit(self, governance):
-        """record_training always populates git_commit field."""
+        """record_training always populates git_commit from build_info."""
         lineage = governance.record_training(
             version="v001",
             features=["rsi_14"],
             metrics={"cv_accuracy": 0.6},
         )
-        # In a git repo, commit should be populated
-        # The test runs inside a git repo, so this should always work
-        assert lineage.git_commit != "", (
-            "git_commit must be populated — check that git CLI or env vars are available"
-        )
+        assert lineage.git_commit == _TEST_COMMIT
 
-    def test_env_var_takes_priority_over_git_cli(self, governance):
-        """Env var is used even when git CLI would return a different commit."""
-        with patch.dict(os.environ, {"GIT_COMMIT": "env_override_commit"}):
+    def test_provenance_module_is_single_source(self, governance):
+        """Verify governance delegates to provenance module (no subprocess)."""
+        with patch("subprocess.run") as mock_run:
             commit = governance._get_git_commit()
-        assert commit == "env_override_commit"
+        mock_run.assert_not_called()
+        assert commit == _TEST_COMMIT
 
 
 # ─────────────────────────────────────────────────────────────────────────────
