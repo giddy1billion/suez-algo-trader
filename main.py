@@ -1774,6 +1774,19 @@ Examples:
     setup_logging(settings.log_level, settings.log_file)
     logger = get_logger("main")
 
+    # Log active storage paths for operational visibility
+    logger.info("main.storage_paths", **settings.storage_paths_summary)
+
+    # Safeguard: refuse to run the bot against the test storage profile
+    if settings.is_test_environment:
+        logger.error(
+            "main.startup_blocked",
+            reason="SUEZ_ENV=test detected — refusing to start the live/paper bot against test storage",
+        )
+        print("[!] SUEZ_ENV=test — the bot cannot start against the test storage profile.")
+        print("    Unset SUEZ_ENV or set SUEZ_ENV=production to run the bot.")
+        sys.exit(1)
+
     # Fail fast on missing runtime dependencies or credentials
     _preflight_check(logger)
 

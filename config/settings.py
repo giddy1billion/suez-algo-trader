@@ -3,6 +3,7 @@ Centralized configuration using Pydantic settings.
 Loads from .env file with validation and type coercion.
 """
 
+import os
 from enum import Enum
 from pathlib import Path
 from typing import Optional
@@ -22,8 +23,19 @@ class OperationalMode(str, Enum):
     LIVE = "live"
 
 
+class Environment(str, Enum):
+    """Deployment environment — controls storage isolation."""
+
+    PRODUCTION = "production"
+    TEST = "test"
+
+
 class Settings(BaseSettings):
     """Application configuration -- loaded from .env + environment variables."""
+
+    # --- Environment Profile ---
+    # Set SUEZ_ENV=test to activate isolated test storage paths.
+    suez_env: Environment = Environment.PRODUCTION
 
     # --- Trading Mode ---
     trading_mode: TradingMode = TradingMode.PAPER
@@ -314,6 +326,63 @@ class Settings(BaseSettings):
     @property
     def is_paper(self) -> bool:
         return self.trading_mode == TradingMode.PAPER
+
+    @property
+    def is_test_environment(self) -> bool:
+        """Return True when running in the test environment profile."""
+        return self.suez_env == Environment.TEST
+
+    @property
+    def storage_base_dir(self) -> str:
+        """Root directory for all persistent storage.
+
+        Test profile writes to ``data_cache_test/`` to avoid
+        contaminating production data.
+        """
+        if self.is_test_environment:
+            return "data_cache_test"
+        return "data_cache"
+
+    @property
+    def effective_database_url(self) -> str:
+        """Database URL adjusted for the active environment profile."""
+        if self.is_test_environment:
+            # Rewrite default SQLite path to test directory
+            default_prod = "sqlite:///data_cache/trading.db"
+            if self.database_url == default_prod:
+                return f"sqlite:///{self.storage_base_dir}/trading.db"
+        return self.database_url
+
+    @property
+    def effective_correlation_store_db_path(self) -> str:
+        """Correlation store path adjusted for active environment."""
+        if self.is_test_environment:
+            default_prod = "data_cache/correlation_store.db"
+            if self.correlation_store_db_path == default_prod:
+                return f"{self.storage_base_dir}/correlation_store.db"
+        return self.correlation_store_db_path
+
+    @property
+    def effective_prediction_registry_storage_path(self) -> str:
+        """Prediction registry path adjusted for active environment."""
+        if self.is_test_environment:
+            default_prod = "data_cache/predictions"
+            if self.prediction_registry_storage_path == default_prod:
+                return f"{self.storage_base_dir}/predictions"
+        return self.prediction_registry_storage_path
+
+    @property
+    def storage_paths_summary(self) -> dict[str, str]:
+        """Return a mapping of all active storage paths for operational logging."""
+        return {
+            "suez_env": self.suez_env.value,
+            "storage_base_dir": self.storage_base_dir,
+            "database_url": self.effective_database_url,
+            "correlation_store_db_path": self.effective_correlation_store_db_path,
+            "prediction_registry_storage_path": self.effective_prediction_registry_storage_path,
+            "ml_model_path": self.ml_model_path,
+            "log_file": self.log_file,
+        }
 
     @field_validator("trading_mode", mode="before")
     @classmethod
