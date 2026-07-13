@@ -600,10 +600,15 @@ class ExecutionEngine:
                 source="decision_orchestrator",
             ))
 
-            # If contract says REJECT or is vetoed, stop immediately
-            if not decision_contract.is_executable and decision_contract.decision == Decision.REJECT:
+            # If contract is not executable (REJECT, DEFER, vetoed, or expired), stop immediately
+            if not decision_contract.is_executable:
+                rejection_reason = (
+                    f"contract_{decision_contract.decision.value}"
+                    f"{' (vetoed)' if decision_contract.vetoed else ''}"
+                    f": {decision_contract.recommendation}"
+                )
                 logger.info(
-                    "engine.contract_rejected",
+                    "engine.contract_not_executable",
                     contract_id=decision_contract.contract_id,
                     symbol=signal.symbol,
                     decision=decision_contract.decision.value,
@@ -616,11 +621,11 @@ class ExecutionEngine:
                     symbol=signal.symbol,
                     signal_id=signal.signal_id,
                     approved=False,
-                    reasons=[f"contract_rejected: {decision_contract.recommendation}"],
+                    reasons=[rejection_reason],
                     contract_id=decision_contract.contract_id,
                     source="decision_orchestrator",
                 ))
-                self._record_contract_rejection(decision_contract, signal.symbol, "contract_rejected")
+                self._record_contract_rejection(decision_contract, signal.symbol, decision_contract.decision.value)
                 self._log_signal_v2(signal, executed=False)
                 return None
 

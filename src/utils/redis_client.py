@@ -239,7 +239,7 @@ class RedisCache(CacheBackend):
         try:
             fk = self._full_key(key)
             if ttl:
-                self._redis.setex(fk, ttl, value)
+                self._redis.set(fk, value, ex=ttl)
             else:
                 self._redis.set(fk, value)
         except Exception as e:
