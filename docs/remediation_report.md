@@ -173,14 +173,16 @@ The audit flagged initialization leakage in adaptive labeling.
 
 ## Residual Risks
 
-| Risk | Severity | Mitigation |
-|---|---|---|
-| Survivorship bias in training data | Medium | Lineage tracks symbols; manual review needed to ensure delisted assets are included |
-| Walk-forward Sharpe threshold = 0.0 | Low | Very permissive; consider raising to 0.3+ |
-| Monte Carlo prob_profit threshold = 0.50 | Low | Barely above random; consider 0.55+ |
-| VaR ignores cross-asset correlations | Medium | Parametric estimate uses sum of absolute VaR; consider covariance-matrix approach |
-| No automated live-capital kill switch | Medium | Circuit breaker exists but requires manual reset; consider auto-halt on extreme drawdown |
-| Single-instance SQLite store | Low | Durable but not HA; consider PostgreSQL for multi-instance |
+| Risk | Severity | Mitigation | Status |
+|---|---|---|---|
+| Survivorship bias in training data | Medium | Lineage tracks symbols; manual review needed to ensure delisted assets are included | Open — requires manual data review |
+| Walk-forward Sharpe threshold = 0.0 | Low | ~~Very permissive~~ → Raised to 0.3 in config/settings.py | ✅ Resolved (already in settings) |
+| Monte Carlo prob_profit threshold = 0.50 | Low | ~~Barely above random~~ → Raised to 0.65 in config/settings.py | ✅ Resolved (already in settings) |
+| VaR ignores cross-asset correlations | Medium | ~~Parametric sum of absolute VaR~~ → Covariance-matrix VaR when correlation_matrix provided | ✅ Resolved |
+| No automated live-capital kill switch | Medium | ~~Requires manual reset~~ → Kill switch at 25% DD, cannot be cleared by daily reset | ✅ Resolved |
+| Silent journal failures | Medium | ~~debug level logging~~ → warning level with symbol context | ✅ Resolved |
+| Heuristic exit matching | Medium | ~~Oldest of last 20 open entries~~ → Precise trade_id match with fallback | ✅ Resolved |
+| Single-instance SQLite store | Low | Durable but not HA; consider PostgreSQL for multi-instance | Open — low priority |
 
 ---
 
@@ -191,12 +193,13 @@ The audit flagged initialization leakage in adaptive labeling.
 ✅ All P0 items resolved — governance bypass eliminated, realistic backtest, early stopping
 ✅ All P1 items resolved — class imbalance, realized-vol VaR, audit semantics, thread safety
 ✅ All P2-P3 items resolved — observability, cost modeling, auto-recovery
-✅ 221+ tests passing with 0 CodeQL alerts
+✅ Residual risks addressed — covariance VaR, kill switch, journal reliability
+✅ 232+ tests passing with 0 CodeQL alerts
 ✅ No feature leakage or adaptive labeling issues (false positives confirmed)
 
 ⚠️ **Before live capital deployment:**
-1. Raise validation thresholds (walk-forward Sharpe ≥ 0.3, MC prob ≥ 0.55)
-2. Add covariance-based VaR for multi-asset portfolios
-3. Implement automated kill switch with max-drawdown circuit breaker
+1. ~~Raise validation thresholds~~ ✅ Done (WF Sharpe ≥ 0.3, MC prob ≥ 0.65)
+2. ~~Add covariance-based VaR~~ ✅ Done
+3. ~~Implement automated kill switch~~ ✅ Done (25% drawdown triggers permanent halt)
 4. Run extended paper trading period (≥30 days) with production data
 5. Manual review of training symbol universe for survivorship bias

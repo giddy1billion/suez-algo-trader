@@ -176,3 +176,5 @@ This selects the **oldest** open journal entry for the symbol from the last 20 e
    - Recovery scenarios (journal entry without exit)
    - Edge cases (empty database, single trade)
 3. **Command output clarity** — `/journalstats` now displays both total and closed trade counts, making the filtering explicit to users.
+4. **Silent journal failures fixed** (§3.2) — Log level upgraded from `debug` to `warning` with symbol context, ensuring journal failures are visible in production logs.
+5. **Heuristic exit matching improved** (§3.3) — Now uses precise `trade_id` lookup first before falling back to the oldest-open-entry heuristic. Query limit increased from 20 to 50 entries.
