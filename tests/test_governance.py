@@ -4,10 +4,22 @@ Tests for Model Governance — lineage tracking and deployment lifecycle.
 
 import os
 import tempfile
+from unittest.mock import patch
 
 import pytest
 
 from src.ml.governance import GovernanceViolation, ModelGovernance, ModelLineage
+
+# Provide a stable commit hash for all governance tests (simulates stamped build)
+_TEST_COMMIT = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
+
+
+@pytest.fixture(autouse=True)
+def _stamp_build_info():
+    """Simulate a stamped production build for all tests in this module."""
+    with patch("src.ml.build_info.GIT_COMMIT", _TEST_COMMIT):
+        with patch("src.ml.build_info.GIT_BRANCH", "main"):
+            yield
 
 
 @pytest.fixture

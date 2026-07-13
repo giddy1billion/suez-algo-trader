@@ -301,16 +301,13 @@ class ModelPredictor:
         return proba, lineage
 
     def _get_git_commit(self) -> str:
-        """Get current git commit hash (cached)."""
+        """Get current git commit hash (cached).
+
+        Uses the provenance module as single source of truth.
+        """
         if not hasattr(self, '_cached_git_commit'):
-            try:
-                import subprocess
-                self._cached_git_commit = subprocess.check_output(
-                    ["git", "rev-parse", "--short", "HEAD"],
-                    stderr=subprocess.DEVNULL,
-                ).decode().strip()
-            except Exception:
-                self._cached_git_commit = ""
+            from src.ml.provenance import get_short_commit
+            self._cached_git_commit = get_short_commit()
         return self._cached_git_commit
 
     # ──────────────────────────────────────────────────────────────────────

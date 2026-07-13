@@ -17,13 +17,13 @@ This creates auditable lineage for every prediction made in production.
 import hashlib
 import json
 import os
-import subprocess
 import threading
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Optional
 
+from src.ml.provenance import get_branch, get_commit_hash
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -522,69 +522,15 @@ class ModelGovernance:
     # ------------------------------------------------------------------
 
     def _get_git_commit(self) -> str:
-        """Get current git commit hash.
+        """Get current git commit hash from the provenance module.
 
-        Resolution order:
-        1. GIT_COMMIT / SOURCE_VERSION environment variable (set by CI/Docker)
-        2. git rev-parse HEAD (tried from multiple directories)
-        3. .git_commit file (embedded at Docker build time)
+        Uses build-time injected metadata as the single source of truth.
         """
-        # Priority 1: Environment variables (most reliable in CI/Docker)
-        for env_var in ("GIT_COMMIT", "SOURCE_VERSION", "GITHUB_SHA"):
-            commit = os.environ.get(env_var, "").strip()
-            if commit:
-                return commit
-
-        # Priority 2: git CLI
-        search_dirs = [
-            os.path.dirname(os.path.abspath(__file__)),  # src/ml/
-            os.getcwd(),  # working directory
-            os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),  # project root
-        ]
-        for cwd in search_dirs:
-            try:
-                result = subprocess.run(
-                    ["git", "rev-parse", "HEAD"],
-                    capture_output=True, text=True, timeout=5,
-                    cwd=cwd,
-                )
-                if result.returncode == 0 and result.stdout.strip():
-                    return result.stdout.strip()
-            except Exception:
-                continue
-
-        # Priority 3: .git_commit file (embedded at Docker build time)
-        for cwd in search_dirs:
-            commit_file = os.path.join(cwd, ".git_commit")
-            if os.path.exists(commit_file):
-                try:
-                    with open(commit_file, "r") as f:
-                        commit = f.read().strip()
-                    if commit:
-                        return commit
-                except Exception:
-                    pass
-        return ""
+        return get_commit_hash()
 
     def _get_git_branch(self) -> str:
-        """Get current git branch name. Tries multiple paths for robustness."""
-        search_dirs = [
-            os.path.dirname(os.path.abspath(__file__)),
-            os.getcwd(),
-            os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-        ]
-        for cwd in search_dirs:
-            try:
-                result = subprocess.run(
-                    ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-                    capture_output=True, text=True, timeout=5,
-                    cwd=cwd,
-                )
-                if result.returncode == 0 and result.stdout.strip():
-                    return result.stdout.strip()
-            except Exception:
-                continue
-        return ""
+        """Get current git branch name from the provenance module."""
+        return get_branch()
 
     def _hash_dict(self, d: dict) -> str:
         """Deterministic hash of a dictionary."""

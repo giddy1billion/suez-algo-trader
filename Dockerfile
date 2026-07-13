@@ -23,6 +23,11 @@ RUN if [ -z "$GIT_COMMIT_HASH" ] && [ -d .git ]; then \
         echo "$GIT_COMMIT_HASH" > /app/.git_commit; \
     fi
 
+# Stamp build_info.py with commit metadata (preferred provenance source)
+RUN python scripts/inject_build_info.py \
+        --commit "${GIT_COMMIT_HASH:-$(git rev-parse HEAD 2>/dev/null || echo '')}" \
+    || true
+
 # Create directories and set ownership
 RUN mkdir -p data_cache models logs \
     && addgroup --system --gid 1001 trader \

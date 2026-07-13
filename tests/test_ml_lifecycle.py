@@ -36,6 +36,17 @@ from src.ml.governance import ModelGovernance, ModelLineage, ModelStatus, Valida
 from src.predictions.registry import PredictionRecord, PredictionRegistry
 from src.strategy.base import Signal, LegacyTradeSignal
 
+# Stable commit hash for all lifecycle tests (simulates stamped build)
+_TEST_COMMIT = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
+
+
+@pytest.fixture(autouse=True)
+def _stamp_build_info():
+    """Simulate a stamped production build for all tests in this module."""
+    with patch("src.ml.build_info.GIT_COMMIT", _TEST_COMMIT):
+        with patch("src.ml.build_info.GIT_BRANCH", "main"):
+            yield
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Phase 1: Prediction Provenance & NO_SIGNAL Sentinel
