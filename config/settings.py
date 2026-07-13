@@ -58,6 +58,9 @@ class Settings(BaseSettings):
     max_consecutive_errors: int = 5
     error_cooldown_seconds: int = 300
 
+    # --- Timezone (P2-11) ---
+    market_timezone: str = "America/New_York"  # IANA timezone for market-aware operations
+
     # --- Risk Management ---
     max_position_size_pct: float = 0.02
     max_daily_loss_pct: float = 0.05

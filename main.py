@@ -51,6 +51,7 @@ from src.config.initializer import initialize_configuration_service
 # ──────────────────────────────────────────────────────────────────────────
 
 _shutdown_event = threading.Event()
+_tracked_threads: list[threading.Thread] = []  # P2-04: daemon threads for graceful shutdown
 logger = None
 
 
@@ -964,12 +965,24 @@ def cmd_run(
                     if restart_count < max_restarts:
                         import time as _time
                         _time.sleep(5)  # Wait before retry
-                        # Create fresh event loop for retry
+                        # P1-17: Close old loop to prevent resource leak before creating fresh one
+                        try:
+                            loop.run_until_complete(loop.shutdown_asyncgens())
+                            loop.close()
+                        except Exception:
+                            pass
                         loop = asyncio.new_event_loop()
                         asyncio.set_event_loop(loop)
+            # Cleanup on exit
+            try:
+                loop.run_until_complete(loop.shutdown_asyncgens())
+                loop.close()
+            except Exception:
+                pass
 
         _telegram_thread = threading.Thread(target=_run_telegram_bot, args=(telegram_bot,), daemon=True)
         _telegram_thread.start()
+        _tracked_threads.append(_telegram_thread)
         logger.info("telegram.bot_started")
         # NOTE: set_components() is called later (after full initialization) to inject
         # broker, engine, risk etc. Commands gracefully deny with "Not connected" during
@@ -1009,12 +1022,18 @@ def cmd_run(
 
         _stream_thread = threading.Thread(target=_run_stream, daemon=True)
         _stream_thread.start()
+        _tracked_threads.append(_stream_thread)
         logger.info("stream.started", symbols=len(symbols))
 
     # Start trade update stream (real-time order fills/cancellations)
     if not dry_run:
+        # P1-06: Deduplication set to prevent duplicate fill events on WebSocket reconnect
+        _seen_fill_events: set = set()
+        _MAX_SEEN_FILLS = 10000  # Bounded to prevent memory leak
+
         def _trade_update_handler(update: dict):
             """Handle real-time trade updates from Alpaca WebSocket."""
+            nonlocal _seen_fill_events
             event_type = update.get("event", "")
             order_info = update.get("order", {})
             symbol = order_info.get("symbol", "?")
@@ -1023,6 +1042,17 @@ def cmd_run(
             if event_type in ("fill", "partial_fill"):
                 filled_qty = order_info.get("filled_qty", "0")
                 filled_price = order_info.get("filled_avg_price")
+
+                # Deduplication: skip if already seen this exact fill
+                dedup_key = f"{order_id}:{event_type}:{filled_qty}:{filled_price}"
+                if dedup_key in _seen_fill_events:
+                    logger.debug("trade_update.duplicate_fill_skipped", order_id=order_id)
+                    return
+                _seen_fill_events.add(dedup_key)
+                if len(_seen_fill_events) > _MAX_SEEN_FILLS:
+                    # Evict oldest half to prevent unbounded growth
+                    _seen_fill_events = set(list(_seen_fill_events)[_MAX_SEEN_FILLS // 2:])
+
                 logger.info("trade_update.fill", event=event_type, symbol=symbol,
                            filled_qty=filled_qty, avg_price=filled_price, order_id=order_id)
 
@@ -1074,6 +1104,20 @@ def cmd_run(
 
     # Thread-safe broker access for scheduled background jobs
     _broker_lock = threading.Lock()
+
+    # P1-09: Helper context manager with timeout to prevent deadlocks in background jobs
+    import contextlib
+
+    @contextlib.contextmanager
+    def _broker_lock_timeout(timeout: float = 30.0):
+        """Acquire _broker_lock with a timeout; raises TimeoutError if unable."""
+        acquired = _broker_lock.acquire(timeout=timeout)
+        if not acquired:
+            raise TimeoutError(f"Failed to acquire broker lock within {timeout}s")
+        try:
+            yield
+        finally:
+            _broker_lock.release()
 
     # Runtime state for scheduled jobs to signal the main loop
     _runtime_lock = threading.Lock()
@@ -1137,10 +1181,32 @@ def cmd_run(
                         # Resolve asset-class-aware parameters (includes timeframe)
                         params = get_backtest_config(sym)
                         sym_timeframe = params.get("timeframe", timeframe)
-                        with _broker_lock:
+                        with _broker_lock_timeout():
                             df = broker.get_bars_df(sym, sym_timeframe, limit=500)
                         if df is None or len(df) < 50:
                             continue
+
+                        # P2-01: Stale data detection — skip if last bar is >2x timeframe old
+                        try:
+                            _tf_minutes = {"1Min": 1, "5Min": 5, "15Min": 15, "30Min": 30,
+                                           "1Hour": 60, "4Hour": 240, "1Day": 1440}.get(sym_timeframe, 60)
+                            _last_bar_time = df.index[-1] if hasattr(df.index[-1], 'timestamp') else None
+                            if _last_bar_time is not None:
+                                from datetime import timezone as _tz
+                                _now_utc = datetime.now(_tz.utc)
+                                _last_bar_utc = _last_bar_time.to_pydatetime()
+                                if _last_bar_utc.tzinfo is None:
+                                    import pytz
+                                    _last_bar_utc = pytz.utc.localize(_last_bar_utc)
+                                _staleness_minutes = (_now_utc - _last_bar_utc).total_seconds() / 60
+                                if _staleness_minutes > 2 * _tf_minutes:
+                                    logger.warning("scheduler.stale_data_skipped",
+                                                   symbol=sym, staleness_min=round(_staleness_minutes, 1),
+                                                   threshold_min=2 * _tf_minutes)
+                                    continue
+                        except Exception as _stale_err:
+                            logger.debug("scheduler.stale_check_error", symbol=sym, error=str(_stale_err))
+
                         metrics = vectorbt_momentum_backtest(
                             df,
                             fast_ema=params["fast_ema"],
@@ -1220,7 +1286,7 @@ def cmd_run(
 
                 for sym in sweep_symbols:
                     try:
-                        with _broker_lock:
+                        with _broker_lock_timeout():
                             df = broker.get_bars_df(sym, timeframe, limit=700)
                         if df is None or len(df) < 100:
                             continue
@@ -1255,7 +1321,7 @@ def cmd_run(
         def _daily_risk_reset():
             """Reset daily risk counters at market open."""
             try:
-                with _broker_lock:
+                with _broker_lock_timeout():
                     account = broker.get_account()
                 risk.reset_daily(account['equity'])
                 # Refresh sector cache from DB as a daily backstop
@@ -1671,6 +1737,15 @@ def cmd_run(
 
     # Shutdown
     logger.info("bot.stopped", cycles=cycle_count)
+
+    # P2-04: Graceful shutdown — join all tracked daemon threads
+    for t in _tracked_threads:
+        if t.is_alive():
+            t.join(timeout=5.0)
+            if t.is_alive():
+                logger.warning("shutdown.thread_join_timeout", thread=t.name, timeout=5.0)
+            else:
+                logger.debug("shutdown.thread_joined", thread=t.name)
 
     # P0-03: Cancel all pending orders before shutdown to prevent orphaned positions
     try:

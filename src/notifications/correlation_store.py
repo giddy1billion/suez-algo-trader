@@ -766,6 +766,55 @@ class SqliteCorrelationStore:
             self._conn.commit()
             self._metrics.send_failures += 1
 
+    def retry_dead_letters(self, sender_fn=None, max_attempts: int = 5, limit: int = 50) -> dict:
+        """Attempt to re-process dead letter entries.
+
+        Args:
+            sender_fn: Callable(message: str) -> bool. Returns True on success.
+                       If None, dead letters are just returned without retry.
+            max_attempts: Skip entries that have already failed this many times.
+            limit: Max number of dead letters to process per call.
+
+        Returns:
+            Dict with keys: retried, succeeded, failed, skipped.
+        """
+        results = {"retried": 0, "succeeded": 0, "failed": 0, "skipped": 0}
+        letters = self.get_dead_letters(limit=limit)
+
+        for letter_id, message, attempts in letters:
+            if attempts >= max_attempts:
+                results["skipped"] += 1
+                logger.debug("dead_letter.skip_max_attempts", letter_id=letter_id, attempts=attempts)
+                continue
+
+            if sender_fn is None:
+                results["skipped"] += 1
+                continue
+
+            results["retried"] += 1
+            try:
+                success = sender_fn(message)
+                if success:
+                    self.remove_dead_letter(letter_id)
+                    results["succeeded"] += 1
+                    logger.info("dead_letter.retry_succeeded", letter_id=letter_id)
+                else:
+                    self.increment_dead_letter_attempt(letter_id, error="sender returned False")
+                    results["failed"] += 1
+            except Exception as e:
+                self.increment_dead_letter_attempt(letter_id, error=str(e))
+                results["failed"] += 1
+                logger.warning("dead_letter.retry_failed", letter_id=letter_id, error=str(e))
+
+        if results["retried"] > 0:
+            logger.info(
+                "dead_letter.retry_batch_complete",
+                retried=results["retried"],
+                succeeded=results["succeeded"],
+                failed=results["failed"],
+            )
+        return results
+
     # ── Cleanup / Metrics ────────────────────────────────────────────────
 
     def cleanup_expired(self) -> int:

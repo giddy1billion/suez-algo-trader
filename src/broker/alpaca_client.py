@@ -221,7 +221,31 @@ class AlpacaBroker:
         self._trade_stream_handler = None
         self._shutdown_flag: bool = False
 
+        # P2-05: Startup connection test — fail fast if broker is unreachable
+        self._verify_connection(timeout=min(timeout, 15.0))
+
         logger.info("broker.initialized", paper=paper, data_feed=data_feed, timeout=timeout)
+
+    def _verify_connection(self, timeout: float = 15.0) -> None:
+        """Test broker connectivity at startup. Raises if unreachable."""
+        import concurrent.futures
+        def _ping():
+            return self.trading_client.get_account()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_ping)
+            try:
+                future.result(timeout=timeout)
+                logger.info("broker.connection_verified")
+            except concurrent.futures.TimeoutError:
+                raise ConnectionError(
+                    f"Broker connection test timed out after {timeout}s — "
+                    f"check network connectivity and API credentials"
+                )
+            except Exception as e:
+                raise ConnectionError(
+                    f"Broker connection test failed: {e}"
+                )
 
     @property
     def name(self) -> str:
@@ -925,6 +949,8 @@ class AlpacaBroker:
         """Run trade stream with automatic reconnection on failure."""
         backoff = 1.0
         max_backoff = 60.0
+        max_reconnect_attempts = 50  # P1-04: prevent infinite reconnection loop
+        reconnect_attempts = 0
         while not self._shutdown_flag:
             try:
                 logger.info("trade_stream.connecting")
@@ -932,8 +958,21 @@ class AlpacaBroker:
             except Exception as e:
                 if self._shutdown_flag:
                     break
-                logger.error("trade_stream.disconnected", error=str(e), reconnect_in=backoff)
-                time.sleep(backoff)
+                reconnect_attempts += 1
+                if reconnect_attempts >= max_reconnect_attempts:
+                    logger.error(
+                        "trade_stream.max_reconnects_exceeded",
+                        attempts=reconnect_attempts,
+                        error=str(e),
+                        msg="CRITICAL: Trade stream permanently disconnected. Manual intervention required.",
+                    )
+                    break
+                # Add jitter to prevent thundering herd
+                import random
+                jitter = random.uniform(0, backoff * 0.3)
+                logger.error("trade_stream.disconnected", error=str(e),
+                           reconnect_in=backoff + jitter, attempt=reconnect_attempts)
+                time.sleep(backoff + jitter)
                 backoff = min(backoff * 2, max_backoff)
                 # Re-create stream for fresh connection
                 try:
@@ -949,6 +988,7 @@ class AlpacaBroker:
             else:
                 # Clean exit (no exception) — reset backoff
                 backoff = 1.0
+                reconnect_attempts = 0
                 if not self._shutdown_flag:
                     # Unexpected clean exit, try reconnecting
                     logger.warning("trade_stream.unexpected_exit", reconnect_in=backoff)

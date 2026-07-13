@@ -101,6 +101,21 @@ class RecoveryManager:
                     f"{[o.get('symbol', 'unknown') for o in orphans]}"
                 )
 
+            # 7. P1-07: Close stale local positions not present at broker
+            broker_symbols = {p.get("symbol", "") for p in positions}
+            stale_closed = 0
+            for trade in internal_trades:
+                if hasattr(trade, 'symbol') and trade.symbol not in broker_symbols:
+                    try:
+                        if hasattr(trade, 'transition'):
+                            trade.transition(TradeState.CLOSED, "recovery: position absent from broker")
+                            stale_closed += 1
+                    except Exception as e:
+                        logger.warning("recovery.stale_close_failed", symbol=getattr(trade, 'symbol', '?'), error=str(e))
+            if stale_closed:
+                report.warnings.append(f"Closed {stale_closed} stale local position(s) not found at broker")
+                logger.info("recovery.stale_positions_closed", count=stale_closed)
+
             report.success = True
             logger.info(
                 "Recovery complete: %d positions recovered, %d orphans detected",

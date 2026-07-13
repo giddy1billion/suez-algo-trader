@@ -79,7 +79,7 @@ class AssetClassScheduler:
         self._lock = threading.Lock()
         self._running = False
         self._thread: Optional[threading.Thread] = None
-        self._tick_interval = 30.0  # Evaluate triggers every 30 seconds
+        self._tick_interval = 10.0  # Evaluate triggers every 10 seconds for responsive scheduling
         self._alert_callback = alert_callback
 
         # Health monitoring

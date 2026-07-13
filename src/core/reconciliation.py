@@ -64,6 +64,9 @@ class PortfolioReconciler:
         self.trade_manager = trade_manager
         self.event_bus = event_bus
         self.interval_seconds = interval_seconds
+        # P2-18: Track recent fixes for idempotency (symbol -> last fix timestamp)
+        self._recent_fixes: dict[str, datetime] = {}
+        self._fix_cooldown_seconds: float = 60.0
 
     def reconcile(self) -> ReconciliationReport:
         """Compare internal state with broker and detect discrepancies."""
@@ -205,75 +208,100 @@ class PortfolioReconciler:
 
         Fixes MISSING_INTERNAL (creates lifecycle for broker position).
         Fixes MISSING_BROKER (closes local position that no longer exists at broker).
+
+        P2-07: Each fix is wrapped individually so one failure doesn't abort the rest.
+        P2-18: Fixes are idempotent — the same symbol won't be fixed twice within cooldown.
         """
         fixes = []
+        now = datetime.now(timezone.utc)
 
         for disc in report.discrepancies:
-            if disc.type == MISSING_BROKER:
-                # Position exists locally but NOT at broker — broker closed it
-                # (e.g., stop-loss filled, liquidation, manual close)
-                symbol = disc.symbol
-                try:
-                    # Find and close the internal trade lifecycle
-                    active_trades = self.trade_manager.get_active_trades()
-                    for trade in active_trades:
-                        if trade.symbol == symbol:
-                            trade.transition(TradeState.CLOSED, "auto-fix: position closed at broker (MISSING_BROKER)")
-                            trade.metadata["auto_closed"] = True
-                            trade.metadata["auto_close_reason"] = "MISSING_BROKER reconciliation"
-                            fixes.append(f"Closed local position for {symbol} (not found at broker)")
-                            logger.warning(
-                                "reconciliation.auto_close_missing_broker",
-                                symbol=symbol,
-                                reason="Position exists locally but not at broker",
-                            )
-                            break
-                    else:
-                        fixes.append(f"MISSING_BROKER {symbol}: no active trade found to close")
-                except Exception as e:
-                    logger.error("Auto-fix MISSING_BROKER failed for %s: %s", symbol, str(e))
-                    fixes.append(f"FAILED to fix MISSING_BROKER {symbol}: {str(e)}")
-                continue
-
-            if disc.type != MISSING_INTERNAL:
-                continue
-
             symbol = disc.symbol
-            pos = disc.broker_state
-            side = pos.get("side", "long").upper()
-            if side in ("LONG",):
-                side = "BUY"
-            elif side in ("SHORT",):
-                side = "SELL"
 
-            try:
-                # Create a new lifecycle for this broker position
-                trade = self.trade_manager.create_trade(
+            # P2-18: Idempotency check — skip if recently fixed
+            fix_key = f"{disc.type}:{symbol}"
+            last_fix = self._recent_fixes.get(fix_key)
+            if last_fix and (now - last_fix).total_seconds() < self._fix_cooldown_seconds:
+                logger.debug(
+                    "reconciliation.auto_fix_skipped_cooldown",
                     symbol=symbol,
-                    side=side,
-                    trade_id=pos.get("asset_id", f"reconciled-{symbol}"),
+                    type=disc.type,
+                    seconds_since_last=round((now - last_fix).total_seconds(), 1),
                 )
+                fixes.append(f"SKIPPED {disc.type} {symbol}: fix applied recently (cooldown)")
+                continue
 
-                # Fast-forward to ACTIVE
-                trade.transition(TradeState.PENDING_RISK, "auto-fix reconciliation")
-                trade.transition(TradeState.RISK_APPROVED, "auto-fix reconciliation")
-                trade.transition(TradeState.SUBMITTED, "auto-fix reconciliation")
-                trade.transition(TradeState.ACCEPTED, "auto-fix reconciliation")
-                trade.transition(TradeState.FILLED, "auto-fix reconciliation")
-                trade.transition(TradeState.ACTIVE, "auto-fix: created from broker position")
-
-                # Attach metadata
-                qty = pos.get("qty", pos.get("quantity", 0))
-                trade.metadata["recovered"] = True
-                trade.metadata["auto_fixed"] = True
-                trade.metadata["broker_qty"] = qty
-                trade.metadata["broker_position"] = pos
-
-                fixes.append(f"Created lifecycle for {symbol} (side={side})")
-                logger.info("Auto-fix: created lifecycle for %s", symbol)
-
+            # P2-07: Each fix action in its own try/except
+            try:
+                if disc.type == MISSING_BROKER:
+                    self._fix_missing_broker(disc, fixes)
+                    self._recent_fixes[fix_key] = now
+                elif disc.type == MISSING_INTERNAL:
+                    self._fix_missing_internal(disc, fixes)
+                    self._recent_fixes[fix_key] = now
+                else:
+                    # Unsupported fix type — skip silently
+                    continue
             except Exception as e:
-                logger.error("Auto-fix failed for %s: %s", symbol, str(e))
-                fixes.append(f"FAILED to fix {symbol}: {str(e)}")
+                logger.error(
+                    "reconciliation.auto_fix_failed",
+                    symbol=symbol,
+                    type=disc.type,
+                    error=str(e),
+                )
+                fixes.append(f"FAILED to fix {disc.type} {symbol}: {str(e)}")
 
         return fixes
+
+    def _fix_missing_broker(self, disc: Discrepancy, fixes: list[str]) -> None:
+        """Fix MISSING_BROKER: close local position not found at broker."""
+        symbol = disc.symbol
+        active_trades = self.trade_manager.get_active_trades()
+        for trade in active_trades:
+            if trade.symbol == symbol:
+                trade.transition(TradeState.CLOSED, "auto-fix: position closed at broker (MISSING_BROKER)")
+                trade.metadata["auto_closed"] = True
+                trade.metadata["auto_close_reason"] = "MISSING_BROKER reconciliation"
+                fixes.append(f"Closed local position for {symbol} (not found at broker)")
+                logger.warning(
+                    "reconciliation.auto_close_missing_broker",
+                    symbol=symbol,
+                    reason="Position exists locally but not at broker",
+                )
+                return
+        fixes.append(f"MISSING_BROKER {symbol}: no active trade found to close")
+
+    def _fix_missing_internal(self, disc: Discrepancy, fixes: list[str]) -> None:
+        """Fix MISSING_INTERNAL: create lifecycle for broker position."""
+        symbol = disc.symbol
+        pos = disc.broker_state
+        side = pos.get("side", "long").upper()
+        if side in ("LONG",):
+            side = "BUY"
+        elif side in ("SHORT",):
+            side = "SELL"
+
+        # Create a new lifecycle for this broker position
+        trade = self.trade_manager.create_trade(
+            symbol=symbol,
+            side=side,
+            trade_id=pos.get("asset_id", f"reconciled-{symbol}"),
+        )
+
+        # Fast-forward to ACTIVE
+        trade.transition(TradeState.PENDING_RISK, "auto-fix reconciliation")
+        trade.transition(TradeState.RISK_APPROVED, "auto-fix reconciliation")
+        trade.transition(TradeState.SUBMITTED, "auto-fix reconciliation")
+        trade.transition(TradeState.ACCEPTED, "auto-fix reconciliation")
+        trade.transition(TradeState.FILLED, "auto-fix reconciliation")
+        trade.transition(TradeState.ACTIVE, "auto-fix: created from broker position")
+
+        # Attach metadata
+        qty = pos.get("qty", pos.get("quantity", 0))
+        trade.metadata["recovered"] = True
+        trade.metadata["auto_fixed"] = True
+        trade.metadata["broker_qty"] = qty
+        trade.metadata["broker_position"] = pos
+
+        fixes.append(f"Created lifecycle for {symbol} (side={side})")
+        logger.info("Auto-fix: created lifecycle for %s", symbol)

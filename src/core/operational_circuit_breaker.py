@@ -27,6 +27,7 @@ class OperationalState(str, Enum):
     CLOSED = "CLOSED"       # Normal operation — all systems healthy
     OPEN = "OPEN"           # Failures detected — trading halted
     HALF_OPEN = "HALF_OPEN"  # Probing — allowing limited traffic to test recovery
+    HALTED = "HALTED"       # Manual halt — all trading prevented until explicitly resumed
 
 
 class FailureDomain(str, Enum):
@@ -105,7 +106,7 @@ class OperationalCircuitBreaker:
         """Whether trading operations should proceed."""
         with self._lock:
             self._check_recovery_timeout()
-            return self._state != OperationalState.OPEN
+            return self._state not in (OperationalState.OPEN, OperationalState.HALTED)
 
     def record_failure(
         self,
@@ -179,6 +180,38 @@ class OperationalCircuitBreaker:
         with self._lock:
             self._close()
 
+    def halt(self, reason: str = "manual_halt") -> None:
+        """Enter HALTED state — prevents all trading until explicitly resumed.
+
+        Unlike OPEN (which auto-recovers via HALF_OPEN), HALTED requires
+        an explicit call to resume() to re-enable trading.
+        """
+        with self._lock:
+            old_state = self._state
+            if old_state == OperationalState.HALTED:
+                return
+            self._state = OperationalState.HALTED
+            logger.warning("operational_circuit_breaker.halted", reason=reason)
+            if self._on_state_change:
+                try:
+                    self._on_state_change(old_state, self._state)
+                except Exception:
+                    pass
+
+    def resume(self) -> None:
+        """Exit HALTED state and return to CLOSED (normal operation)."""
+        with self._lock:
+            if self._state != OperationalState.HALTED:
+                return
+            old_state = self._state
+            self._state = OperationalState.CLOSED
+            logger.info("operational_circuit_breaker.resumed_from_halt")
+            if self._on_state_change:
+                try:
+                    self._on_state_change(old_state, self._state)
+                except Exception:
+                    pass
+
     def get_status(self) -> dict[str, Any]:
         """Get current status and metrics."""
         with self._lock:
@@ -187,7 +220,7 @@ class OperationalCircuitBreaker:
             self._expire_failures(now)
             return {
                 "state": self._state.value,
-                "trading_allowed": self._state != OperationalState.OPEN,
+                "trading_allowed": self._state not in (OperationalState.OPEN, OperationalState.HALTED),
                 "failure_counts": {
                     domain.value: len(q) for domain, q in self._failures.items()
                 },

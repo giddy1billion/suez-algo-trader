@@ -864,6 +864,17 @@ class ExecutionEngine:
                 trade_lifecycle.transition(TradeState.CANCELLED, f"invalid price: {observed_price}")
             return None
 
+        # P2-14: Minimum order size enforcement
+        _is_crypto = "/" in signal.symbol
+        _min_order_size = 0.0001 if _is_crypto else 1.0
+        if final_qty < _min_order_size:
+            logger.warning("engine.below_min_order_size",
+                          symbol=signal.symbol, qty=final_qty, min_size=_min_order_size)
+            if trade_lifecycle:
+                trade_lifecycle.transition(TradeState.CANCELLED,
+                                          f"qty {final_qty} below minimum {_min_order_size}")
+            return None
+
         # Place the order — use contract SL/TP (system-determined) not strategy hints
         order_type = "bracket" if (final_stop_loss and final_take_profit) else "market"
         logger.info(
