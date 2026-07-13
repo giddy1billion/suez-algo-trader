@@ -262,16 +262,21 @@ class ModelGovernance:
         Mark a model version as deployed (live in production).
 
         Deployment is BLOCKED unless the model passes all governance
-        validation gates.  The ``skip_validation`` flag exists **only**
-        for disaster-recovery rollbacks and is logged as an audit event.
+        validation gates.  Validation bypass is disabled in production
+        hardening mode to prevent accidental unsafe promotions.
 
         Raises:
             GovernanceViolation: If the model fails validation and
                 ``skip_validation`` is False.
         """
+        if skip_validation:
+            raise GovernanceViolation(
+                "Validation bypass is disabled: deployment requires passing all governance gates"
+            )
+
         # ── Mandatory validation gate ──────────────────────────────
         is_valid, issues = self.validate_for_deployment(version)
-        if not is_valid and not skip_validation:
+        if not is_valid:
             logger.warning(
                 "governance.deploy_blocked",
                 version=version,
@@ -279,13 +284,6 @@ class ModelGovernance:
             )
             raise GovernanceViolation(
                 f"Model {version} failed governance validation: {issues}"
-            )
-        if skip_validation and not is_valid:
-            logger.warning(
-                "governance.deploy_override",
-                version=version,
-                issues=issues,
-                reason=reason,
             )
 
         with self._lock:

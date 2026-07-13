@@ -129,6 +129,7 @@ class Settings(BaseSettings):
     #   PostgreSQL: "postgresql://user:pass@host:5432/dbname?sslmode=require"
     #   SQLite:     "sqlite:///data_cache/trading.db"
     database_url: str = "sqlite:///data_cache/trading.db"
+    correlation_store_db_path: str = "data_cache/correlation_store.db"
 
     # --- Redis (optional — graceful fallback to in-memory if empty) ---
     redis_url: str = ""

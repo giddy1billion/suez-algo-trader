@@ -634,7 +634,7 @@ class TrainingPipeline:
 
     def _prepare_training_data(
         self, feature_data: dict[str, pd.DataFrame]
-    ) -> tuple[np.ndarray, np.ndarray, list[str], Optional[np.ndarray], int]:
+    ) -> tuple[np.ndarray, np.ndarray, list[str], Optional[np.ndarray], int, Optional[np.ndarray]]:
         """
         Prepare combined feature matrix from per-symbol DataFrames.
 
@@ -701,7 +701,7 @@ class TrainingPipeline:
         # Extract sample weights if present (from experience enrichment)
         sample_weights = None
         if '_sample_weight' in combined.columns:
-            sample_weights = combined['_sample_weight'].values
+            sample_weights = combined['_sample_weight'].copy()
             combined = combined.drop(columns=['_sample_weight'], errors='ignore')
         if '_from_experience' in combined.columns:
             combined = combined.drop(columns=['_from_experience'], errors='ignore')
@@ -710,7 +710,7 @@ class TrainingPipeline:
         valid_mask = combined[feature_cols + ['target']].notna().all(axis=1)
         valid = combined[valid_mask].reset_index(drop=True)
         if sample_weights is not None:
-            sample_weights = sample_weights[valid_mask.values]
+            sample_weights = sample_weights.loc[valid_mask].to_numpy()
         if len(valid) < self._min_samples:
             raise RuntimeError(
                 f"Insufficient training samples: {len(valid)} < {self._min_samples}"
@@ -738,7 +738,7 @@ class TrainingPipeline:
 
     def _train_model(
         self, feature_data: dict[str, pd.DataFrame]
-    ) -> tuple[Any, dict, list[str], np.ndarray, np.ndarray]:
+    ) -> tuple[Any, dict, list[str], np.ndarray, np.ndarray, Optional[np.ndarray]]:
         """
         Train XGBoost model on prepared feature data.
 
@@ -1063,8 +1063,20 @@ class TrainingPipeline:
         from sklearn.metrics import accuracy_score
 
         hold_bars = 5
+        primary_symbol = next(iter(sorted(feature_data.keys())), "AAPL")
+        try:
+            from src.config.backtest_params import get_backtest_config
+            commission_pct = float(get_backtest_config(primary_symbol).get("fees"))
+        except Exception:
+            commission_pct = 1.0 / 1000.0
+        try:
+            from config.settings import settings
+            slippage_pct = float(settings.backtest_slippage_pct)
+        except Exception:
+            slippage_pct = 1.0 / 2000.0
+        cost_per_trade = commission_pct + (2.0 * slippage_pct)
 
-        X, y, _, sample_weights, _ = self._prepare_training_data(feature_data)
+        X, y, _, sample_weights, _, close_prices = self._prepare_training_data(feature_data)
 
         # Divide into (n_splits + 1) temporal segments
         n_total = len(X)
@@ -1076,7 +1088,7 @@ class TrainingPipeline:
                 n_total=n_total,
                 segment_size=segment_size,
             )
-            return {"sharpe": 0.0, "total_return": 0.0, "splits": []}
+            return {"sharpe": 0.0, "total_return": 0.0, "n_trades": 0, "splits": []}
 
         all_wf_trades = []
         split_results = []
@@ -1097,6 +1109,11 @@ class TrainingPipeline:
             w_train_wf = sample_weights[:train_end] if sample_weights is not None else None
             X_test_wf = X[test_start:test_end]
             y_test_wf = y[test_start:test_end]
+            close_test_wf = (
+                close_prices[test_start:test_end]
+                if close_prices is not None and len(close_prices) >= test_end
+                else None
+            )
 
             # Train fresh model on expanding window
             wf_model = XGBClassifier(
@@ -1130,13 +1147,22 @@ class TrainingPipeline:
                     i += 1
                     continue
 
-                true_dir = DirectionEncoder.decode(np.array([y_test_wf[i]]))[0]
-                if true_dir == signal:
-                    trade_return = 0.005 * abs(signal)
-                elif true_dir == 0:
-                    trade_return = -0.001
+                if close_test_wf is not None:
+                    entry_price = close_test_wf[i]
+                    exit_price = close_test_wf[i + hold_bars]
+                    if entry_price > 0:
+                        raw_return = signal * (exit_price / entry_price - 1.0)
+                        trade_return = float(raw_return - cost_per_trade)
+                    else:
+                        trade_return = 0.0
                 else:
-                    trade_return = -0.005 * abs(signal)
+                    true_dir = DirectionEncoder.decode(np.array([y_test_wf[i]]))[0]
+                    if true_dir == signal:
+                        trade_return = 0.005 * abs(signal) - cost_per_trade
+                    elif true_dir == 0:
+                        trade_return = -cost_per_trade
+                    else:
+                        trade_return = -0.005 * abs(signal) - cost_per_trade
 
                 split_trades.append({"return": trade_return, "signal": signal})
                 i += hold_bars

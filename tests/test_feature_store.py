@@ -230,11 +230,14 @@ class TestImmutableGovernance:
         governance.record_training(
             version="v001",
             features=["f1", "f2"],
-            metrics={"cv_accuracy": 0.7, "sharpe": 1.5},
+            dataset=pd.DataFrame({"close": np.arange(200), "volume": np.arange(200)}),
+            metrics={"cv_accuracy": 0.7, "sharpe": 1.5, "n_trades": 60, "max_drawdown": 0.05},
             hyperparameters={"lr": 0.01},
             seed=42,
+            walk_forward_results={"sharpe": 0.7},
+            monte_carlo_results={"probability_of_profit": 0.7},
         )
-        governance.deploy("v001", reason="initial", skip_validation=True)
+        governance.deploy("v001", reason="initial")
 
         # Try to overwrite
         governance.record_training(
@@ -255,11 +258,14 @@ class TestImmutableGovernance:
         governance.record_training(
             version="v001",
             features=["f1", "f2"],
-            metrics={"cv_accuracy": 0.7},
+            dataset=pd.DataFrame({"close": np.arange(200), "volume": np.arange(200)}),
+            metrics={"cv_accuracy": 0.7, "sharpe": 1.2, "n_trades": 60, "max_drawdown": 0.05},
             hyperparameters={"lr": 0.01},
             seed=42,
+            walk_forward_results={"sharpe": 0.7},
+            monte_carlo_results={"probability_of_profit": 0.7},
         )
-        governance.deploy("v001", reason="test", skip_validation=True)
+        governance.deploy("v001", reason="test")
 
         is_valid, issues = governance.verify_integrity()
         assert is_valid, f"Unexpected issues: {issues}"
@@ -269,11 +275,14 @@ class TestImmutableGovernance:
         governance.record_training(
             version="v001",
             features=["f1", "f2"],
-            metrics={"cv_accuracy": 0.7},
+            dataset=pd.DataFrame({"close": np.arange(200), "volume": np.arange(200)}),
+            metrics={"cv_accuracy": 0.7, "sharpe": 1.2, "n_trades": 60, "max_drawdown": 0.05},
             hyperparameters={"lr": 0.01},
             seed=42,
+            walk_forward_results={"sharpe": 0.7},
+            monte_carlo_results={"probability_of_profit": 0.7},
         )
-        governance.deploy("v001", reason="test", skip_validation=True)
+        governance.deploy("v001", reason="test")
 
         # Tamper with the record directly
         import json

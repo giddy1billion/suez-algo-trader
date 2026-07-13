@@ -114,12 +114,10 @@ class TestGovernanceBypassRegression:
         assert deployed is not None
         assert deployed.version == "v001"
 
-    def test_skip_validation_flag_allows_deploy_with_audit(self, failing_model):
-        """skip_validation allows emergency deploy but logs the override."""
-        result = failing_model.deploy("v_bad", reason="Emergency rollback", skip_validation=True)
-        assert result is True
-        deployed = failing_model.get_deployed_model()
-        assert deployed is not None
+    def test_skip_validation_flag_is_blocked(self, failing_model):
+        """skip_validation cannot bypass deployment validation."""
+        with pytest.raises(GovernanceViolation, match="bypass is disabled"):
+            failing_model.deploy("v_bad", reason="Emergency rollback", skip_validation=True)
 
     def test_nonexistent_version_returns_false(self, tmp_governance):
         """deploy() returns False for version not in records."""
@@ -351,6 +349,15 @@ class TestSchedulerHealthMonitoring:
         assert scheduler._restart_count == 1
         assert scheduler._running is True
 
+    def test_scheduler_alert_callback_invoked(self):
+        """Scheduler heartbeat alerts call the configured callback."""
+        from src.scheduler.asset_class_scheduler import AssetClassScheduler
+
+        alerts = []
+        scheduler = AssetClassScheduler(alert_callback=lambda msg: alerts.append(msg))
+        scheduler._emit_alert("heartbeat stale")
+        assert alerts == ["heartbeat stale"]
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # 5. Early Stopping Tests (P0-5)
@@ -569,7 +576,8 @@ class TestDurableCorrelationStoreDefault:
         from src.notifications import telegram_audit_forwarder
 
         source = inspect.getsource(telegram_audit_forwarder.TelegramAuditForwarder.__init__)
-        assert "SqliteCorrelationStore()" in source
+        assert "SqliteCorrelationStore(" in source
+        assert "db_path" in source
         assert "InMemoryCorrelationStore()" not in source
 
 
