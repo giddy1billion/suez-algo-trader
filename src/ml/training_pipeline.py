@@ -110,6 +110,7 @@ class TrainingPipeline:
         min_training_samples: int = 500,
         experience_db=None,
         dataset_registry=None,
+        training_lock=None,
     ):
         self._registry = registry
         self._governance = governance
@@ -119,6 +120,7 @@ class TrainingPipeline:
         self._experience_db = experience_db  # ExperienceDatabase for closed-loop training
         self._dataset_registry = dataset_registry  # DatasetRegistry for lineage tracking
         self._min_samples = min_training_samples
+        self._training_lock = training_lock  # TrainingLock for distributed singleton
 
         # Recovery settings (loaded from config when available)
         try:
@@ -169,15 +171,32 @@ class TrainingPipeline:
         Raises:
             RuntimeError: If a pipeline is already running.
         """
+        # Distributed lock check — prevents concurrent training across instances
+        if self._training_lock:
+            from src.ml.training_lock import TrainingLockError
+            # Generate pipeline_id early so we can use it for lock acquisition
+            pipeline_id = uuid.uuid4().hex[:12]
+            if not self._training_lock.try_acquire(pipeline_id):
+                holder = self._training_lock.lock_holder() or "unknown"
+                raise RuntimeError(
+                    f"Training lock held by {holder}. "
+                    f"Cannot start pipeline {pipeline_id} from "
+                    f"{self._training_lock.instance_identity}."
+                )
+        else:
+            pipeline_id = uuid.uuid4().hex[:12]
+
         with self._lock:
             if self._current and self._current.is_running:
+                # Release distributed lock if we acquired it
+                if self._training_lock:
+                    self._training_lock.release(pipeline_id)
                 raise RuntimeError(
                     f"Pipeline already running: {self._current.pipeline_id} "
                     f"(step: {self._current.current_step})"
                 )
             self._stop_event.clear()
 
-            pipeline_id = uuid.uuid4().hex[:12]
             progress = PipelineProgress(
                 pipeline_id=pipeline_id,
                 trigger=trigger,
@@ -195,6 +214,9 @@ class TrainingPipeline:
                 progress.completed_at = datetime.now(timezone.utc)
                 logger.error("training_pipeline.failed", pipeline_id=pipeline_id, error=str(e))
             finally:
+                # Release distributed lock when training completes
+                if self._training_lock:
+                    self._training_lock.release(pipeline_id)
                 with self._lock:
                     self._history.append(progress)
                     if len(self._history) > self._max_history:
@@ -228,6 +250,7 @@ class TrainingPipeline:
             symbols=symbols,
             timeframe=timeframe,
             trigger=trigger,
+            instance=self._training_lock.instance_identity if self._training_lock else "local",
         )
         return pipeline_id
 
@@ -1115,7 +1138,21 @@ class TrainingPipeline:
                 else None
             )
 
-            # Train fresh model on expanding window
+            # Train fresh model on expanding window with early stopping
+            # Use last 10% of training data as fold-local validation (respects temporal order)
+            embargo_bars = 5  # Same as purge_gap to prevent leakage
+            es_split = int(len(X_train_wf) * 0.90)
+            X_train_fold = X_train_wf[:es_split]
+            y_train_fold = y_train_wf[:es_split]
+            w_train_fold = w_train_wf[:es_split] if w_train_wf is not None else None
+            # Apply embargo gap between fold-local train and validation
+            val_start = es_split + embargo_bars
+            X_val_fold = X_train_wf[val_start:]
+            y_val_fold = y_train_wf[val_start:]
+
+            # If validation set is too small after embargo, use full training without early stopping
+            use_early_stopping = len(X_val_fold) >= 20
+
             wf_model = XGBClassifier(
                 n_estimators=500,
                 max_depth=4,
@@ -1130,8 +1167,15 @@ class TrainingPipeline:
                 eval_metric='mlogloss',
                 random_state=42,
                 verbosity=0,
+                early_stopping_rounds=30 if use_early_stopping else None,
             )
-            wf_model.fit(X_train_wf, y_train_wf, sample_weight=w_train_wf, verbose=False)
+            if use_early_stopping:
+                wf_model.fit(
+                    X_train_fold, y_train_fold, sample_weight=w_train_fold,
+                    eval_set=[(X_val_fold, y_val_fold)], verbose=False,
+                )
+            else:
+                wf_model.fit(X_train_wf, y_train_wf, sample_weight=w_train_wf, verbose=False)
 
             # Predict on unseen segment
             preds = wf_model.predict(X_test_wf)
@@ -1168,12 +1212,15 @@ class TrainingPipeline:
                 i += hold_bars
 
             all_wf_trades.extend(split_trades)
+            best_iteration = getattr(wf_model, 'best_iteration', None) if use_early_stopping else None
             split_results.append({
                 "split": split_idx,
                 "train_size": len(X_train_wf),
                 "test_size": len(X_test_wf),
                 "accuracy": accuracy,
                 "n_trades": len(split_trades),
+                "best_iteration": best_iteration,
+                "early_stopping_used": use_early_stopping,
             })
 
         # Compute walk-forward metrics from all out-of-sample trades

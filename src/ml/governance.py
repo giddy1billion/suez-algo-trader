@@ -268,10 +268,24 @@ class ModelGovernance:
         Raises:
             GovernanceViolation: If the model fails validation and
                 ``skip_validation`` is False.
+            GovernanceViolation: If lineage integrity verification fails
+                (tampered records detected).
         """
         if skip_validation:
             raise GovernanceViolation(
                 "Validation bypass is disabled: deployment requires passing all governance gates"
+            )
+
+        # ── Integrity gate (fail closed) ──────────────────────────
+        integrity_ok, integrity_issues = self.verify_integrity()
+        if not integrity_ok:
+            logger.warning(
+                "governance.deploy_blocked_integrity",
+                version=version,
+                issues=integrity_issues,
+            )
+            raise GovernanceViolation(
+                f"Lineage integrity check failed: {integrity_issues}"
             )
 
         # ── Mandatory validation gate ──────────────────────────────
@@ -406,14 +420,14 @@ class ModelGovernance:
                 error=str(e),
                 msg="Using hardcoded default thresholds — verify config/settings.py is accessible",
             )
-            min_cv_accuracy = 0.52
-            min_walk_forward_sharpe = 0.0
-            min_monte_carlo_prob_profit = 0.50
+            min_cv_accuracy = 0.62
+            min_walk_forward_sharpe = 0.3
+            min_monte_carlo_prob_profit = 0.65
             min_sharpe_ratio = 0.5
             max_drawdown_pct = 0.20
             min_expectancy = 0.0
             min_precision = 0.50
-            min_backtest_trades = 30
+            min_backtest_trades = 50
 
         issues = []
         checks = []
@@ -691,7 +705,7 @@ class ModelGovernance:
         
         Checks:
         - All records have required fields (version, training_timestamp)
-        - No deployed record has been tampered with (integrity hash matches)
+        - Any record with an integrity_hash has not been tampered with
         
         Returns (is_valid, list_of_issues).
         """
@@ -708,8 +722,8 @@ class ModelGovernance:
             if not entry.get("training_timestamp"):
                 issues.append(f"Record {version} missing 'training_timestamp'")
 
-            # Check integrity hash for deployed records
-            if entry.get("deployed_at") and entry.get("integrity_hash"):
+            # Check integrity hash for any record that has one
+            if entry.get("integrity_hash"):
                 expected_hash = self._compute_integrity_hash(entry)
                 if entry["integrity_hash"] != expected_hash:
                     issues.append(

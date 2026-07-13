@@ -513,10 +513,21 @@ async def cmd_buy(message: Message):
         return
 
     symbol = parts[1].upper()
+    # Validate symbol format
+    if not symbol or len(symbol) > 10 or not all(c.isalnum() or c == '/' for c in symbol):
+        await message.answer("❌ Invalid symbol format. Use 1-10 alphanumeric chars (e.g. AAPL, BTC/USD).")
+        return
+
     try:
         qty = float(parts[2])
     except ValueError:
         await message.answer("Invalid quantity.")
+        return
+
+    # Validate quantity
+    import math
+    if math.isnan(qty) or math.isinf(qty) or qty <= 0:
+        await message.answer("❌ Quantity must be a positive number.")
         return
 
     # Confirmation keyboard
@@ -546,10 +557,21 @@ async def cmd_sell(message: Message):
         return
 
     symbol = parts[1].upper()
+    # Validate symbol format
+    if not symbol or len(symbol) > 10 or not all(c.isalnum() or c == '/' for c in symbol):
+        await message.answer("❌ Invalid symbol format. Use 1-10 alphanumeric chars (e.g. AAPL, BTC/USD).")
+        return
+
     try:
         qty = float(parts[2])
     except ValueError:
         await message.answer("Invalid quantity.")
+        return
+
+    # Validate quantity
+    import math
+    if math.isnan(qty) or math.isinf(qty) or qty <= 0:
+        await message.answer("❌ Quantity must be a positive number.")
         return
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -3088,14 +3110,37 @@ async def callback_confirm_buy(callback: CallbackQuery):
         return
 
     try:
+        from src.risk.protective_exits import ProtectiveExits
+        # Get current price for SL/TP computation
         with _broker_lock:
-            order = _broker.market_order(symbol, qty, "buy")
-        if order.get("error"):
-            await callback.message.edit_text(f"❌ Order failed: {order.get('message', 'Unknown error')}")
+            # Attempt to get a price reference for bracket computation
+            try:
+                bars = _broker.get_bars_df(symbol, "1Day", limit=1)
+                entry_price = float(bars['close'].iloc[-1]) if bars is not None and len(bars) > 0 else 0.0
+            except Exception:
+                entry_price = 0.0
+
+            if entry_price > 0:
+                exits = ProtectiveExits()
+                levels = exits.compute(entry_price=entry_price, side="buy")
+                order = _broker.bracket_order(
+                    symbol=symbol, qty=qty, side="buy",
+                    stop_loss_price=levels.stop_loss,
+                    take_profit_price=levels.take_profit,
+                )
+            else:
+                # Fallback: plain market order if price unavailable
+                order = _broker.market_order(symbol, qty, "buy")
+
+        if not order or order.get("error"):
+            error_msg = order.get("message", "Unknown error") if order else "No response"
+            await callback.message.edit_text(f"❌ BUY order failed: {error_msg}")
         else:
-            order_id = order.get("id", "UNKNOWN")
+            order_id = order.get('id', 'unknown')
+            sl_msg = f"\nSL: ${levels.stop_loss:.2f} | TP: ${levels.take_profit:.2f}" if entry_price > 0 else ""
             await callback.message.edit_text(
-                f"✅ BUY order placed: {symbol} x {qty}\nOrder ID: {order_id[:8]}..."
+                f"✅ BUY bracket order placed: {symbol} x {qty}{sl_msg}\n"
+                f"Order ID: {order_id[:8]}..."
             )
     except Exception as e:
         await callback.message.edit_text(f"❌ Order failed: {e}")
@@ -3119,14 +3164,34 @@ async def callback_confirm_sell(callback: CallbackQuery):
         return
 
     try:
+        from src.risk.protective_exits import ProtectiveExits
         with _broker_lock:
-            order = _broker.market_order(symbol, qty, "sell")
-        if order.get("error"):
-            await callback.message.edit_text(f"❌ Order failed: {order.get('message', 'Unknown error')}")
+            try:
+                bars = _broker.get_bars_df(symbol, "1Day", limit=1)
+                entry_price = float(bars['close'].iloc[-1]) if bars is not None and len(bars) > 0 else 0.0
+            except Exception:
+                entry_price = 0.0
+
+            if entry_price > 0:
+                exits = ProtectiveExits()
+                levels = exits.compute(entry_price=entry_price, side="sell")
+                order = _broker.bracket_order(
+                    symbol=symbol, qty=qty, side="sell",
+                    stop_loss_price=levels.stop_loss,
+                    take_profit_price=levels.take_profit,
+                )
+            else:
+                order = _broker.market_order(symbol, qty, "sell")
+
+        if not order or order.get("error"):
+            error_msg = order.get("message", "Unknown error") if order else "No response"
+            await callback.message.edit_text(f"❌ SELL order failed: {error_msg}")
         else:
-            order_id = order.get("id", "UNKNOWN")
+            order_id = order.get('id', 'unknown')
+            sl_msg = f"\nSL: ${levels.stop_loss:.2f} | TP: ${levels.take_profit:.2f}" if entry_price > 0 else ""
             await callback.message.edit_text(
-                f"✅ SELL order placed: {symbol} x {qty}\nOrder ID: {order_id[:8]}..."
+                f"✅ SELL bracket order placed: {symbol} x {qty}{sl_msg}\n"
+                f"Order ID: {order_id[:8]}..."
             )
     except Exception as e:
         await callback.message.edit_text(f"❌ Order failed: {e}")

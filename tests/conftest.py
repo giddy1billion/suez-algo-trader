@@ -1,8 +1,33 @@
 """Shared test fixtures for algo-trader test suite."""
+import os
+
+# Set SUEZ_ENV=test BEFORE any application imports to ensure test isolation.
+os.environ.setdefault("SUEZ_ENV", "test")
+
 import pytest
 import pandas as pd
 import numpy as np
 from datetime import datetime, timezone, timedelta
+
+
+@pytest.fixture(autouse=True)
+def _isolate_test_environment(tmp_path, monkeypatch):
+    """Autouse fixture ensuring every test gets isolated storage paths.
+
+    This guarantees:
+    - SUEZ_ENV is always 'test' during the test session
+    - Default database and storage paths point to a per-test temp directory
+    - No test can accidentally read/write production data_cache
+    """
+    monkeypatch.setenv("SUEZ_ENV", "test")
+
+    # Provide isolated paths for any code that reads these env vars directly
+    test_data_dir = str(tmp_path / "data_cache_test")
+    os.makedirs(test_data_dir, exist_ok=True)
+
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{test_data_dir}/trading.db")
+    monkeypatch.setenv("CORRELATION_STORE_DB_PATH", f"{test_data_dir}/correlation_store.db")
+    monkeypatch.setenv("PREDICTION_REGISTRY_STORAGE_PATH", f"{test_data_dir}/predictions")
 
 
 @pytest.fixture
