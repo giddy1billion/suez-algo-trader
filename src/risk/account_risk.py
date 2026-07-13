@@ -35,6 +35,7 @@ class AccountRiskLayer:
         max_daily_loss_pct: float = 0.03,
         max_weekly_loss_pct: float = 0.07,
         max_drawdown_pct: float = 0.15,
+        kill_switch_drawdown_pct: float = 0.25,
         min_cash_reserve_pct: float = 0.20,
         max_day_trades_5d: int = 3,
         pdt_account_threshold: float = 25_000.0,
@@ -45,6 +46,7 @@ class AccountRiskLayer:
         self.max_daily_loss_pct = max_daily_loss_pct
         self.max_weekly_loss_pct = max_weekly_loss_pct
         self.max_drawdown_pct = max_drawdown_pct
+        self.kill_switch_drawdown_pct = kill_switch_drawdown_pct
         self.min_cash_reserve_pct = min_cash_reserve_pct
         self.max_day_trades_5d = max_day_trades_5d
         self.pdt_account_threshold = pdt_account_threshold
@@ -64,6 +66,8 @@ class AccountRiskLayer:
         self._day_trades: deque = deque(maxlen=100)  # (date, was_day_trade) pairs
         self._is_halted: bool = False
         self._halt_reason: str = ""
+        self._kill_switch_active: bool = False
+        self._kill_switch_reason: str = ""
 
     # ──────────────────────────────────────────────────────────────────────
     # State Management
@@ -113,8 +117,16 @@ class AccountRiskLayer:
             self._peak_equity = account_value
 
     def reset_halt(self) -> None:
-        """Manually reset a halt condition (e.g., next trading day)."""
+        """Manually reset a halt condition (e.g., next trading day).
+        
+        NOTE: This does NOT reset the kill switch. The kill switch can only
+        be reset via explicit `reset_kill_switch()` call (requires manual intervention).
+        """
         with self._lock:
+            if self._kill_switch_active:
+                logger.warning("account_risk.halt_reset_blocked_by_kill_switch",
+                              reason=self._kill_switch_reason)
+                return
             self._is_halted = False
             self._halt_reason = ""
             logger.info("account_risk.halt_reset")
@@ -126,6 +138,30 @@ class AccountRiskLayer:
     @property
     def halt_reason(self) -> str:
         return self._halt_reason
+
+    @property
+    def kill_switch_active(self) -> bool:
+        """True if the extreme drawdown kill switch has been triggered."""
+        return self._kill_switch_active
+
+    @property
+    def kill_switch_reason(self) -> str:
+        """Reason the kill switch was triggered."""
+        return self._kill_switch_reason
+
+    def reset_kill_switch(self) -> None:
+        """
+        Explicitly reset the kill switch after manual review.
+        
+        This should only be called after a human has reviewed the extreme
+        drawdown event and determined it is safe to resume trading.
+        """
+        with self._lock:
+            self._kill_switch_active = False
+            self._kill_switch_reason = ""
+            self._is_halted = False
+            self._halt_reason = ""
+            logger.warning("account_risk.kill_switch_reset_manual")
 
     # ──────────────────────────────────────────────────────────────────────
     # Evaluation
@@ -178,6 +214,39 @@ class AccountRiskLayer:
                 reason=f"Account halted: {self._halt_reason}",
             )
 
+        # 0. Kill switch check (highest priority — checked before all other limits)
+        equity = getattr(self, "_current_equity", portfolio_value)
+        if self._peak_equity == 0.0 and equity > 0:
+            self._peak_equity = equity
+        if self._peak_equity > 0:
+            drawdown = (self._peak_equity - equity) / self._peak_equity
+            if drawdown >= self.kill_switch_drawdown_pct:
+                self._kill_switch_active = True
+                self._kill_switch_reason = (
+                    f"KILL SWITCH: Extreme drawdown {drawdown:.1%} from peak "
+                    f"(threshold: {self.kill_switch_drawdown_pct:.1%})"
+                )
+                self._is_halted = True
+                self._halt_reason = self._kill_switch_reason
+                logger.critical(
+                    "account_risk.kill_switch_triggered",
+                    drawdown=f"{drawdown:.1%}",
+                    threshold=f"{self.kill_switch_drawdown_pct:.1%}",
+                    peak_equity=self._peak_equity,
+                    current_equity=equity,
+                )
+                return LayerDecision(
+                    layer_name="account_risk",
+                    action=RiskAction.REJECT,
+                    reason=self._halt_reason,
+                    metadata={
+                        "kill_switch": True,
+                        "drawdown": drawdown,
+                        "peak_equity": self._peak_equity,
+                        "current_equity": equity,
+                    },
+                )
+
         # 1. Daily loss limit
         if portfolio_value > 0:
             daily_loss_pct = -self._daily_pnl / portfolio_value if self._daily_pnl < 0 else 0.0
@@ -204,10 +273,7 @@ class AccountRiskLayer:
                     reason=self._halt_reason,
                 )
 
-        # 3. Max drawdown from peak
-        equity = getattr(self, "_current_equity", portfolio_value)
-        if self._peak_equity == 0.0 and equity > 0:
-            self._peak_equity = equity
+        # 3. Max drawdown from peak (standard threshold — kill switch already checked above)
         if self._peak_equity > 0:
             drawdown = (self._peak_equity - equity) / self._peak_equity
             if drawdown >= self.max_drawdown_pct:

@@ -1013,7 +1013,7 @@ class ExecutionEngine:
                         ),
                     })
                 except Exception as e:
-                    logger.debug("journal.log_entry_error", error=str(e))
+                    logger.warning("journal.log_entry_error", error=str(e), symbol=signal.symbol)
 
             logger.info("engine.order_placed",
                        symbol=signal.symbol, side=side, qty=final_qty,
@@ -1136,18 +1136,36 @@ class ExecutionEngine:
                         journal = _get_journal(self.db)
                         if journal:
                             try:
-                                entries = journal.get_journal(symbol=symbol, limit=20)
-                                open_entries = [e for e in entries if e.get("exit_price") is None]
-                                if open_entries:
-                                    target = open_entries[-1]
+                                target = None
+                                # Prefer precise match by trade_id over heuristic
+                                if trade_id:
+                                    entries = journal.get_journal(symbol=symbol, limit=50)
+                                    target = next(
+                                        (e for e in entries
+                                         if e.get("trade_id") == trade_id and e.get("exit_price") is None),
+                                        None,
+                                    )
+                                # Fallback: oldest open entry for this symbol
+                                if target is None:
+                                    entries = journal.get_journal(symbol=symbol, limit=50)
+                                    open_entries = [e for e in entries if e.get("exit_price") is None]
+                                    if open_entries:
+                                        target = open_entries[-1]
+                                if target:
                                     journal.log_exit(target["id"], {
                                         "exit_price": current_price,
                                         "exit_reason": exit_signal.reason[:50] if exit_signal.reason else "strategy_exit",
                                         "pnl": pnl,
                                         "pnl_pct": pnl_pct,
                                     })
+                                else:
+                                    logger.warning(
+                                        "journal.exit_no_matching_entry",
+                                        symbol=symbol,
+                                        trade_id=trade_id,
+                                    )
                             except Exception as e:
-                                logger.debug("journal.log_exit_error", error=str(e))
+                                logger.warning("journal.log_exit_error", error=str(e), symbol=symbol)
                     except Exception as e:
                         logger.error("engine.exit_failed", symbol=symbol, error=str(e))
                 else:

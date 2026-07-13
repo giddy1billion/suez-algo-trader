@@ -290,6 +290,15 @@ class RiskEngine:
         """Get halt reason if trading is halted."""
         return self.account_layer.halt_reason
 
+    @property
+    def kill_switch_active(self) -> bool:
+        """Check if the extreme drawdown kill switch is active."""
+        return self.account_layer.kill_switch_active
+
+    def reset_kill_switch(self) -> None:
+        """Reset the kill switch after manual review."""
+        self.account_layer.reset_kill_switch()
+
     # ──────────────────────────────────────────────────────────────────────
     # Internal
     # ──────────────────────────────────────────────────────────────────────
