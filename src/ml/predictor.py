@@ -301,8 +301,19 @@ class ModelPredictor:
         return proba, lineage
 
     def _get_git_commit(self) -> str:
-        """Get current git commit hash (cached)."""
+        """Get current git commit hash (cached).
+
+        Uses build_info first, then falls back to git CLI.
+        """
         if not hasattr(self, '_cached_git_commit'):
+            # Try build-time metadata first
+            try:
+                from src.ml.build_info import GIT_COMMIT as _build_commit
+                if _build_commit:
+                    self._cached_git_commit = _build_commit[:7]
+                    return self._cached_git_commit
+            except (ImportError, AttributeError):
+                pass
             try:
                 import subprocess
                 self._cached_git_commit = subprocess.check_output(

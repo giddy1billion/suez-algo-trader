@@ -511,10 +511,19 @@ class ModelGovernance:
         """Get current git commit hash.
 
         Resolution order:
-        1. GIT_COMMIT / SOURCE_VERSION environment variable (set by CI/Docker)
-        2. git rev-parse HEAD (tried from multiple directories)
-        3. .git_commit file (embedded at Docker build time)
+        1. Build-time metadata (src/ml/build_info.py, stamped by CI)
+        2. GIT_COMMIT / SOURCE_VERSION / GITHUB_SHA environment variable
+        3. git rev-parse HEAD (tried from multiple directories)
+        4. .git_commit file (embedded at Docker build time)
         """
+        # Priority 0: Build-time injected metadata (most reliable)
+        try:
+            from src.ml.build_info import GIT_COMMIT as _build_commit
+            if _build_commit:
+                return _build_commit
+        except (ImportError, AttributeError):
+            pass
+
         # Priority 1: Environment variables (most reliable in CI/Docker)
         for env_var in ("GIT_COMMIT", "SOURCE_VERSION", "GITHUB_SHA"):
             commit = os.environ.get(env_var, "").strip()
