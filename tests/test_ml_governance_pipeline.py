@@ -122,11 +122,23 @@ class TestCommitMetadata:
         commit = governance._get_git_commit()
         assert commit == _TEST_COMMIT
 
-    def test_env_vars_are_not_used(self, governance):
-        """Environment variables are no longer used for runtime commit resolution."""
+    def test_env_vars_are_used_as_fallback(self, governance):
+        """Environment variables are used as fallback when build_info is empty."""
         with patch("src.ml.build_info.GIT_COMMIT", ""):
-            with patch.dict(os.environ, {"GIT_COMMIT": "should_not_use"}):
+            with patch.dict(os.environ, {"GIT_COMMIT": "env_commit_hash"}, clear=False):
                 commit = governance._get_git_commit()
+        assert commit == "env_commit_hash"
+
+    def test_all_sources_empty_returns_empty(self, governance):
+        """Returns empty when build_info and all env vars are empty."""
+        with patch("src.ml.build_info.GIT_COMMIT", ""):
+            with patch.dict(os.environ, {
+                "GIT_COMMIT": "",
+                "SOURCE_VERSION": "",
+                "GITHUB_SHA": "",
+            }, clear=False):
+                with patch("builtins.open", side_effect=OSError("no file")):
+                    commit = governance._get_git_commit()
         assert commit == ""
 
     def test_record_training_includes_commit(self, governance):

@@ -1,17 +1,18 @@
 """
 Comprehensive tests for model-provenance commit-resolution path.
 
-After the provenance audit, ALL runtime commit resolution flows through
-the centralized ``src/ml/provenance`` module which reads exclusively from
-``src/ml/build_info.py``.  Legacy fallbacks (env vars, git CLI,
-.git_commit file) have been removed from runtime code — they remain only
-in the build-time injection script (scripts/inject_build_info.py).
+The ``src/ml/provenance`` module provides centralized commit resolution with
+the following precedence:
+  1. ``src/ml/build_info.py`` constants (injected at Docker/CI build time)
+  2. Environment variables: GIT_COMMIT, SOURCE_VERSION, GITHUB_SHA
+  3. ``.git_commit`` file in the project root
 
 Tests cover:
-  1. build_info.py as the single source of truth
-  2. Strict mode raising when not stamped
-  3. inject_build_info.py script stamping at build time
-  4. Integration with governance and predictor
+  1. build_info.py as highest-priority source
+  2. Environment variable fallback chain
+  3. Strict mode raising when no source provides a hash
+  4. inject_build_info.py script stamping at build time
+  5. Integration with governance and predictor
 """
 
 import os
@@ -54,7 +55,7 @@ def clean_env():
 
 
 class TestProvenancePrecedence:
-    """Verify that build_info.GIT_COMMIT is the sole runtime source."""
+    """Verify provenance resolution precedence: build_info > env vars > .git_commit file."""
 
     def test_build_info_is_sole_source(self, governance):
         """build_info.GIT_COMMIT is returned by _get_git_commit."""
@@ -62,29 +63,42 @@ class TestProvenancePrecedence:
             commit = governance._get_git_commit()
         assert commit == "build_injected_sha256"
 
-    def test_env_vars_are_not_used_at_runtime(self, governance):
-        """Environment variables are ignored — only build_info matters."""
-        with patch("src.ml.build_info.GIT_COMMIT", ""):
-            with patch.dict(os.environ, {"GIT_COMMIT": "ci_commit_hash"}):
+    def test_build_info_takes_precedence_over_env(self, governance):
+        """build_info.GIT_COMMIT wins even when env vars are set."""
+        with patch("src.ml.build_info.GIT_COMMIT", "build_info_value"):
+            with patch.dict(os.environ, {"GIT_COMMIT": "env_value"}):
                 commit = governance._get_git_commit()
-        # Env var is NOT used — returns empty when build_info is empty
-        assert commit == ""
+        assert commit == "build_info_value"
 
-    def test_empty_build_info_returns_empty(self, governance):
-        """When build_info not stamped, returns empty (no legacy fallback)."""
+    def test_env_vars_used_when_build_info_empty(self, governance):
+        """Environment variables are used as fallback when build_info is empty."""
+        with patch("src.ml.build_info.GIT_COMMIT", ""):
+            with patch.dict(os.environ, {"GIT_COMMIT": "ci_commit_hash"}, clear=False):
+                commit = governance._get_git_commit()
+        assert commit == "ci_commit_hash"
+
+    def test_env_var_precedence_order(self, governance):
+        """GIT_COMMIT env var takes precedence over SOURCE_VERSION and GITHUB_SHA."""
         with patch("src.ml.build_info.GIT_COMMIT", ""):
             with patch.dict(os.environ, {
-                "GIT_COMMIT": "should_not_use",
-                "SOURCE_VERSION": "should_not_use",
-                "GITHUB_SHA": "should_not_use",
-            }):
+                "GIT_COMMIT": "git_commit_val",
+                "SOURCE_VERSION": "source_version_val",
+                "GITHUB_SHA": "github_sha_val",
+            }, clear=False):
                 commit = governance._get_git_commit()
-        assert commit == ""
+        assert commit == "git_commit_val"
 
     def test_all_sources_fail_returns_empty(self, governance):
-        """Returns empty string when build_info is not stamped."""
+        """Returns empty string when all sources are empty."""
         with patch("src.ml.build_info.GIT_COMMIT", ""):
-            commit = governance._get_git_commit()
+            with patch.dict(os.environ, {
+                "GIT_COMMIT": "",
+                "SOURCE_VERSION": "",
+                "GITHUB_SHA": "",
+            }, clear=False):
+                # Also ensure no .git_commit file interferes
+                with patch("builtins.open", side_effect=OSError("no file")):
+                    commit = governance._get_git_commit()
         assert commit == ""
         assert isinstance(commit, str)
 
@@ -104,17 +118,29 @@ class TestProvenanceModule:
             assert get_commit_hash() == "abc123full"
 
     def test_get_commit_hash_strict_raises(self):
-        """Strict mode raises ProvenanceError when not stamped."""
+        """Strict mode raises ProvenanceError when all sources are empty."""
         from src.ml.provenance import ProvenanceError, get_commit_hash
         with patch("src.ml.build_info.GIT_COMMIT", ""):
-            with pytest.raises(ProvenanceError):
-                get_commit_hash(strict=True)
+            with patch.dict(os.environ, {
+                "GIT_COMMIT": "",
+                "SOURCE_VERSION": "",
+                "GITHUB_SHA": "",
+            }, clear=False):
+                with patch("builtins.open", side_effect=OSError("no file")):
+                    with pytest.raises(ProvenanceError):
+                        get_commit_hash(strict=True)
 
     def test_get_commit_hash_non_strict_returns_empty(self):
-        """Non-strict returns empty when not stamped."""
+        """Non-strict returns empty when all sources are empty."""
         from src.ml.provenance import get_commit_hash
         with patch("src.ml.build_info.GIT_COMMIT", ""):
-            assert get_commit_hash() == ""
+            with patch.dict(os.environ, {
+                "GIT_COMMIT": "",
+                "SOURCE_VERSION": "",
+                "GITHUB_SHA": "",
+            }, clear=False):
+                with patch("builtins.open", side_effect=OSError("no file")):
+                    assert get_commit_hash() == ""
 
     def test_get_short_commit(self):
         """get_short_commit truncates to requested length."""
@@ -142,7 +168,7 @@ class TestProvenanceModule:
 
 
 class TestNoLegacyFallbacks:
-    """Verify that legacy resolution paths (git CLI, env vars, .git_commit) are removed."""
+    """Verify that git CLI subprocess calls are not used for commit resolution."""
 
     def test_no_subprocess_calls_in_commit_resolution(self, governance):
         """_get_git_commit never invokes subprocess."""
@@ -155,21 +181,26 @@ class TestNoLegacyFallbacks:
     def test_no_subprocess_when_empty(self, governance):
         """Even when build_info is empty, no subprocess call is made."""
         with patch("src.ml.build_info.GIT_COMMIT", ""):
-            with patch("subprocess.run") as mock_run:
-                commit = governance._get_git_commit()
+            with patch.dict(os.environ, {
+                "GIT_COMMIT": "",
+                "SOURCE_VERSION": "",
+                "GITHUB_SHA": "",
+            }, clear=False):
+                with patch("subprocess.run") as mock_run:
+                    with patch("builtins.open", side_effect=OSError("no file")):
+                        commit = governance._get_git_commit()
         mock_run.assert_not_called()
         assert commit == ""
 
-    def test_no_git_commit_file_access(self, governance, tmp_path):
-        """No .git_commit file is accessed at runtime."""
+    def test_no_git_commit_file_access_when_env_set(self, governance, tmp_path):
+        """When env var provides commit, .git_commit file is not needed."""
         commit_file = tmp_path / ".git_commit"
         commit_file.write_text("should_not_be_read\n")
 
         with patch("src.ml.build_info.GIT_COMMIT", ""):
-            commit = governance._get_git_commit()
-        # The .git_commit file content is never returned
-        assert commit != "should_not_be_read"
-        assert commit == ""
+            with patch.dict(os.environ, {"GIT_COMMIT": "from_env"}, clear=False):
+                commit = governance._get_git_commit()
+        assert commit == "from_env"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -188,9 +219,15 @@ class TestBuildInfoModule:
         assert isinstance(build_info.BUILD_TIMESTAMP, str)
 
     def test_build_info_empty_returns_empty_from_governance(self, governance):
-        """If build_info is empty, governance returns empty (no fallback)."""
+        """If build_info and all fallbacks are empty, governance returns empty."""
         with patch("src.ml.build_info.GIT_COMMIT", ""):
-            commit = governance._get_git_commit()
+            with patch.dict(os.environ, {
+                "GIT_COMMIT": "",
+                "SOURCE_VERSION": "",
+                "GITHUB_SHA": "",
+            }, clear=False):
+                with patch("builtins.open", side_effect=OSError("no file")):
+                    commit = governance._get_git_commit()
         assert commit == ""
 
 
@@ -354,14 +391,20 @@ class TestPredictorCommitResolution:
         assert result == "abcdef1"  # First 7 chars
 
     def test_predictor_returns_empty_without_build_info(self):
-        """Predictor returns empty when build_info is not stamped (no git fallback)."""
+        """Predictor returns empty when build_info and all fallbacks are empty."""
         from src.ml.predictor import ModelPredictor
         predictor = ModelPredictor.__new__(ModelPredictor)
         # Clear cached value
         if hasattr(predictor, '_cached_git_commit'):
             del predictor._cached_git_commit
         with patch("src.ml.build_info.GIT_COMMIT", ""):
-            result = predictor._get_git_commit()
+            with patch.dict(os.environ, {
+                "GIT_COMMIT": "",
+                "SOURCE_VERSION": "",
+                "GITHUB_SHA": "",
+            }, clear=False):
+                with patch("builtins.open", side_effect=OSError("no file")):
+                    result = predictor._get_git_commit()
         assert result == ""
 
     def test_predictor_no_subprocess_call(self):

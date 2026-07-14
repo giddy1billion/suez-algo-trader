@@ -20,6 +20,8 @@ Usage:
 
 from __future__ import annotations
 
+import os
+
 import src.ml.build_info as _build_info
 
 
@@ -28,21 +30,50 @@ class ProvenanceError(Exception):
 
 
 def get_commit_hash(*, strict: bool = False) -> str:
-    """Return the build-time injected commit hash.
+    """Return the commit hash from build-time metadata or environment.
+
+    Resolution order:
+    1. ``build_info.GIT_COMMIT`` (injected at Docker/CI build time)
+    2. ``GIT_COMMIT`` environment variable
+    3. ``SOURCE_VERSION`` environment variable (Azure)
+    4. ``GITHUB_SHA`` environment variable (GitHub Actions)
+    5. ``.git_commit`` file in the project root
 
     Args:
-        strict: If True, raise ProvenanceError when build_info is empty
-                (i.e. the artifact was not properly stamped).
+        strict: If True, raise ProvenanceError when no source provides
+                a commit hash.
 
     Returns:
-        Full commit SHA string, or "" if not stamped and strict=False.
+        Full commit SHA string, or "" if not available and strict=False.
     """
     commit = _build_info.GIT_COMMIT
     if commit:
         return commit
+
+    # Fallback to environment variables (CI / local dev)
+    for var in ("GIT_COMMIT", "SOURCE_VERSION", "GITHUB_SHA"):
+        val = os.environ.get(var, "").strip()
+        if val:
+            return val
+
+    # Fallback to .git_commit file in project root
+    _project_root = os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)
+    )))
+    _commit_file = os.path.join(_project_root, ".git_commit")
+    try:
+        if os.path.isfile(_commit_file):
+            with open(_commit_file) as fh:
+                val = fh.read().strip()
+                if val:
+                    return val
+    except OSError:
+        pass
+
     if strict:
         raise ProvenanceError(
-            "Build-time commit hash not found in build_info.py. "
+            "Commit hash not found in build_info.py, environment variables "
+            "(GIT_COMMIT, SOURCE_VERSION, GITHUB_SHA), or .git_commit file. "
             "Ensure scripts/inject_build_info.py ran during the build."
         )
     return ""

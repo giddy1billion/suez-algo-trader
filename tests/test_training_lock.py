@@ -211,9 +211,9 @@ class TestGitCommitInGovernance:
         monkeypatch.delenv("GITHUB_SHA", raising=False)
 
         # Create the .git_commit file in the project root
-        project_root = os.path.dirname(os.path.dirname(os.path.dirname(
+        project_root = os.path.dirname(os.path.dirname(
             os.path.abspath(__file__)
-        )))
+        ))
         commit_file = os.path.join(project_root, ".git_commit")
         test_hash = "feedbeef12345678feedbeef12345678feedbeef"
         existed = os.path.exists(commit_file)
