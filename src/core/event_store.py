@@ -134,6 +134,11 @@ class EventStore:
         # For PostgreSQL, schema is managed by Alembic migrations (bootstrap_database).
         if not url.startswith("postgresql"):
             EventBase.metadata.create_all(self._engine)
+            # P1-08: Enable WAL mode and synchronous=FULL for crash safety
+            with self._engine.connect() as conn:
+                conn.execute(text("PRAGMA journal_mode=WAL"))
+                conn.execute(text("PRAGMA synchronous=FULL"))
+                conn.commit()
         self._session_factory = sessionmaker(bind=self._engine)
 
         logger.info("EventStore initialized", session_id=self.session_id)
@@ -163,7 +168,8 @@ class EventStore:
             )
 
             with self._lock:
-                with self._get_session() as session:
+                session = self._get_session()
+                try:
                     dialect = session.bind.dialect.name if session.bind else "sqlite"
                     if dialect == "postgresql":
                         from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -186,6 +192,11 @@ class EventStore:
                             return
                         session.add(record)
                         session.commit()
+                except Exception:
+                    session.rollback()
+                    raise
+                finally:
+                    session.close()
         except Exception:
             logger.exception("Failed to persist event %s", type(event).__name__)
             raise
@@ -258,11 +269,18 @@ class EventStore:
         cutoff = datetime.now(timezone.utc) - timedelta(days=days)
         cutoff_str = cutoff.isoformat()
         with self._lock:
-            with self._get_session() as session:
+            session = self._get_session()
+            try:
                 session.query(EventRecord).filter(
                     EventRecord.timestamp < cutoff_str
                 ).delete(synchronize_session=False)
                 session.commit()
+            except Exception:
+                session.rollback()
+                logger.exception("Failed to cleanup old events")
+                raise
+            finally:
+                session.close()
         logger.info("Cleaned up events older than %d days", days)
 
     def list_sessions(self, limit: int = 20) -> List[dict]:

@@ -156,23 +156,25 @@ def set_components(broker, engine, risk_manager, strategy, db=None, authorized_c
     global _broker, _engine, _risk_manager, _strategy, _db, _authorized_users
     global _health_monitor, _live_metrics, _scheduler, _event_bus, _trade_manager
     global _reconciler, _ops_handler, _runtime_state
-    _broker = broker
-    _engine = engine
-    _risk_manager = risk_manager
-    _strategy = strategy
-    _db = db
-    if authorized_chat_ids:
-        _authorized_users = set(authorized_chat_ids)
-    if health_monitor:
-        _health_monitor = health_monitor
-    if live_metrics:
-        _live_metrics = live_metrics
-    if scheduler:
-        _scheduler = scheduler
-    if event_bus:
-        _event_bus = event_bus
-    if trade_manager:
-        _trade_manager = trade_manager
+    # P2-15: Protect global state mutation with broker lock
+    with _broker_lock:
+        _broker = broker
+        _engine = engine
+        _risk_manager = risk_manager
+        _strategy = strategy
+        _db = db
+        if authorized_chat_ids:
+            _authorized_users = set(authorized_chat_ids)
+        if health_monitor:
+            _health_monitor = health_monitor
+        if live_metrics:
+            _live_metrics = live_metrics
+        if scheduler:
+            _scheduler = scheduler
+        if event_bus:
+            _event_bus = event_bus
+        if trade_manager:
+            _trade_manager = trade_manager
     if reconciler:
         _reconciler = reconciler
     if ops_handler:
@@ -195,6 +197,27 @@ def _is_authorized(message: Message) -> bool:
         logger.warning("telegram.unauthorized_attempt", user_id=message.from_user.id, username=getattr(message.from_user, 'username', 'unknown'))
         return False
     return message.from_user.id in _authorized_users
+
+
+def require_auth(handler):
+    """P2-16: Decorator that rejects unauthorized users before handler execution.
+
+    Provides a hardened auth gate at the decorator level so that even if
+    the in-body _is_authorized() check is accidentally removed, unauthorized
+    users are still blocked.
+    """
+    from functools import wraps
+
+    @wraps(handler)
+    async def wrapper(message: Message, *args, **kwargs):
+        if not message.from_user:
+            logger.warning("telegram.no_user_in_message")
+            return
+        if not _is_authorized(message):
+            await message.answer("⛔ Unauthorized. Use /auth <PIN> to authenticate.")
+            return
+        return await handler(message, *args, **kwargs)
+    return wrapper
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -1087,6 +1110,11 @@ async def cmd_set(message: Message):
     old_value = getattr(settings, field_name, "?")
 
     # Apply to settings object directly (in-memory)
+    # P1-03: Additional safety - only allow setting known settings attributes
+    _ALLOWED_SETTINGS_FIELDS = {spec.get("field", p) for p, spec in SETTABLE_PARAMS.items()}
+    if field_name not in _ALLOWED_SETTINGS_FIELDS:
+        await message.answer(f"Security: field '{field_name}' not in allowed settings whitelist.")
+        return
     try:
         setattr(settings, field_name, value)
     except Exception as e:

@@ -710,8 +710,16 @@ class ExecutionEngine:
         try:
             account = self.broker.get_account()
             cash = account.get('cash', 0.0)
-        except Exception:
-            cash = portfolio_value * 0.5
+        except Exception as e:
+            logger.error("engine.account_cash_unavailable", error=str(e), symbol=signal.symbol)
+            self._publish(SignalRejected(
+                signal_id=signal.signal_id,
+                symbol=signal.symbol,
+                reason="Cannot determine account cash — halting trade for safety",
+                stage="account_query",
+                source="engine",
+            ))
+            return None
 
         # Build market_data context for risk engine
         risk_market_data = {}
@@ -843,6 +851,30 @@ class ExecutionEngine:
         if trade_lifecycle:
             trade_lifecycle.transition(TradeState.SUBMITTED, "order submitted to broker")
 
+        # P1-16: Final validation before broker submission - reject NaN/Inf
+        import math as _math
+        if not _math.isfinite(final_qty) or final_qty <= 0:
+            logger.error("engine.invalid_qty_before_submit", qty=final_qty, symbol=signal.symbol)
+            if trade_lifecycle:
+                trade_lifecycle.transition(TradeState.CANCELLED, f"invalid qty: {final_qty}")
+            return None
+        if not _math.isfinite(observed_price) or observed_price <= 0:
+            logger.error("engine.invalid_price_before_submit", price=observed_price, symbol=signal.symbol)
+            if trade_lifecycle:
+                trade_lifecycle.transition(TradeState.CANCELLED, f"invalid price: {observed_price}")
+            return None
+
+        # P2-14: Minimum order size enforcement
+        _is_crypto = "/" in signal.symbol
+        _min_order_size = 0.0001 if _is_crypto else 1.0
+        if final_qty < _min_order_size:
+            logger.warning("engine.below_min_order_size",
+                          symbol=signal.symbol, qty=final_qty, min_size=_min_order_size)
+            if trade_lifecycle:
+                trade_lifecycle.transition(TradeState.CANCELLED,
+                                          f"qty {final_qty} below minimum {_min_order_size}")
+            return None
+
         # Place the order — use contract SL/TP (system-determined) not strategy hints
         order_type = "bracket" if (final_stop_loss and final_take_profit) else "market"
         logger.info(
@@ -859,6 +891,32 @@ class ExecutionEngine:
             confidence=f"{effective_confidence:.3f}",
             contract_id=decision_contract.contract_id if decision_contract else "",
         )
+
+        # P0-04: Write intent record BEFORE broker submission to prevent data loss
+        # on crash between broker confirmation and DB write.
+        import uuid as _uuid
+        _intent_id = f"intent-{_uuid.uuid4().hex[:12]}"
+        try:
+            self.db.record_trade({
+                "symbol": signal.symbol,
+                "side": side,
+                "qty": final_qty,
+                "price": observed_price,
+                "order_type": order_type,
+                "status": "pending_submission",
+                "order_id": _intent_id,
+                "strategy": signal.strategy_id,
+                "signal_id": signal.signal_id,
+                "signal_strength": signal.signal_strength,
+                "stop_loss": final_stop_loss,
+                "take_profit": final_take_profit,
+                "contract_id": decision_contract.contract_id if decision_contract else None,
+                "contract_confidence": decision_contract.final_confidence if decision_contract else None,
+                "contract_decision": decision_contract.decision.value if decision_contract else None,
+            })
+        except Exception as e:
+            logger.error("engine.intent_record_failed", error=str(e), symbol=signal.symbol)
+
         try:
             if final_stop_loss and final_take_profit:
                 order = self.broker.bracket_order(
@@ -929,6 +987,9 @@ class ExecutionEngine:
                 if trade_lifecycle:
                     trade_lifecycle.transition(TradeState.FILLED, f"filled qty={final_qty}")
                     trade_lifecycle.transition(TradeState.ACTIVE, "position active")
+                    # P1-10: Set broker_qty after fill to prevent reconciliation false positives
+                    trade_lifecycle.metadata['broker_qty'] = final_qty
+                    trade_lifecycle.metadata['avg_fill_price'] = fill_price
 
                 self._publish(OrderFilled(
                     order_id=order.get("id", ""),
@@ -968,26 +1029,30 @@ class ExecutionEngine:
                     trade_lifecycle.metadata['expected_qty'] = final_qty
                 logger.info("engine.pending_fill", order_id=order.get("id", ""), qty=final_qty)
 
-            # Record trade to database (full audit trail)
-            self.db.record_trade({
-                "symbol": signal.symbol,
-                "side": side,
-                "qty": final_qty,
-                "price": observed_price,
-                "order_type": "bracket" if final_stop_loss else "market",
-                "status": order.get("status", "submitted"),
-                "order_id": order.get("id"),
-                "strategy": signal.strategy_id,
-                "signal_id": signal.signal_id,
-                "signal_strength": signal.signal_strength,
-                "stop_loss": final_stop_loss,
-                "take_profit": final_take_profit,
-                "sim_slippage_bps": sim_result.get("slippage_bps") if sim_result else None,
-                "sim_fees": fill_fees if sim_result else None,
-                "contract_id": decision_contract.contract_id if decision_contract else None,
-                "contract_confidence": decision_contract.final_confidence if decision_contract else None,
-                "contract_decision": decision_contract.decision.value if decision_contract else None,
-            })
+            # Update the intent record with actual broker response
+            try:
+                self.db.record_trade({
+                    "symbol": signal.symbol,
+                    "side": side,
+                    "qty": final_qty,
+                    "price": observed_price,
+                    "order_type": "bracket" if final_stop_loss else "market",
+                    "status": order.get("status", "submitted"),
+                    "order_id": order.get("id"),
+                    "strategy": signal.strategy_id,
+                    "signal_id": signal.signal_id,
+                    "signal_strength": signal.signal_strength,
+                    "stop_loss": final_stop_loss,
+                    "take_profit": final_take_profit,
+                    "sim_slippage_bps": sim_result.get("slippage_bps") if sim_result else None,
+                    "sim_fees": fill_fees if sim_result else None,
+                    "contract_id": decision_contract.contract_id if decision_contract else None,
+                    "contract_confidence": decision_contract.final_confidence if decision_contract else None,
+                    "contract_decision": decision_contract.decision.value if decision_contract else None,
+                    "intent_id": _intent_id,
+                })
+            except Exception as e:
+                logger.error("engine.trade_record_update_failed", error=str(e), symbol=signal.symbol)
 
             # Journal trade entry for analysis
             journal = _get_journal(self.db)
@@ -1013,7 +1078,7 @@ class ExecutionEngine:
                         ),
                     })
                 except Exception as e:
-                    logger.debug("journal.log_entry_error", error=str(e))
+                    logger.warning("journal.log_entry_error", error=str(e), symbol=signal.symbol)
 
             logger.info("engine.order_placed",
                        symbol=signal.symbol, side=side, qty=final_qty,
@@ -1136,18 +1201,36 @@ class ExecutionEngine:
                         journal = _get_journal(self.db)
                         if journal:
                             try:
-                                entries = journal.get_journal(symbol=symbol, limit=20)
-                                open_entries = [e for e in entries if e.get("exit_price") is None]
-                                if open_entries:
-                                    target = open_entries[-1]
+                                target = None
+                                # Prefer precise match by trade_id over heuristic
+                                if trade_id:
+                                    entries = journal.get_journal(symbol=symbol, limit=50)
+                                    target = next(
+                                        (e for e in entries
+                                         if e.get("trade_id") == trade_id and e.get("exit_price") is None),
+                                        None,
+                                    )
+                                # Fallback: oldest open entry for this symbol
+                                if target is None:
+                                    entries = journal.get_journal(symbol=symbol, limit=50)
+                                    open_entries = [e for e in entries if e.get("exit_price") is None]
+                                    if open_entries:
+                                        target = open_entries[-1]
+                                if target:
                                     journal.log_exit(target["id"], {
                                         "exit_price": current_price,
                                         "exit_reason": exit_signal.reason[:50] if exit_signal.reason else "strategy_exit",
                                         "pnl": pnl,
                                         "pnl_pct": pnl_pct,
                                     })
+                                else:
+                                    logger.warning(
+                                        "journal.exit_no_matching_entry",
+                                        symbol=symbol,
+                                        trade_id=trade_id,
+                                    )
                             except Exception as e:
-                                logger.debug("journal.log_exit_error", error=str(e))
+                                logger.warning("journal.log_exit_error", error=str(e), symbol=symbol)
                     except Exception as e:
                         logger.error("engine.exit_failed", symbol=symbol, error=str(e))
                 else:
@@ -1283,8 +1366,10 @@ class ExecutionEngine:
                         break
 
             # Fallback: check _trade_context for contract_id
-            if not contract_id and trade_id and trade_id in self._trade_context:
-                contract_id = self._trade_context[trade_id].get("contract_id", "")
+            if not contract_id and trade_id:
+                with self._trade_context_lock:
+                    if trade_id in self._trade_context:
+                        contract_id = self._trade_context[trade_id].get("contract_id", "")
 
             self._publish(TradeClosed(
                 trade_id=trade_id,
@@ -1300,7 +1385,8 @@ class ExecutionEngine:
             # Record outcome in contract store
             if contract_id and self._contract_store:
                 try:
-                    side = self._trade_context.get(trade_id, {}).get("side", "buy")
+                    with self._trade_context_lock:
+                        side = self._trade_context.get(trade_id, {}).get("side", "buy")
                     self._contract_store.record_outcome(
                         contract_id=contract_id,
                         trade_id=trade_id,

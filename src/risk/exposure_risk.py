@@ -98,6 +98,22 @@ class ExposureRiskLayer:
         current_positions: Optional[list[dict]],
     ) -> LayerDecision:
         """Core evaluation logic (under lock)."""
+        import math
+
+        # Input validation: reject if price is invalid (prevents division-by-zero bypass)
+        if request.price <= 0 or math.isnan(request.price) or math.isinf(request.price):
+            return LayerDecision(
+                layer_name="exposure_risk",
+                action=RiskAction.REJECT,
+                reason=f"Invalid price: {request.price}",
+            )
+        if request.qty <= 0 or math.isnan(request.qty) or math.isinf(request.qty):
+            return LayerDecision(
+                layer_name="exposure_risk",
+                action=RiskAction.REJECT,
+                reason=f"Invalid quantity: {request.qty}",
+            )
+
         adjusted_qty = request.qty
 
         # 1. Stop loss required

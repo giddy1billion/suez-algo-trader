@@ -343,6 +343,69 @@ class NotificationSubscriber:
 
 
 # ---------------------------------------------------------------------------
+# Partial Fill Tracker — updates internal trade state on partial fills
+# ---------------------------------------------------------------------------
+
+
+class PartialFillTracker:
+    """Tracks partial fills and updates trade lifecycle metadata with
+    weighted average entry price and cumulative filled quantity.
+    
+    Addresses P0-02: Partial fills must update internal state to prevent
+    PnL calculation errors and reconciliation mismatches.
+    """
+
+    def __init__(self, trade_manager=None) -> None:
+        self._trade_manager = trade_manager
+        self._lock = threading.Lock()
+        # Track accumulated fills per order_id: {order_id: {"total_qty": float, "weighted_cost": float}}
+        self._fill_accumulator: dict[str, dict] = {}
+
+    def handle_partial_fill(self, event: OrderPartialFill) -> None:
+        """Update internal state on partial fill."""
+        order_id = event.order_id
+        fill_qty = event.filled_qty
+        fill_price = event.fill_price
+
+        if not order_id or fill_qty <= 0 or fill_price <= 0:
+            return
+
+        with self._lock:
+            if order_id not in self._fill_accumulator:
+                self._fill_accumulator[order_id] = {"total_qty": 0.0, "weighted_cost": 0.0}
+
+            acc = self._fill_accumulator[order_id]
+            acc["total_qty"] += fill_qty
+            acc["weighted_cost"] += fill_qty * fill_price
+
+            # Calculate weighted average price
+            avg_price = acc["weighted_cost"] / acc["total_qty"] if acc["total_qty"] > 0 else fill_price
+
+        # Update trade lifecycle if trade_manager available
+        if self._trade_manager:
+            try:
+                trade = self._trade_manager.find_trade_by_order_id(order_id)
+                if trade:
+                    trade.metadata["filled_qty"] = acc["total_qty"]
+                    trade.metadata["avg_fill_price"] = avg_price
+                    trade.metadata["broker_qty"] = acc["total_qty"]
+                    trade.metadata["last_partial_fill_price"] = fill_price
+                    trade.metadata["partial_fill_count"] = trade.metadata.get("partial_fill_count", 0) + 1
+                    logger.info(
+                        "partial_fill.state_updated",
+                        order_id=order_id,
+                        filled_qty=acc["total_qty"],
+                        avg_price=f"{avg_price:.4f}",
+                    )
+            except Exception:
+                logger.exception("PartialFillTracker: failed to update trade for order %s", order_id)
+
+    def register(self, bus: EventBus) -> None:
+        """Register for OrderPartialFill events."""
+        bus.subscribe(OrderPartialFill, self.handle_partial_fill)
+
+
+# ---------------------------------------------------------------------------
 # Setup helper
 # ---------------------------------------------------------------------------
 
@@ -351,6 +414,7 @@ def setup_default_subscribers(
     bus: EventBus,
     audit_logger: Optional[AuditLogger] = None,
     notification_send_func: Optional[Any] = None,
+    trade_manager=None,
 ) -> dict[str, Any]:
     """
     Wire up all default subscribers to the event bus.
@@ -359,6 +423,7 @@ def setup_default_subscribers(
         bus: The EventBus instance.
         audit_logger: Optional custom AuditLogger.
         notification_send_func: Optional callable for sending notifications.
+        trade_manager: Optional TradeManager for partial fill tracking.
 
     Returns:
         Dict of subscriber instances for reference/testing.
@@ -366,10 +431,12 @@ def setup_default_subscribers(
     audit = AuditSubscriber(audit_logger)
     journal = JournalSubscriber()
     notifications = NotificationSubscriber(notification_send_func)
+    partial_fill_tracker = PartialFillTracker(trade_manager)
 
     audit.register(bus)
     journal.register(bus)
     notifications.register(bus)
+    partial_fill_tracker.register(bus)
 
     logger.info("Default event subscribers registered (%d handlers)", bus.subscriber_count)
 
@@ -377,4 +444,5 @@ def setup_default_subscribers(
         "audit": audit,
         "journal": journal,
         "notifications": notifications,
+        "partial_fill_tracker": partial_fill_tracker,
     }

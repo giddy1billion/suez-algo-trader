@@ -700,6 +700,8 @@ class TrainingPipeline:
                     base_threshold,
                     0.5 * rolling_vol * np.sqrt(forward_bars)
                 )
+                # P2-10: Clamp adaptive threshold to prevent extreme values
+                adaptive_threshold = np.clip(adaptive_threshold, 0.001, 0.05)
             else:
                 adaptive_threshold = base_threshold
             df_copy['target'] = np.where(
@@ -782,12 +784,16 @@ class TrainingPipeline:
 
         X, y, feature_cols, sample_weights, holdout_start_idx, close_prices = self._prepare_training_data(feature_data)
 
+        # P2-09: Apply embargo gap between training and holdout to prevent label leakage
+        embargo_gap = 5  # Same as purge_gap used in walk-forward
+        holdout_actual_start = holdout_start_idx + embargo_gap
+
         # Split into train and holdout — holdout is NEVER used for model fitting
         X_train_all = X[:holdout_start_idx]
         y_train_all = y[:holdout_start_idx]
         w_train_all = sample_weights[:holdout_start_idx] if sample_weights is not None else None
-        X_holdout = X[holdout_start_idx:]
-        y_holdout = y[holdout_start_idx:]
+        X_holdout = X[holdout_actual_start:]
+        y_holdout = y[holdout_actual_start:]
 
         logger.info(
             "training_pipeline.data_split",
@@ -918,7 +924,7 @@ class TrainingPipeline:
             },
         }
 
-        close_holdout = close_prices[holdout_start_idx:] if close_prices is not None else None
+        close_holdout = close_prices[holdout_actual_start:] if close_prices is not None else None
 
         return final_model, metrics, feature_cols, X_holdout, y_holdout, close_holdout
 

@@ -81,6 +81,10 @@ def _is_retryable(exc: Exception) -> bool:
         ConnectionError, Timeout, ReadTimeout, ConnectTimeout
     )
 
+    # Programming errors — never retry (fail fast for debugging)
+    if isinstance(exc, (TypeError, AttributeError, KeyError, ValueError, IndexError)):
+        return False
+
     # Network/timeout errors — always retry
     if isinstance(exc, (ConnectionError, Timeout, ReadTimeout, ConnectTimeout, OSError)):
         return True
@@ -102,7 +106,7 @@ def _is_retryable(exc: Exception) -> bool:
         if status in (401, 403, 422):
             return False
 
-    # Unknown errors — retry to be safe
+    # Unknown errors — retry to be safe (likely network-related)
     return True
 
 
@@ -217,7 +221,31 @@ class AlpacaBroker:
         self._trade_stream_handler = None
         self._shutdown_flag: bool = False
 
+        # P2-05: Startup connection test — fail fast if broker is unreachable
+        self._verify_connection(timeout=min(timeout, 15.0))
+
         logger.info("broker.initialized", paper=paper, data_feed=data_feed, timeout=timeout)
+
+    def _verify_connection(self, timeout: float = 15.0) -> None:
+        """Test broker connectivity at startup. Raises if unreachable."""
+        import concurrent.futures
+        def _ping():
+            return self.trading_client.get_account()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_ping)
+            try:
+                future.result(timeout=timeout)
+                logger.info("broker.connection_verified")
+            except concurrent.futures.TimeoutError:
+                raise ConnectionError(
+                    f"Broker connection test timed out after {timeout}s — "
+                    f"check network connectivity and API credentials"
+                )
+            except Exception as e:
+                raise ConnectionError(
+                    f"Broker connection test failed: {e}"
+                )
 
     @property
     def name(self) -> str:
@@ -241,9 +269,18 @@ class AlpacaBroker:
         return TimeInForce.DAY
 
     def _call(self, fn, *args, **kwargs):
-        """Execute an API call with rate limiting, retry, and error handling."""
+        """Execute an API call with rate limiting, timeout enforcement, and error handling."""
+        import concurrent.futures
         self._rate_limiter.acquire()
-        return fn(*args, **kwargs)
+        # P1-05: Enforce timeout on all broker API calls
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(fn, *args, **kwargs)
+            try:
+                return future.result(timeout=self.timeout)
+            except concurrent.futures.TimeoutError:
+                raise TimeoutError(
+                    f"Broker API call {fn.__name__} timed out after {self.timeout}s"
+                )
 
     # ──────────────────────────────────────────────────────────────────────
     # Account & Portfolio
@@ -320,9 +357,14 @@ class AlpacaBroker:
     def market_order(self, symbol: str, qty: float, side: str, time_in_force: str = "day",
                      client_order_id: str = None) -> dict:
         """Place a market order."""
+        import uuid
         try:
             order_side = OrderSide.BUY if side.lower() == "buy" else OrderSide.SELL
             tif = self._parse_time_in_force(time_in_force)
+
+            # Generate idempotency key if not provided
+            if client_order_id is None:
+                client_order_id = f"suez-{uuid.uuid4().hex[:16]}"
 
             request = MarketOrderRequest(
                 symbol=symbol,
@@ -332,7 +374,8 @@ class AlpacaBroker:
                 client_order_id=client_order_id,
             )
             order = self._call(self.trading_client.submit_order, request)
-            logger.info("order.submitted", symbol=symbol, side=side, qty=qty, type="market", order_id=str(order.id))
+            logger.info("order.submitted", symbol=symbol, side=side, qty=qty, type="market",
+                       order_id=str(order.id), client_order_id=client_order_id)
             return self._order_to_dict(order)
         except Exception as exc:
             logger.error("order.market_failed", symbol=symbol, error=str(exc))
@@ -906,6 +949,8 @@ class AlpacaBroker:
         """Run trade stream with automatic reconnection on failure."""
         backoff = 1.0
         max_backoff = 60.0
+        max_reconnect_attempts = 50  # P1-04: prevent infinite reconnection loop
+        reconnect_attempts = 0
         while not self._shutdown_flag:
             try:
                 logger.info("trade_stream.connecting")
@@ -913,8 +958,21 @@ class AlpacaBroker:
             except Exception as e:
                 if self._shutdown_flag:
                     break
-                logger.error("trade_stream.disconnected", error=str(e), reconnect_in=backoff)
-                time.sleep(backoff)
+                reconnect_attempts += 1
+                if reconnect_attempts >= max_reconnect_attempts:
+                    logger.error(
+                        "trade_stream.max_reconnects_exceeded",
+                        attempts=reconnect_attempts,
+                        error=str(e),
+                        msg="CRITICAL: Trade stream permanently disconnected. Manual intervention required.",
+                    )
+                    break
+                # Add jitter to prevent thundering herd
+                import random
+                jitter = random.uniform(0, backoff * 0.3)
+                logger.error("trade_stream.disconnected", error=str(e),
+                           reconnect_in=backoff + jitter, attempt=reconnect_attempts)
+                time.sleep(backoff + jitter)
                 backoff = min(backoff * 2, max_backoff)
                 # Re-create stream for fresh connection
                 try:
@@ -930,6 +988,7 @@ class AlpacaBroker:
             else:
                 # Clean exit (no exception) — reset backoff
                 backoff = 1.0
+                reconnect_attempts = 0
                 if not self._shutdown_flag:
                     # Unexpected clean exit, try reconnecting
                     logger.warning("trade_stream.unexpected_exit", reconnect_in=backoff)

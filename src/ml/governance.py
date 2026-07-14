@@ -478,6 +478,16 @@ class ModelGovernance:
                lineage.n_trades_backtest >= min_backtest_trades,
                f"Backtest trades {lineage.n_trades_backtest} below minimum {min_backtest_trades}")
 
+        # Precision and expectancy thresholds (previously loaded but not enforced)
+        if hasattr(lineage, 'precision') and lineage.precision is not None:
+            _check("precision",
+                   lineage.precision >= min_precision,
+                   f"Precision {lineage.precision:.3f} below threshold {min_precision}")
+        if hasattr(lineage, 'expectancy') and lineage.expectancy is not None:
+            _check("expectancy",
+                   lineage.expectancy >= min_expectancy,
+                   f"Expectancy {lineage.expectancy:.4f} below threshold {min_expectancy}")
+
         is_valid = len(issues) == 0
         self._last_validation_result = ValidationResult(
             is_valid=is_valid,

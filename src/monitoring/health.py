@@ -165,10 +165,17 @@ class HealthMonitor:
         if ch.last_heartbeat is None:
             return
         elapsed = (datetime.now(timezone.utc) - ch.last_heartbeat).total_seconds()
-        if elapsed > _DOWN_THRESHOLD and ch.error_count < 5:
-            ch.status = "down"
-        elif elapsed > _DEGRADED_THRESHOLD and ch.error_count < 1:
-            ch.status = "degraded"
+        if elapsed > _DOWN_THRESHOLD:
+            if ch.status != "down":
+                ch.status = "down"
+        elif elapsed > _DEGRADED_THRESHOLD:
+            if ch.status != "degraded":
+                ch.status = "degraded"
+        else:
+            # P1-13: Recover from "down"/"degraded" when heartbeat resumes
+            if ch.status in ("down", "degraded"):
+                ch.status = "healthy"
+                ch.error_count = 0
 
     def set_status(self, component: str, status: str):
         """Manually set component status (ok, warning, error)."""

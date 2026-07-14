@@ -28,6 +28,8 @@ class PaperBroker:
     """
 
     def __init__(self, starting_equity: float = 100_000.0):
+        # P2-13: Thread lock guards all mutable state (positions, orders, cash)
+        # to prevent race conditions from concurrent access
         self._lock = threading.Lock()
         self._starting_equity = starting_equity
         self._cash = starting_equity

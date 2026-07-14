@@ -93,6 +93,20 @@ class TradeRequest:
     def notional_value(self) -> float:
         return self.qty * self.price
 
+    def __post_init__(self):
+        """Validate trade request inputs to prevent garbage data propagating to risk layers."""
+        import math
+        if self.qty < 0:
+            raise ValueError(f"TradeRequest.qty must be non-negative, got {self.qty}")
+        if self.price <= 0 or (isinstance(self.price, float) and (math.isnan(self.price) or math.isinf(self.price))):
+            raise ValueError(f"TradeRequest.price must be positive and finite, got {self.price}")
+        if isinstance(self.confidence, float) and (math.isnan(self.confidence) or math.isinf(self.confidence)):
+            raise ValueError(f"TradeRequest.confidence must be finite, got {self.confidence}")
+        if self.side not in ("buy", "sell"):
+            raise ValueError(f"TradeRequest.side must be 'buy' or 'sell', got '{self.side}'")
+        if not self.symbol or not self.symbol.strip():
+            raise ValueError("TradeRequest.symbol must be non-empty")
+
     @property
     def risk_per_share(self) -> float:
         if self.stop_loss is None:

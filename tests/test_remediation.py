@@ -760,6 +760,9 @@ class TestDependencyPinning:
             line = line.strip()
             if not line or line.startswith("#") or line.startswith("//"):
                 continue
-            # Should have either == or < or ,< for upper bound
-            assert ">=" in line, f"Missing version floor: {line}"
-            assert "<" in line or "==" in line, f"Missing version ceiling: {line}"
+            # Should have either == (exact pin) or >= with < (range pin)
+            has_exact_pin = "==" in line
+            has_range_pin = ">=" in line and "<" in line
+            assert has_exact_pin or has_range_pin, (
+                f"Missing version constraint (need == or >=x,<y): {line}"
+            )

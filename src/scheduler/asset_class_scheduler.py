@@ -79,7 +79,7 @@ class AssetClassScheduler:
         self._lock = threading.Lock()
         self._running = False
         self._thread: Optional[threading.Thread] = None
-        self._tick_interval = 30.0  # Evaluate triggers every 30 seconds
+        self._tick_interval = 10.0  # Evaluate triggers every 10 seconds for responsive scheduling
         self._alert_callback = alert_callback
 
         # Health monitoring
@@ -423,7 +423,20 @@ class AssetClassScheduler:
             restart_count=self._restart_count,
             reason=reason,
         )
-        self._publish_scheduler_event("scheduler_watchdog", "restarted")
+        self._publish_scheduler_event("scheduler_watchdog", "restarting")
+        # Actually restart threads (not just reset counters)
+        try:
+            self._running = False
+            if self._thread and self._thread.is_alive():
+                self._thread.join(timeout=5)
+            self._running = True
+            self._thread = threading.Thread(target=self._run_loop, daemon=True)
+            self._thread.start()
+            logger.info("scheduler.threads_restarted", restart_count=self._restart_count)
+            self._publish_scheduler_event("scheduler_watchdog", "restarted")
+        except Exception as e:
+            logger.error("scheduler.restart_failed", error=str(e))
+            self._publish_scheduler_event("scheduler_watchdog", "restart_failed")
 
     def _emit_alert(self, message: str) -> None:
         """Emit scheduler alert via callback and event bus."""

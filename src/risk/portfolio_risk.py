@@ -94,6 +94,22 @@ class PortfolioRiskLayer:
         correlation_matrix: Optional[dict],
     ) -> LayerDecision:
         """Core evaluation logic (called under lock)."""
+        import math
+
+        # Input validation: reject if price is invalid (prevents division-by-zero bypass)
+        if request.price <= 0 or math.isnan(request.price) or math.isinf(request.price):
+            return LayerDecision(
+                layer_name="portfolio_risk",
+                action=RiskAction.REJECT,
+                reason=f"Invalid price: {request.price}",
+            )
+        if request.qty <= 0 or math.isnan(request.qty) or math.isinf(request.qty):
+            return LayerDecision(
+                layer_name="portfolio_risk",
+                action=RiskAction.REJECT,
+                reason=f"Invalid quantity: {request.qty}",
+            )
+
         if portfolio_value <= 0:
             return LayerDecision(
                 layer_name="portfolio_risk",
@@ -195,14 +211,20 @@ class PortfolioRiskLayer:
                 reason=f"Net exposure ({new_net:.0%}) would exceed limit ({self.max_net_exposure_pct:.0%})",
             )
 
-        # 7. Portfolio VaR (simplified parametric estimate)
+        # 7. Portfolio VaR (parametric estimate with optional correlation adjustment)
         # Uses position-level realized volatility when available,
         # falling back to asset-class defaults if daily_vol is absent.
+        # When a correlation matrix is provided, computes portfolio variance
+        # using the covariance-matrix approach for more accurate VaR.
         _asset_class_vol_defaults = {
             "crypto": 0.05,   # ~5% daily vol typical for BTC/ETH
             "equity": 0.015,  # ~1.5% daily vol typical for large-cap equity
         }
         default_vol = 0.02
+
+        # Build position volatility mapping for covariance calculation
+        position_vols: dict[str, float] = {}
+        position_values: dict[str, float] = {}
 
         portfolio_heat = 0.0
         for p in positions:
@@ -210,14 +232,46 @@ class PortfolioRiskLayer:
             if pos_vol <= 0:
                 asset_class = str(p.get("asset_class", "equity")).lower()
                 pos_vol = _asset_class_vol_defaults.get(asset_class, default_vol)
-            portfolio_heat += abs(float(p.get("market_value", 0))) * pos_vol
+            sym = p.get("symbol", "")
+            pos_value = abs(float(p.get("market_value", 0)))
+            position_vols[sym] = pos_vol
+            position_values[sym] = pos_value
+            portfolio_heat += pos_value * pos_vol
 
         # Estimate trade volatility from position data or asset-class default
         trade_asset_class = "equity"  # default; callers can set via request metadata
         trade_vol = _asset_class_vol_defaults.get(trade_asset_class, default_vol)
         trade_heat = adjusted_qty * request.price * trade_vol
         total_heat = portfolio_heat + trade_heat
-        var_estimate = total_heat * 1.65  # 95% confidence, 1-day
+
+        # Include the proposed trade in position maps for VaR calc
+        position_vols[request.symbol] = trade_vol
+        trade_value = adjusted_qty * request.price
+        position_values[request.symbol] = position_values.get(request.symbol, 0) + trade_value
+
+        # Compute VaR: use covariance-matrix approach when correlations available
+        if correlation_matrix and len(position_values) > 1:
+            # Portfolio variance = sum_i sum_j w_i * w_j * vol_i * vol_j * corr_ij
+            portfolio_variance = 0.0
+            symbols = list(position_values.keys())
+            for i, sym_i in enumerate(symbols):
+                vi = position_values[sym_i] * position_vols.get(sym_i, default_vol)
+                for j, sym_j in enumerate(symbols):
+                    vj = position_values[sym_j] * position_vols.get(sym_j, default_vol)
+                    if i == j:
+                        corr = 1.0
+                    else:
+                        pair = tuple(sorted([sym_i, sym_j]))
+                        corr = correlation_matrix.get(pair, 0.0)
+                        # P1-02: Bound correlation values to [-1, 1]
+                        corr = max(-1.0, min(1.0, corr))
+                    portfolio_variance += vi * vj * corr
+            # VaR = z * sqrt(portfolio_variance), 95% confidence
+            import math
+            var_estimate = 1.65 * math.sqrt(max(portfolio_variance, 0.0))
+        else:
+            # Fallback: sum of absolute VaR (assumes perfect correlation)
+            var_estimate = total_heat * 1.65  # 95% confidence, 1-day
 
         if var_estimate / portfolio_value > self.max_var_pct:
             return LayerDecision(
