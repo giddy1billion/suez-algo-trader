@@ -378,7 +378,8 @@ async def cmd_status(message: Message):
         )
         await message.answer(text, parse_mode=ParseMode.HTML)
     except Exception as e:
-        await message.answer("Operation failed. Check system logs for details.")
+        logger.error("telegram.cmd_status_failed", error=str(e), exc_info=True)
+        await message.answer(f"Operation failed: {e}")
 
 
 @router.message(Command("positions"))
@@ -407,7 +408,8 @@ async def cmd_positions(message: Message):
         lines.append(f"\n<b>Total Unrealized: ${total_pnl:+,.2f}</b>")
         await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
     except Exception as e:
-        await message.answer("Operation failed. Check system logs for details.")
+        logger.error("telegram.cmd_positions_failed", error=str(e), exc_info=True)
+        await message.answer(f"Operation failed: {e}")
 
 
 @router.message(Command("orders"))
@@ -432,7 +434,8 @@ async def cmd_orders(message: Message):
             )
         await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
     except Exception as e:
-        await message.answer("Operation failed. Check system logs for details.")
+        logger.error("telegram.cmd_orders_failed", error=str(e), exc_info=True)
+        await message.answer(f"Operation failed: {e}")
 
 
 @router.message(Command("pnl"))
@@ -477,7 +480,8 @@ async def cmd_trades(message: Message):
 
         await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
     except Exception as e:
-        await message.answer("Operation failed. Check system logs for details.")
+        logger.error("telegram.cmd_trades_failed", error=str(e), exc_info=True)
+        await message.answer(f"Operation failed: {e}")
 
 
 @router.message(Command("signals"))
@@ -515,7 +519,8 @@ async def cmd_signals(message: Message):
             )
         await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
     except Exception as e:
-        await message.answer("Operation failed. Check system logs for details.")
+        logger.error("telegram.cmd_signals_failed", error=str(e), exc_info=True)
+        await message.answer(f"Operation failed: {e}")
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -665,7 +670,8 @@ async def cmd_cancelall(message: Message):
             _broker.cancel_all_orders()
         await message.answer("All pending orders cancelled.")
     except Exception as e:
-        await message.answer("Operation failed. Check system logs for details.")
+        logger.error("telegram.cmd_cancelall_failed", error=str(e), exc_info=True)
+        await message.answer(f"Operation failed: {e}")
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -1709,7 +1715,8 @@ async def cmd_modelinfo(message: Message):
 
         await message.answer(text, parse_mode=ParseMode.HTML)
     except Exception as e:
-        await message.answer("Operation failed. Check system logs for details.")
+        logger.error("telegram.cmd_modelinfo_failed", error=str(e), exc_info=True)
+        await message.answer(f"Operation failed: {e}")
 
 
 @router.message(Command("predict"))
@@ -2859,7 +2866,8 @@ async def cmd_assets(message: Message):
 
         await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
     except Exception as e:
-        await message.answer("Operation failed. Check system logs for details.")
+        logger.error("telegram.cmd_assets_failed", error=str(e), exc_info=True)
+        await message.answer(f"Operation failed: {e}")
 
 
 @router.message(Command("search"))
@@ -3073,7 +3081,8 @@ async def cmd_asset_detail(message: Message):
 
         await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
     except Exception as e:
-        await message.answer("Operation failed. Check system logs for details.")
+        logger.error("telegram.cmd_asset_detail_failed", error=str(e), exc_info=True)
+        await message.answer(f"Operation failed: {e}")
 
 
 @router.message(Command("watchlist"))
