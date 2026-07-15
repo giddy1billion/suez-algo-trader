@@ -42,11 +42,17 @@ def monte_carlo_simulation(
     n_simulations: int = 1000,
     confidence_levels: Optional[List[int]] = None,
     seed: Optional[int] = 42,
+    randomize_magnitude: bool = True,
+    magnitude_noise_pct: float = 0.10,
 ) -> Dict[str, Any]:
-    """Run Monte Carlo simulation by shuffling trade order.
+    """Run Monte Carlo simulation by shuffling trade order and optionally magnitude.
 
     Builds confidence intervals on final equity and drawdown by randomly
     reordering the historical trade sequence many times.
+
+    MC1 FIX: Now randomizes both order AND magnitude (±noise_pct) to account
+    for execution uncertainty, market conditions, and correlation effects.
+    MC4 FIX: Returns confidence intervals on P(Profit).
 
     Args:
         trades: List of trade dicts with at minimum a 'pnl' key.
@@ -55,9 +61,11 @@ def monte_carlo_simulation(
         n_simulations: Number of random shuffles to perform.
         confidence_levels: Percentile levels to compute (default: [5, 25, 50, 75, 95]).
         seed: RNG seed for reproducibility (default: 42). Pass None for non-deterministic.
+        randomize_magnitude: If True, also perturb trade PnL magnitudes (MC1 fix).
+        magnitude_noise_pct: Standard deviation of multiplicative noise on PnL (default: 10%).
 
     Returns:
-        Dict with simulation statistics and percentile equity curves.
+        Dict with simulation statistics, percentile equity curves, and confidence intervals.
     """
     if confidence_levels is None:
         confidence_levels = [5, 25, 50, 75, 95]
@@ -84,6 +92,12 @@ def monte_carlo_simulation(
         indices = rng.permutation(n_trades)
         shuffled_pnls = pnls[indices]
 
+        # MC1 FIX: Optionally randomize trade magnitudes to account for
+        # execution variance, market condition changes, and correlation effects
+        if randomize_magnitude and magnitude_noise_pct > 0:
+            noise = rng.normal(1.0, magnitude_noise_pct, size=n_trades)
+            shuffled_pnls = shuffled_pnls * noise
+
         # Compute equity curve
         equity = _compute_equity_curve(shuffled_pnls, initial_cash)
         equity_curves[i] = equity
@@ -107,6 +121,21 @@ def monte_carlo_simulation(
     p5_max_dd = float(np.percentile(max_drawdowns, 5))
 
     probability_of_profit = float(np.sum(final_returns > 0) / n_simulations)
+
+    # MC4 FIX: Compute confidence interval on P(Profit) using Wilson score
+    # This provides a proper statistical range rather than a point estimate
+    n_profitable = int(np.sum(final_returns > 0))
+    if n_simulations > 0:
+        z = 1.96  # 95% confidence
+        phat = probability_of_profit
+        denominator = 1 + z**2 / n_simulations
+        center = (phat + z**2 / (2 * n_simulations)) / denominator
+        spread = z * np.sqrt((phat * (1 - phat) + z**2 / (4 * n_simulations)) / n_simulations) / denominator
+        prob_profit_ci_lower = float(max(0, center - spread))
+        prob_profit_ci_upper = float(min(1, center + spread))
+    else:
+        prob_profit_ci_lower = 0.0
+        prob_profit_ci_upper = 0.0
     # Ruin: equity drops below 50% of initial at any point
     min_equity_per_sim = np.min(equity_curves, axis=1)
     probability_of_ruin = float(np.sum(min_equity_per_sim < initial_cash * 0.5) / n_simulations)
@@ -140,6 +169,8 @@ def monte_carlo_simulation(
         "median_max_drawdown": median_max_dd,
         "p5_max_drawdown": p5_max_dd,
         "probability_of_profit": probability_of_profit,
+        "prob_profit_ci_lower": prob_profit_ci_lower,
+        "prob_profit_ci_upper": prob_profit_ci_upper,
         "probability_of_ruin": probability_of_ruin,
         "expected_return": expected_return,
         "return_std": return_std,
@@ -163,6 +194,8 @@ def _empty_mc_result(
         "median_max_drawdown": 0.0,
         "p5_max_drawdown": 0.0,
         "probability_of_profit": 0.0,
+        "prob_profit_ci_lower": 0.0,
+        "prob_profit_ci_upper": 0.0,
         "probability_of_ruin": 0.0,
         "expected_return": 0.0,
         "return_std": 0.0,

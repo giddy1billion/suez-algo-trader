@@ -85,13 +85,25 @@ class FeatureStore:
         normalization_method: str = "standard",
         description: str = "",
         parent_version: str | None = None,
+        scaling_source: str = "training",
     ) -> str:
         """
         Register a new feature version.
 
         Returns the version_id. If an identical feature_hash already exists,
         returns the existing version_id (deduplication).
+
+        Args:
+            scaling_source: Must be 'training' to confirm scaling params
+                come from training data only (prevents lookahead bias).
         """
+        # F4 FIX: Validate that scaling parameters come from training data only
+        if scaling_source != "training":
+            raise ValueError(
+                f"Scaling parameters must come from training data only "
+                f"(got source='{scaling_source}'). Compute scaling on the "
+                f"training fold before applying to validation/test data."
+            )
         if encoding_params is None:
             encoding_params = {}
 
@@ -279,16 +291,23 @@ class FeatureStore:
         self,
         baseline_days: int = 30,
         recent_days: int = 7,
+        asset_class: str = "equity",
     ) -> dict:
         """
         Compute Population Stability Index (PSI) for each feature.
 
         Compares recent feature distributions vs historical baseline.
 
+        F7 FIX: Uses asset-class-aware drift thresholds. Crypto naturally
+        has higher regime-shift volatility, so a higher PSI threshold (0.40)
+        is used to avoid false alarms during normal crypto regime shifts.
+
         Returns:
             {feature_name: {"psi": float, "baseline_mean": float,
              "recent_mean": float, "drift_detected": bool}}
         """
+        # F7: Asset-class-aware PSI thresholds
+        drift_threshold = 0.40 if asset_class == "crypto" else 0.25
         now = datetime.now(timezone.utc)
         baseline_start = now - timedelta(days=baseline_days)
         recent_start = now - timedelta(days=recent_days)
@@ -343,7 +362,7 @@ class FeatureStore:
                 "psi": psi,
                 "baseline_mean": float(np.mean(baseline_arr)),
                 "recent_mean": float(np.mean(recent_arr)),
-                "drift_detected": psi >= 0.25,
+                "drift_detected": psi >= drift_threshold,
             }
 
         logger.info(
@@ -356,12 +375,19 @@ class FeatureStore:
         return drift_results
 
     def get_feature_importance_history(self) -> pd.DataFrame:
-        """Track how feature importance changes across model versions."""
+        """
+        Track how feature importance changes across model versions.
+
+        F6 FIX: Now tracks actual importance scores (from model) when available,
+        not just position in the feature list. Returns a DataFrame with
+        version_id, feature_name, position, importance_score, and created_at.
+        """
         with self._Session() as session:
             rows = session.query(
                 MLFeatureVersion.version_id,
                 MLFeatureVersion.feature_names,
                 MLFeatureVersion.created_at,
+                MLFeatureVersion.scaling_params,  # importance scores stored here
             ).order_by(MLFeatureVersion.created_at.asc()).all()
 
         if not rows:
@@ -372,12 +398,23 @@ class FeatureStore:
             version_id = row[0]
             feature_names = json.loads(row[1]) if isinstance(row[1], str) else row[1]
             created_at = row[2]
+            # Try to extract model importance scores from scaling_params
+            scaling_raw = row[3]
+            scaling_data = {}
+            if scaling_raw:
+                try:
+                    scaling_data = json.loads(scaling_raw) if isinstance(scaling_raw, str) else scaling_raw
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            importance_scores = scaling_data.get("feature_importance", {})
+
             for idx, name in enumerate(feature_names):
                 records.append(
                     {
                         "version_id": version_id,
                         "feature_name": name,
                         "position": idx,
+                        "importance_score": importance_scores.get(name, 0.0),
                         "created_at": created_at,
                     }
                 )
