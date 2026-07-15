@@ -109,8 +109,10 @@ def _record_passing_model(governance, version="v001"):
         metrics={
             "cv_accuracy": 0.65,
             "sharpe": 1.2,
-            "n_trades": 120,
+            "n_trades": 250,
             "max_drawdown": 0.06,
+            "precision": 0.60,
+            "expectancy": 0.005,
         },
         hyperparameters={"n_estimators": 200, "max_depth": 5, "learning_rate": 0.05},
         seed=42,
@@ -119,7 +121,7 @@ def _record_passing_model(governance, version="v001"):
         monte_carlo_results={
             "median_return": 0.06,
             "p5_return": -0.04,
-            "probability_of_profit": 0.72,
+            "probability_of_profit": 0.75,
         },
     )
 

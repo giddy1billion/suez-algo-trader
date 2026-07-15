@@ -219,6 +219,9 @@ class ModelGovernance:
             calmar_ratio=metrics.get("calmar", metrics.get("calmar_ratio", 0.0)),
             max_drawdown=metrics.get("max_drawdown", 0.0),
             n_trades_backtest=metrics.get("n_trades", 0),
+            # Governance gate fields
+            precision=metrics.get("precision", None),
+            expectancy=metrics.get("expectancy", None),
             # Walk-forward
             walk_forward_sharpe=(
                 walk_forward_results.get("sharpe", 0.0)

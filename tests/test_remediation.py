@@ -64,8 +64,10 @@ def valid_model(tmp_governance):
         metrics={
             "cv_accuracy": 0.67,
             "sharpe": 1.5,
-            "n_trades": 150,
+            "n_trades": 250,
             "max_drawdown": 0.05,
+            "precision": 0.60,
+            "expectancy": 0.005,
         },
         hyperparameters={"n_estimators": 100, "max_depth": 6},
         seed=42,

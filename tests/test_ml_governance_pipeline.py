@@ -68,8 +68,10 @@ def passing_model(governance):
             "cv_accuracy": 0.67,
             "sharpe": 1.2,
             "sharpe_ratio": 1.2,
-            "n_trades": 100,
+            "n_trades": 250,
             "max_drawdown": 0.08,
+            "precision": 0.60,
+            "expectancy": 0.005,
         },
         hyperparameters={"n_estimators": 500, "max_depth": 4, "learning_rate": 0.02},
         seed=42,
@@ -78,7 +80,7 @@ def passing_model(governance):
         monte_carlo_results={
             "median_return": 0.04,
             "p5_return": -0.03,
-            "probability_of_profit": 0.68,
+            "probability_of_profit": 0.75,
         },
     )
     return governance
@@ -184,37 +186,40 @@ class TestGovernanceMetrics:
         assert any("Sharpe ratio" in i for i in issues)
 
     def test_cv_accuracy_threshold(self, governance):
-        """CV accuracy must be >= 0.62 (configurable)."""
+        """CV accuracy must be >= 0.52 (configurable)."""
         governance.record_training(
             version="v001", features=["a", "b"],
-            metrics={"cv_accuracy": 0.61, "sharpe": 1.0, "n_trades": 100},
+            metrics={"cv_accuracy": 0.51, "sharpe": 1.0, "n_trades": 250,
+                     "precision": 0.60, "expectancy": 0.005},
             hyperparameters={"n_estimators": 100},
-            walk_forward_results={"sharpe": 0.5},
-            monte_carlo_results={"probability_of_profit": 0.7},
+            walk_forward_results={"sharpe": 0.8},
+            monte_carlo_results={"probability_of_profit": 0.75},
         )
         is_valid, issues = governance.validate_for_deployment("v001")
         assert any("CV accuracy" in i for i in issues)
 
     def test_walk_forward_sharpe_threshold(self, governance):
-        """Walk-forward Sharpe must be >= 0.3."""
+        """Walk-forward Sharpe must be >= 0.5."""
         governance.record_training(
             version="v001", features=["a", "b"],
-            metrics={"cv_accuracy": 0.65, "sharpe": 1.0, "n_trades": 100},
+            metrics={"cv_accuracy": 0.65, "sharpe": 1.0, "n_trades": 250,
+                     "precision": 0.60, "expectancy": 0.005},
             hyperparameters={"n_estimators": 100},
-            walk_forward_results={"sharpe": 0.29},
-            monte_carlo_results={"probability_of_profit": 0.7},
+            walk_forward_results={"sharpe": 0.49},
+            monte_carlo_results={"probability_of_profit": 0.75},
         )
         is_valid, issues = governance.validate_for_deployment("v001")
         assert any("Walk-forward Sharpe" in i for i in issues)
 
     def test_monte_carlo_prob_profit_threshold(self, governance):
-        """Monte Carlo probability of profit must be >= 0.65."""
+        """Monte Carlo probability of profit must be >= 0.70."""
         governance.record_training(
             version="v001", features=["a", "b"],
-            metrics={"cv_accuracy": 0.65, "sharpe": 1.0, "n_trades": 100},
+            metrics={"cv_accuracy": 0.65, "sharpe": 1.0, "n_trades": 250,
+                     "precision": 0.60, "expectancy": 0.005},
             hyperparameters={"n_estimators": 100},
-            walk_forward_results={"sharpe": 0.5},
-            monte_carlo_results={"probability_of_profit": 0.64},
+            walk_forward_results={"sharpe": 0.8},
+            monte_carlo_results={"probability_of_profit": 0.69},
         )
         is_valid, issues = governance.validate_for_deployment("v001")
         assert any("prob_profit" in i for i in issues)
@@ -223,10 +228,11 @@ class TestGovernanceMetrics:
         """OOS Sharpe ratio must be >= 0.5."""
         governance.record_training(
             version="v001", features=["a", "b"],
-            metrics={"cv_accuracy": 0.65, "sharpe": 0.4, "n_trades": 100},
+            metrics={"cv_accuracy": 0.65, "sharpe": 0.4, "n_trades": 250,
+                     "precision": 0.60, "expectancy": 0.005},
             hyperparameters={"n_estimators": 100},
-            walk_forward_results={"sharpe": 0.5},
-            monte_carlo_results={"probability_of_profit": 0.7},
+            walk_forward_results={"sharpe": 0.8},
+            monte_carlo_results={"probability_of_profit": 0.75},
         )
         is_valid, issues = governance.validate_for_deployment("v001")
         assert any("Sharpe ratio" in i for i in issues)
@@ -235,23 +241,24 @@ class TestGovernanceMetrics:
         """Max drawdown must be <= 0.20."""
         governance.record_training(
             version="v001", features=["a", "b"],
-            metrics={"cv_accuracy": 0.65, "sharpe": 1.0, "n_trades": 100,
-                     "max_drawdown": 0.25},
+            metrics={"cv_accuracy": 0.65, "sharpe": 1.0, "n_trades": 250,
+                     "max_drawdown": 0.25, "precision": 0.60, "expectancy": 0.005},
             hyperparameters={"n_estimators": 100},
-            walk_forward_results={"sharpe": 0.5},
-            monte_carlo_results={"probability_of_profit": 0.7},
+            walk_forward_results={"sharpe": 0.8},
+            monte_carlo_results={"probability_of_profit": 0.75},
         )
         is_valid, issues = governance.validate_for_deployment("v001")
         assert any("drawdown" in i.lower() for i in issues)
 
     def test_min_backtest_trades_threshold(self, governance):
-        """Must have at least 50 backtest trades."""
+        """Must have at least 200 backtest trades."""
         governance.record_training(
             version="v001", features=["a", "b"],
-            metrics={"cv_accuracy": 0.65, "sharpe": 1.0, "n_trades": 49},
+            metrics={"cv_accuracy": 0.65, "sharpe": 1.0, "n_trades": 199,
+                     "precision": 0.60, "expectancy": 0.005},
             hyperparameters={"n_estimators": 100},
-            walk_forward_results={"sharpe": 0.5},
-            monte_carlo_results={"probability_of_profit": 0.7},
+            walk_forward_results={"sharpe": 0.8},
+            monte_carlo_results={"probability_of_profit": 0.75},
         )
         is_valid, issues = governance.validate_for_deployment("v001")
         assert any("trades" in i.lower() for i in issues)
@@ -266,11 +273,11 @@ class TestGovernanceMetrics:
         governance.record_training(
             version="v001", features=["a", "b", "c"],
             dataset=df,
-            metrics={"cv_accuracy": 0.65, "sharpe": 0.8, "n_trades": 100,
-                     "max_drawdown": 0.10},
+            metrics={"cv_accuracy": 0.65, "sharpe": 0.8, "n_trades": 250,
+                     "max_drawdown": 0.10, "precision": 0.60, "expectancy": 0.005},
             hyperparameters={"n_estimators": 500},
-            walk_forward_results={"sharpe": 0.5},
-            monte_carlo_results={"probability_of_profit": 0.70},
+            walk_forward_results={"sharpe": 0.8},
+            monte_carlo_results={"probability_of_profit": 0.75},
         )
         is_valid, issues = governance.validate_for_deployment("v001")
         # Only git_commit might fail in test env
@@ -376,11 +383,11 @@ class TestPaperTradingActivation:
         governance.record_training(
             version="v010",
             features=["rsi_14", "ema_slope_20", "bb_pct"],
-            metrics={"cv_accuracy": 0.67, "sharpe": 1.0, "n_trades": 100,
-                     "max_drawdown": 0.08},
+            metrics={"cv_accuracy": 0.67, "sharpe": 1.0, "n_trades": 250,
+                     "max_drawdown": 0.08, "precision": 0.60, "expectancy": 0.005},
             hyperparameters={"n_estimators": 500, "learning_rate": 0.02},
-            walk_forward_results={"sharpe": 0.5},
-            monte_carlo_results={"probability_of_profit": 0.70},
+            walk_forward_results={"sharpe": 0.8},
+            monte_carlo_results={"probability_of_profit": 0.75},
         )
 
         # Validate

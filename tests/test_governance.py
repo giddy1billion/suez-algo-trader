@@ -45,8 +45,10 @@ def governance_with_model(governance):
         metrics={
             "cv_accuracy": 0.67,
             "sharpe": 1.5,
-            "n_trades": 150,
+            "n_trades": 250,
             "max_drawdown": 0.05,
+            "precision": 0.60,
+            "expectancy": 0.005,
         },
         hyperparameters={"n_estimators": 100, "max_depth": 6, "learning_rate": 0.1},
         seed=42,
@@ -164,8 +166,10 @@ class TestModelGovernance:
             metrics={
                 "cv_accuracy": 0.72,
                 "sharpe": 1.8,
-                "n_trades": 100,
+                "n_trades": 250,
                 "max_drawdown": 0.04,
+                "precision": 0.62,
+                "expectancy": 0.006,
             },
             hyperparameters={"n_estimators": 100},
             walk_forward_results={"sharpe": 1.5},
@@ -353,8 +357,9 @@ class TestStricterThresholdsRegression:
     def gov(self, tmp_path):
         return ModelGovernance(governance_dir=str(tmp_path / "gov"))
 
-    def _record_model(self, gov, version, cv_accuracy=0.70, wf_sharpe=0.5,
-                      mc_prob=0.70, n_trades=100, sharpe=1.0, max_dd=0.05):
+    def _record_model(self, gov, version, cv_accuracy=0.70, wf_sharpe=0.8,
+                      mc_prob=0.75, n_trades=250, sharpe=1.0, max_dd=0.05,
+                      precision=0.60, expectancy=0.005):
         """Helper to record a model with specified metrics."""
         import pandas as pd
         import numpy as np
@@ -372,6 +377,8 @@ class TestStricterThresholdsRegression:
                 "sharpe": sharpe,
                 "n_trades": n_trades,
                 "max_drawdown": max_dd,
+                "precision": precision,
+                "expectancy": expectancy,
             },
             hyperparameters={"n_estimators": 100, "max_depth": 6},
             seed=42,
@@ -379,48 +386,48 @@ class TestStricterThresholdsRegression:
             monte_carlo_results={"probability_of_profit": mc_prob},
         )
 
-    def test_cv_accuracy_below_062_rejected(self, gov):
-        """CV accuracy below 0.62 threshold is rejected."""
-        self._record_model(gov, "v001", cv_accuracy=0.61)
+    def test_cv_accuracy_below_052_rejected(self, gov):
+        """CV accuracy below 0.52 threshold is rejected."""
+        self._record_model(gov, "v001", cv_accuracy=0.51)
         with pytest.raises(GovernanceViolation, match="failed governance validation"):
             gov.deploy("v001")
 
-    def test_cv_accuracy_at_062_accepted(self, gov):
-        """CV accuracy at exactly 0.62 threshold passes."""
-        self._record_model(gov, "v001", cv_accuracy=0.62)
+    def test_cv_accuracy_at_052_accepted(self, gov):
+        """CV accuracy at exactly 0.52 threshold passes."""
+        self._record_model(gov, "v001", cv_accuracy=0.52)
         assert gov.deploy("v001") is True
 
-    def test_walk_forward_sharpe_below_03_rejected(self, gov):
-        """Walk-forward Sharpe below 0.3 is rejected."""
-        self._record_model(gov, "v001", wf_sharpe=0.29)
+    def test_walk_forward_sharpe_below_05_rejected(self, gov):
+        """Walk-forward Sharpe below 0.5 is rejected."""
+        self._record_model(gov, "v001", wf_sharpe=0.49)
         with pytest.raises(GovernanceViolation, match="failed governance validation"):
             gov.deploy("v001")
 
-    def test_walk_forward_sharpe_at_03_accepted(self, gov):
-        """Walk-forward Sharpe at exactly 0.3 passes."""
-        self._record_model(gov, "v001", wf_sharpe=0.3)
+    def test_walk_forward_sharpe_at_05_accepted(self, gov):
+        """Walk-forward Sharpe at exactly 0.5 passes."""
+        self._record_model(gov, "v001", wf_sharpe=0.5)
         assert gov.deploy("v001") is True
 
-    def test_monte_carlo_prob_below_065_rejected(self, gov):
-        """Monte Carlo prob_profit below 0.65 is rejected."""
-        self._record_model(gov, "v001", mc_prob=0.64)
+    def test_monte_carlo_prob_below_070_rejected(self, gov):
+        """Monte Carlo prob_profit below 0.70 is rejected."""
+        self._record_model(gov, "v001", mc_prob=0.69)
         with pytest.raises(GovernanceViolation, match="failed governance validation"):
             gov.deploy("v001")
 
-    def test_monte_carlo_prob_at_065_accepted(self, gov):
-        """Monte Carlo prob_profit at exactly 0.65 passes."""
-        self._record_model(gov, "v001", mc_prob=0.65)
+    def test_monte_carlo_prob_at_070_accepted(self, gov):
+        """Monte Carlo prob_profit at exactly 0.70 passes."""
+        self._record_model(gov, "v001", mc_prob=0.70)
         assert gov.deploy("v001") is True
 
-    def test_min_trades_below_50_rejected(self, gov):
-        """Fewer than 50 backtest trades is rejected."""
-        self._record_model(gov, "v001", n_trades=49)
+    def test_min_trades_below_200_rejected(self, gov):
+        """Fewer than 200 backtest trades is rejected."""
+        self._record_model(gov, "v001", n_trades=199)
         with pytest.raises(GovernanceViolation, match="failed governance validation"):
             gov.deploy("v001")
 
-    def test_min_trades_at_50_accepted(self, gov):
-        """Exactly 50 backtest trades passes."""
-        self._record_model(gov, "v001", n_trades=50)
+    def test_min_trades_at_200_accepted(self, gov):
+        """Exactly 200 backtest trades passes."""
+        self._record_model(gov, "v001", n_trades=200)
         assert gov.deploy("v001") is True
 
     def test_all_gates_enforced_simultaneously(self, gov):
@@ -433,6 +440,8 @@ class TestStricterThresholdsRegression:
             n_trades=10,
             sharpe=0.1,
             max_dd=0.50,
+            precision=0.20,
+            expectancy=-0.01,
         )
         is_valid, issues = gov.validate_for_deployment("v001")
         assert not is_valid
@@ -448,8 +457,10 @@ class TestStricterThresholdsRegression:
             cv_accuracy=0.70,
             wf_sharpe=0.8,
             mc_prob=0.75,
-            n_trades=200,
+            n_trades=250,
             sharpe=1.5,
             max_dd=0.05,
+            precision=0.60,
+            expectancy=0.005,
         )
         assert gov.deploy("v001") is True

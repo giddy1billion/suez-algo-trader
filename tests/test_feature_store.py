@@ -231,11 +231,11 @@ class TestImmutableGovernance:
             version="v001",
             features=["f1", "f2"],
             dataset=pd.DataFrame({"close": np.arange(200), "volume": np.arange(200)}),
-            metrics={"cv_accuracy": 0.7, "sharpe": 1.5, "n_trades": 60, "max_drawdown": 0.05},
+            metrics={"cv_accuracy": 0.7, "sharpe": 1.5, "n_trades": 250, "precision": 0.60, "expectancy": 0.005, "max_drawdown": 0.05},
             hyperparameters={"lr": 0.01},
             seed=42,
-            walk_forward_results={"sharpe": 0.7},
-            monte_carlo_results={"probability_of_profit": 0.7},
+            walk_forward_results={"sharpe": 0.8},
+            monte_carlo_results={"probability_of_profit": 0.75},
         )
         governance.deploy("v001", reason="initial")
 
@@ -259,11 +259,11 @@ class TestImmutableGovernance:
             version="v001",
             features=["f1", "f2"],
             dataset=pd.DataFrame({"close": np.arange(200), "volume": np.arange(200)}),
-            metrics={"cv_accuracy": 0.7, "sharpe": 1.2, "n_trades": 60, "max_drawdown": 0.05},
+            metrics={"cv_accuracy": 0.7, "sharpe": 1.2, "n_trades": 250, "precision": 0.60, "expectancy": 0.005, "max_drawdown": 0.05},
             hyperparameters={"lr": 0.01},
             seed=42,
-            walk_forward_results={"sharpe": 0.7},
-            monte_carlo_results={"probability_of_profit": 0.7},
+            walk_forward_results={"sharpe": 0.8},
+            monte_carlo_results={"probability_of_profit": 0.75},
         )
         governance.deploy("v001", reason="test")
 
@@ -276,11 +276,11 @@ class TestImmutableGovernance:
             version="v001",
             features=["f1", "f2"],
             dataset=pd.DataFrame({"close": np.arange(200), "volume": np.arange(200)}),
-            metrics={"cv_accuracy": 0.7, "sharpe": 1.2, "n_trades": 60, "max_drawdown": 0.05},
+            metrics={"cv_accuracy": 0.7, "sharpe": 1.2, "n_trades": 250, "precision": 0.60, "expectancy": 0.005, "max_drawdown": 0.05},
             hyperparameters={"lr": 0.01},
             seed=42,
-            walk_forward_results={"sharpe": 0.7},
-            monte_carlo_results={"probability_of_profit": 0.7},
+            walk_forward_results={"sharpe": 0.8},
+            monte_carlo_results={"probability_of_profit": 0.75},
         )
         governance.deploy("v001", reason="test")
 
