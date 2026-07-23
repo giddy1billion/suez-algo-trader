@@ -374,7 +374,7 @@ async def cmd_status(message: Message):
             f"{'─' * 30}\n"
             f"Day P&L:      <code>${pnl:>+12,.2f} ({pnl_pct:+.2f}%)</code>\n"
             f"Positions:    <code>{len(positions):>12d}</code>\n"
-            f"Day Trades:   <code>{account['day_trade_count']:>12d}</code>\n"
+            f"Day Trades:   <code>{account.get('day_trade_count') or 0:>12d}</code>\n"
         )
         await message.answer(text, parse_mode=ParseMode.HTML)
     except Exception as e:

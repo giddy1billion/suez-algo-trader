@@ -104,10 +104,32 @@ class TestStatusPaperMode:
             f"Buying Power: ${account['buying_power']:>12,.2f}\n"
             f"Day P&L: ${pnl:>+12,.2f} ({pnl_pct:+.2f}%)\n"
             f"Positions: {len(positions):>12d}\n"
-            f"Day Trades: {account['day_trade_count']:>12d}\n"
+            f"Day Trades: {account.get('day_trade_count') or 0:>12d}\n"
         )
         assert "Equity" in text
         assert "Day Trades" in text
+
+    def test_status_command_handles_none_day_trade_count(self):
+        """Verify /status doesn't crash when day_trade_count is None (Alpaca API)."""
+        broker = PaperBroker(starting_equity=100_000.0)
+        account = broker.get_account()
+        account['day_trade_count'] = None  # Simulate Alpaca returning None
+        positions = broker.get_positions()
+
+        pnl = account['equity'] - account['last_equity']
+        pnl_pct = (pnl / account['last_equity'] * 100) if account['last_equity'] > 0 else 0
+
+        # This should not raise TypeError
+        text = (
+            f"Equity: ${account['equity']:>12,.2f}\n"
+            f"Cash: ${account['cash']:>12,.2f}\n"
+            f"Buying Power: ${account['buying_power']:>12,.2f}\n"
+            f"Day P&L: ${pnl:>+12,.2f} ({pnl_pct:+.2f}%)\n"
+            f"Positions: {len(positions):>12d}\n"
+            f"Day Trades: {account.get('day_trade_count') or 0:>12d}\n"
+        )
+        assert "Day Trades" in text
+        assert "0" in text
 
 
 # ──────────────────────────────────────────────────────────────────────────────
