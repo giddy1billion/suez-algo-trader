@@ -202,6 +202,7 @@ class LiveModelMonitor:
         self._rollback_record: Optional[RollbackRecord] = None
         self._rollbacks_today: int = 0
         self._day_start: float = 0.0
+        self._trading_halted: bool = False  # DR1: Set when circuit breaker exhausted
 
         # Audit log
         self._audit_log: List[AuditEvent] = []
@@ -647,6 +648,9 @@ class LiveModelMonitor:
             self._day_start = now
 
         if self._rollbacks_today >= self.config.max_rollbacks_per_day:
+            # DR1 FIX: When circuit breaker exhausted, HALT trading entirely
+            # instead of silently ignoring further degradation. The model
+            # is clearly unstable if it needed 3+ rollbacks in one day.
             self._emit_event(AuditEvent(
                 timestamp=now,
                 event_type=MonitorEventType.CIRCUIT_BREAKER_TRIPPED,
@@ -654,9 +658,12 @@ class LiveModelMonitor:
                 details={
                     "rollbacks_today": self._rollbacks_today,
                     "max_allowed": self.config.max_rollbacks_per_day,
+                    "action": "HALT_TRADING",
                 },
                 severity="critical",
             ))
+            # Signal to upstream that trading should be halted, not just skipped
+            self._trading_halted = True
             return False
 
         return True

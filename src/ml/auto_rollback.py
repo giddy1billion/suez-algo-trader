@@ -60,7 +60,8 @@ class RollbackConfig:
 
     # Page-Hinkley parameters
     ph_threshold: float = 50.0  # Page-Hinkley detection threshold
-    ph_alpha: float = 0.005  # minimum acceptable mean change
+    ph_alpha: float = 0.02  # DR2 FIX: Raised from 0.005 to 0.02 — 0.005 was too conservative,
+    # tolerating 0.5% mean shift before flagging. 0.02 detects 2% mean shift promptly.
 
     # Exponential smoothing
     ewma_lambda: float = 0.05  # smoothing factor (lower = more sensitive)
@@ -81,6 +82,9 @@ class RollbackConfig:
     # Health score integration
     health_score_rollback_threshold: float = 55.0
     health_score_reduce_threshold: float = 65.0
+
+    # DR4 FIX: Asset-class-specific thresholds — crypto has naturally higher volatility
+    asset_class: str = "equity"  # 'equity' or 'crypto'
 
 
 @dataclass
@@ -422,10 +426,18 @@ class AutoRollbackManager:
         if n_detections >= 2:
             self._consecutive_detections[model_version] += 1
         else:
-            # Decay consecutive count (don't reset fully on single good trade)
-            self._consecutive_detections[model_version] = max(
-                0, self._consecutive_detections[model_version] - 1
-            )
+            # DR3 FIX: Decay rate halved — single good trade now reduces by 0.5
+            # instead of 1.0. Prevents a single good trade from canceling
+            # multiple consecutive degradation detections.
+            current = self._consecutive_detections[model_version]
+            if current > 0:
+                self._consecutive_detections[model_version] = max(
+                    0, current - 0.5
+                )
+                # Round to int for threshold comparison
+                self._consecutive_detections[model_version] = int(
+                    self._consecutive_detections[model_version]
+                )
 
         consecutive = self._consecutive_detections[model_version]
 

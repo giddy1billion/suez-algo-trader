@@ -74,7 +74,21 @@ class ModelPerformance:
         std_ret = np.std(returns, ddof=1)
         if std_ret == 0:
             return 0.0
-        return float(mean_ret / std_ret * np.sqrt(252))
+        # Use trade-frequency-based annualization instead of hardcoded √252
+        # This avoids crypto underestimation (crypto should use √365)
+        n_trades = len(returns)
+        if n_trades >= 2 and self.trades:
+            # Estimate trades per year from observation window
+            first_ts = self.trades[0].get("timestamp", 0)
+            last_ts = self.trades[-1].get("timestamp", 0)
+            if first_ts and last_ts and last_ts > first_ts:
+                days_observed = max((last_ts - first_ts) / 86400.0, 1.0)
+                trades_per_year = n_trades / days_observed * 365.0
+            else:
+                trades_per_year = 252.0  # fallback
+        else:
+            trades_per_year = 252.0
+        return float(mean_ret / std_ret * np.sqrt(trades_per_year))
 
     def to_dict(self) -> dict:
         return {
@@ -168,7 +182,7 @@ class ABTestManager:
         predictor=None,
         event_bus=None,
         significance_threshold: float = 0.05,
-        min_trades_default: int = 30,
+        min_trades_default: int = 50,
         max_duration_hours_default: float = 168.0,  # 1 week
         promotion_engine=None,
     ):

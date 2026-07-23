@@ -73,8 +73,8 @@ class HyperparameterTuner:
         self,
         feature_data: dict[str, pd.DataFrame],
         asset_class: Optional[str] = None,
-        n_trials: int = 50,
-        n_splits: int = 3,
+        n_trials: int = 100,
+        n_splits: int = 5,
         random_seed: int = 42,
     ) -> dict[str, Any]:
         """
@@ -83,8 +83,10 @@ class HyperparameterTuner:
         Args:
             feature_data: Dict of symbol -> DataFrame with features and target.
             asset_class: 'equity' or 'crypto'. Auto-detected if None.
-            n_trials: Number of Optuna trials.
-            n_splits: Number of TimeSeriesSplit folds for evaluation.
+            n_trials: Number of Optuna trials (HT5: increased from 50 to 100
+                      for better parameter-space coverage with 9 dimensions).
+            n_splits: Number of TimeSeriesSplit folds for evaluation
+                      (HT5: increased from 3 to 5 for more reliable CV).
             random_seed: Random seed for reproducibility.
 
         Returns:
@@ -113,14 +115,29 @@ class HyperparameterTuner:
             scores = []
 
             for train_idx, val_idx in tscv.split(X):
-                # Apply embargo
-                embargo = 5
+                # HT1 FIX: Embargo must be ≥2× forward_bars to prevent label leakage
+                # With forward_bars=5, embargo=10 ensures no overlap between
+                # training targets and validation features
+                embargo = max(10, 2 * 5)  # 2× forward_bars (5)
                 val_idx = val_idx[embargo:]
-                if len(val_idx) < 20:
+                # HT4 FIX: Increase minimum val fold size from 20 to 50
+                # 20 samples is extremely noise-prone; 50 gives ~3× more reliable estimates
+                if len(val_idx) < 50:
                     continue
 
                 X_train, X_val = X[train_idx], X[val_idx]
                 y_train, y_val = y[train_idx], y[val_idx]
+
+                # HT2 FIX: Use a separate held-out slice from TRAINING data for
+                # early stopping, NOT the validation fold. This prevents the model
+                # from directly incorporating validation signal during training.
+                es_split = int(len(X_train) * 0.90)
+                X_train_inner = X_train[:es_split]
+                y_train_inner = y_train[:es_split]
+                # Apply embargo between inner train and early-stopping eval set
+                es_start = es_split + embargo
+                X_es = X_train[es_start:] if es_start < len(X_train) else X_train[es_split:]
+                y_es = y_train[es_start:] if es_start < len(X_train) else y_train[es_split:]
 
                 model = XGBClassifier(
                     **params,
@@ -131,10 +148,11 @@ class HyperparameterTuner:
                     early_stopping_rounds=30,
                 )
                 model.fit(
-                    X_train, y_train,
-                    eval_set=[(X_val, y_val)],
+                    X_train_inner, y_train_inner,
+                    eval_set=[(X_es, y_es)],  # HT2: early stopping on HELD-OUT from train
                     verbose=False,
                 )
+                # HT2/HT3: Score on VALIDATION fold (never seen during training or ES)
                 score = accuracy_score(y_val, model.predict(X_val))
                 scores.append(score)
 

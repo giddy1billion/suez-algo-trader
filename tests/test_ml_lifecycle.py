@@ -246,7 +246,9 @@ class TestModelPromotionGate:
                 "sharpe": 0.8,
                 "sharpe_ratio": 0.8,
                 "max_drawdown": 0.10,
-                "n_trades": 50,
+                "n_trades": 250,
+                "precision": 0.60,
+                "expectancy": 0.005,
             },
             "hyperparameters": {"n_estimators": 200, "max_depth": 6},
             "seed": 42,
@@ -266,8 +268,8 @@ class TestModelPromotionGate:
             metrics=defaults["metrics"],
             hyperparameters=defaults["hyperparameters"],
             seed=defaults["seed"],
-            walk_forward_results={"sharpe": 0.5, "total_return": 0.1},
-            monte_carlo_results={"probability_of_profit": 0.65, "median_return": 0.05, "p5_return": -0.02},
+            walk_forward_results={"sharpe": 0.8, "total_return": 0.1},
+            monte_carlo_results={"probability_of_profit": 0.75, "median_return": 0.05, "p5_return": -0.02},
         )
 
     def test_model_status_enum(self):
@@ -298,7 +300,9 @@ class TestModelPromotionGate:
             "sharpe": 0.8,
             "sharpe_ratio": 0.8,
             "max_drawdown": 0.10,
-            "n_trades": 50,
+            "n_trades": 250,
+            "precision": 0.60,
+            "expectancy": 0.005,
         })
         is_valid, issues = governance.validate_for_deployment("v002")
         assert is_valid is False
@@ -310,7 +314,9 @@ class TestModelPromotionGate:
             "sharpe": 0.1,
             "sharpe_ratio": 0.1,
             "max_drawdown": 0.10,
-            "n_trades": 50,
+            "n_trades": 250,
+            "precision": 0.60,
+            "expectancy": 0.005,
         })
         is_valid, issues = governance.validate_for_deployment("v003")
         assert is_valid is False
@@ -322,7 +328,9 @@ class TestModelPromotionGate:
             "sharpe": 0.8,
             "sharpe_ratio": 0.8,
             "max_drawdown": 0.30,
-            "n_trades": 50,
+            "n_trades": 250,
+            "precision": 0.60,
+            "expectancy": 0.005,
         })
         is_valid, issues = governance.validate_for_deployment("v004")
         assert is_valid is False
@@ -335,6 +343,8 @@ class TestModelPromotionGate:
             "sharpe_ratio": 0.8,
             "max_drawdown": 0.10,
             "n_trades": 10,
+            "precision": 0.60,
+            "expectancy": 0.005,
         })
         is_valid, issues = governance.validate_for_deployment("v005")
         assert is_valid is False
@@ -527,12 +537,14 @@ class TestSelfHealing:
             metrics={
                 "cv_accuracy": 0.65,
                 "sharpe": 1.5,
-                "n_trades": 100,
+                "n_trades": 250,
                 "max_drawdown": 0.05,
+                "precision": 0.60,
+                "expectancy": 0.005,
             },
             hyperparameters={"n_estimators": 200},
             walk_forward_results={"sharpe": 1.0},
-            monte_carlo_results={"probability_of_profit": 0.70},
+            monte_carlo_results={"probability_of_profit": 0.75},
         )
         governance.deploy("v001", reason="test")
 

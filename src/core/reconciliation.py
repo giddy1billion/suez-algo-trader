@@ -207,7 +207,8 @@ class PortfolioReconciler:
         Attempt automatic fixes for safe discrepancies.
 
         Fixes MISSING_INTERNAL (creates lifecycle for broker position).
-        Fixes MISSING_BROKER (closes local position that no longer exists at broker).
+        MISSING_BROKER discrepancies are NOT auto-fixed — they require
+        manual operator intervention.
 
         P2-07: Each fix is wrapped individually so one failure doesn't abort the rest.
         P2-18: Fixes are idempotent — the same symbol won't be fixed twice within cooldown.
@@ -217,6 +218,10 @@ class PortfolioReconciler:
 
         for disc in report.discrepancies:
             symbol = disc.symbol
+
+            # MISSING_BROKER is never auto-fixed; operator must decide
+            if disc.type == MISSING_BROKER:
+                continue
 
             # P2-18: Idempotency check — skip if recently fixed
             fix_key = f"{disc.type}:{symbol}"
@@ -233,10 +238,7 @@ class PortfolioReconciler:
 
             # P2-07: Each fix action in its own try/except
             try:
-                if disc.type == MISSING_BROKER:
-                    self._fix_missing_broker(disc, fixes)
-                    self._recent_fixes[fix_key] = now
-                elif disc.type == MISSING_INTERNAL:
+                if disc.type == MISSING_INTERNAL:
                     self._fix_missing_internal(disc, fixes)
                     self._recent_fixes[fix_key] = now
                 else:

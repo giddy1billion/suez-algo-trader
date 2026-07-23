@@ -93,6 +93,7 @@ def engineer_features(
     include_target: bool = False,
     forward_bars: int = 5,
     threshold: float = 0.005,
+    asset_class: str = "equity",
 ) -> pd.DataFrame:
     """
     Full feature engineering pipeline — 120+ features, institutional quality.
@@ -106,6 +107,8 @@ def engineer_features(
         include_target: If True, appends future_return and target columns.
         forward_bars: Lookahead bars for target computation.
         threshold: Return threshold for classification target.
+        asset_class: 'equity' or 'crypto' — controls annualization, time features,
+                     and volume normalization.
     """
     # Input validation
     if df is None or len(df) == 0:
@@ -342,22 +345,29 @@ def engineer_features(
 
     # ======================================================================
     # 5. VOLUME / ORDER FLOW FEATURES (16 features)
+    # F5 FIX: All volume features are expressed as ratios or z-scores
+    # relative to the asset's own history, making them comparable across
+    # assets/exchanges regardless of absolute volume scale (10,000× variance).
     # ======================================================================
 
     vol_ma_20 = volume.rolling(20, min_periods=10).mean()
+    vol_std_20 = volume.rolling(20, min_periods=10).std()
     df['vol_ma_20'] = vol_ma_20
 
-    # Volume spike / trend (backward compatible)
+    # Volume spike / trend (backward compatible — already ratio-based)
     df['vol_spike'] = _safe_div(volume, vol_ma_20)
     df['vol_trend'] = _safe_div(
         volume.rolling(5, min_periods=5).mean(),
         volume.rolling(20, min_periods=10).mean()
     )
 
+    # Volume z-score: normalized deviation from recent mean (cross-asset comparable)
+    df['vol_zscore'] = _safe_div(volume - vol_ma_20, vol_std_20)
+
     # Volume ratio
     df['volume_ratio_10'] = _safe_div(volume, volume.rolling(10, min_periods=10).mean())
 
-    # Dollar volume
+    # Dollar volume (normalized as ratio — not raw)
     df['dollar_volume'] = close * volume
     df['dollar_volume_ratio'] = _safe_div(
         df['dollar_volume'],
@@ -369,12 +379,16 @@ def engineer_features(
     df['volume_roc_10'] = _safe_div(volume - volume.shift(10), volume.shift(10))
 
     # OBV and OBV slope
-    obv = (np.sign(ret_1).fillna(0) * volume).cumsum()
+    # F2 FIX: Use rolling-window cumsum (bounded) instead of unbounded cumsum
+    # This prevents numerical instability and scale mismatch in trending markets
+    obv_raw = (np.sign(ret_1).fillna(0) * volume)
+    obv = obv_raw.rolling(50, min_periods=10).sum()  # bounded rolling OBV
     df['obv_slope_10'] = _safe_div(obv - obv.shift(10), obv.rolling(10, min_periods=10).mean().abs())
 
     # Accumulation/Distribution Line
     clv = _safe_div((close - low) - (high - close), high - low)
-    ad = (clv * volume).cumsum()
+    ad_raw = clv * volume
+    ad = ad_raw.rolling(50, min_periods=10).sum()  # bounded rolling AD
     df['ad_slope_10'] = _safe_div(ad - ad.shift(10), ad.rolling(10, min_periods=10).mean().abs())
 
     # Money Flow Index (14 period)
@@ -392,7 +406,9 @@ def engineer_features(
     df['force_index_norm'] = _safe_div(df['force_index_13'], vol_ma_20)
 
     # Volume-price trend
-    vpt = (ret_1 * volume).cumsum()
+    # F2 FIX: Use rolling-window VPT instead of unbounded cumsum
+    vpt_raw = ret_1 * volume
+    vpt = vpt_raw.rolling(50, min_periods=10).sum()  # bounded rolling VPT
     df['vpt_slope_10'] = _safe_div(vpt - vpt.shift(10), vpt.rolling(10, min_periods=10).mean().abs())
 
     # Up volume vs down volume ratio (10 bar)
@@ -453,8 +469,18 @@ def engineer_features(
         df['quarter'] = ((month - 1) // 3).astype(int)
 
         # First/last hour flags (for intraday data)
-        df['is_first_hour'] = (hour == df.index[0].hour).astype(int) if len(df) > 0 else 0
-        df['is_last_hour'] = (hour == 15).astype(int)  # typical market close hour
+        # F3 FIX: Asset-class-aware session flags; crypto runs 24/7 so these
+        # are replaced with cyclical session-quadrant features
+        if asset_class == "crypto":
+            # Crypto: 24/7 market — use quadrant-of-day instead of hardcoded hours
+            # Quadrant 0-3 maps to 6-hour blocks (captures Asian/European/US/late sessions)
+            df['session_quadrant'] = (hour // 6).astype(int)
+            df['is_first_hour'] = 0  # not meaningful for 24/7
+            df['is_last_hour'] = 0   # not meaningful for 24/7
+        else:
+            df['is_first_hour'] = ((hour == 9) | (hour == 10)).astype(int)  # first 1-2 hrs after open
+            df['is_last_hour'] = (hour == 15).astype(int)  # typical market close hour
+            df['session_quadrant'] = 0  # not used for equities
 
     # ======================================================================
     # 8. REGIME FEATURES (12 features)
@@ -519,13 +545,15 @@ def engineer_features(
     df['price_pctrank_100'] = _rolling_rank(close, 100)
 
     # Rolling Sharpe (20 bar, annualized approx)
+    # F1 FIX: Use asset-class-aware annualization (√252 equity, √365 crypto)
+    _annualization_days = 365 if asset_class == "crypto" else 252
     mean_ret_20 = ret_1.rolling(20, min_periods=20).mean()
-    df['sharpe_20'] = _safe_div(mean_ret_20, df['vol_20']) * np.sqrt(252)
+    df['sharpe_20'] = _safe_div(mean_ret_20, df['vol_20']) * np.sqrt(_annualization_days)
 
     # Rolling Sortino (20 bar)
     downside_ret = ret_1.where(ret_1 < 0, 0)
     downside_std = downside_ret.rolling(20, min_periods=20).std()
-    df['sortino_20'] = _safe_div(mean_ret_20, downside_std) * np.sqrt(252)
+    df['sortino_20'] = _safe_div(mean_ret_20, downside_std) * np.sqrt(_annualization_days)
 
     # Max return in window
     df['max_ret_10'] = ret_1.rolling(10, min_periods=5).max()

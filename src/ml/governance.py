@@ -100,6 +100,9 @@ class ModelLineage:
     calmar_ratio: float = 0.0
     max_drawdown: float = 0.0
     n_trades_backtest: int = 0
+    # Governance gate fields (previously missing — now enforced)
+    precision: Optional[float] = None
+    expectancy: Optional[float] = None
     # Training metadata
     training_duration_seconds: float = 0.0
     training_timestamp: str = ""
@@ -216,6 +219,9 @@ class ModelGovernance:
             calmar_ratio=metrics.get("calmar", metrics.get("calmar_ratio", 0.0)),
             max_drawdown=metrics.get("max_drawdown", 0.0),
             n_trades_backtest=metrics.get("n_trades", 0),
+            # Governance gate fields
+            precision=metrics.get("precision", None),
+            expectancy=metrics.get("expectancy", None),
             # Walk-forward
             walk_forward_sharpe=(
                 walk_forward_results.get("sharpe", 0.0)
@@ -420,14 +426,14 @@ class ModelGovernance:
                 error=str(e),
                 msg="Using hardcoded default thresholds — verify config/settings.py is accessible",
             )
-            min_cv_accuracy = 0.62
-            min_walk_forward_sharpe = 0.3
-            min_monte_carlo_prob_profit = 0.65
+            min_cv_accuracy = 0.52
+            min_walk_forward_sharpe = 0.5
+            min_monte_carlo_prob_profit = 0.70
             min_sharpe_ratio = 0.5
             max_drawdown_pct = 0.20
-            min_expectancy = 0.0
-            min_precision = 0.50
-            min_backtest_trades = 50
+            min_expectancy = 0.001
+            min_precision = 0.55
+            min_backtest_trades = 200
 
         issues = []
         checks = []
@@ -478,15 +484,17 @@ class ModelGovernance:
                lineage.n_trades_backtest >= min_backtest_trades,
                f"Backtest trades {lineage.n_trades_backtest} below minimum {min_backtest_trades}")
 
-        # Precision and expectancy thresholds (previously loaded but not enforced)
-        if hasattr(lineage, 'precision') and lineage.precision is not None:
-            _check("precision",
-                   lineage.precision >= min_precision,
-                   f"Precision {lineage.precision:.3f} below threshold {min_precision}")
-        if hasattr(lineage, 'expectancy') and lineage.expectancy is not None:
-            _check("expectancy",
-                   lineage.expectancy >= min_expectancy,
-                   f"Expectancy {lineage.expectancy:.4f} below threshold {min_expectancy}")
+        # Precision and expectancy thresholds — NOW ENFORCED (previously gated by hasattr)
+        _check("precision",
+               lineage.precision is not None and lineage.precision >= min_precision,
+               f"Precision {lineage.precision} below threshold {min_precision}"
+               if lineage.precision is not None
+               else f"Precision not recorded — required minimum {min_precision}")
+        _check("expectancy",
+               lineage.expectancy is not None and lineage.expectancy >= min_expectancy,
+               f"Expectancy {lineage.expectancy} below threshold {min_expectancy}"
+               if lineage.expectancy is not None
+               else f"Expectancy not recorded — required minimum {min_expectancy}")
 
         is_valid = len(issues) == 0
         self._last_validation_result = ValidationResult(

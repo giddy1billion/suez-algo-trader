@@ -172,10 +172,10 @@ class HealthMonitor:
             if ch.status != "degraded":
                 ch.status = "degraded"
         else:
-            # P1-13: Recover from "down"/"degraded" when heartbeat resumes
-            if ch.status in ("down", "degraded"):
+            # P1-13: Recover from "down"/"degraded" when heartbeat resumes,
+            # but only if no errors are outstanding.
+            if ch.error_count == 0 and ch.status in ("down", "degraded"):
                 ch.status = "healthy"
-                ch.error_count = 0
 
     def set_status(self, component: str, status: str):
         """Manually set component status (ok, warning, error)."""

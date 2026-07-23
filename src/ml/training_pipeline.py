@@ -367,11 +367,17 @@ class TrainingPipeline:
         logger.info("training_pipeline.step", step="engineer_features")
 
         from src.ml.features import engineer_features
+        from src.ml.hyperparameter_tuning import classify_asset_class
+
+        # Detect asset class for crypto-vs-equity-aware processing
+        asset_class = classify_asset_class(symbols)
+        logger.info("training_pipeline.asset_class_detected", asset_class=asset_class)
+
         feature_data = {}
         for symbol, df in data.items():
             self._raise_if_stopping()
             try:
-                featured_df = engineer_features(df, include_target=False)
+                featured_df = engineer_features(df, include_target=False, asset_class=asset_class)
                 if len(featured_df) >= self._min_samples:
                     feature_data[symbol] = featured_df
                 else:
@@ -440,14 +446,21 @@ class TrainingPipeline:
         logger.info("training_pipeline.step", step="validate", version=version)
 
         # Run out-of-sample backtest on HELD-OUT data the model never trained on
-        backtest_results = self._backtest_model_oos(model, feature_cols, X_holdout, y_holdout, close_holdout)
+        backtest_results = self._backtest_model_oos(
+            model, feature_cols, X_holdout, y_holdout, close_holdout,
+            asset_class=asset_class,
+        )
         # Run genuine walk-forward validation (expanding-window refit + predict)
-        walk_forward_results = self._walk_forward_validation(feature_data, feature_cols)
+        walk_forward_results = self._walk_forward_validation(
+            feature_data, feature_cols, asset_class=asset_class,
+        )
         metrics.update({
             "sharpe": backtest_results.get("sharpe", 0.0),
             "sharpe_ratio": backtest_results.get("sharpe", 0.0),
             "n_trades": backtest_results.get("n_trades", 0),
             "max_drawdown": backtest_results.get("max_drawdown", 0.0),
+            "precision": backtest_results.get("precision", 0.0),
+            "expectancy": backtest_results.get("expectancy", 0.0),
         })
 
         training_duration = time.perf_counter() - train_start
@@ -830,11 +843,22 @@ class TrainingPipeline:
         )
 
         for train_idx, val_idx in tscv.split(X_train_all):
-            # Adaptive embargo: min(10% of val fold, 50 bars) — avoids destroying
-            # early folds while still preventing autocorrelation leakage
-            embargo_bars = min(max(len(val_idx) // 10, 5), 50)
+            # CV3 FIX: Adaptive embargo — minimum 2× forward_bars (10 bars),
+            # scales up to min(20% of val fold, 50 bars). Prevents too-small
+            # embargo when val fold is small (e.g., 30 samples → embargo was 3).
+            embargo_bars = min(max(len(val_idx) // 5, 10), 50)
             val_idx = val_idx[embargo_bars:]
-            if len(val_idx) < 20:
+            # CV5 FIX: Increase minimum from 20 to 50 for more reliable fold estimates
+            if len(val_idx) < 50:
+                continue
+
+            # CV4 FIX: Check class distribution in validation fold — skip if
+            # any class is missing (would give unreliable accuracy estimates)
+            y_val_fold = y_train_all[val_idx]
+            n_classes_in_val = len(np.unique(y_val_fold))
+            if n_classes_in_val < 2:
+                logger.debug("training_pipeline.cv_fold_skipped_low_class_diversity",
+                             n_classes=n_classes_in_val, val_size=len(val_idx))
                 continue
 
             X_train, X_val = X_train_all[train_idx], X_train_all[val_idx]
@@ -937,6 +961,7 @@ class TrainingPipeline:
         close_holdout: Optional[np.ndarray] = None,
         transaction_cost_bps: float = 10.0,
         slippage_bps: float = 5.0,
+        asset_class: str = "equity",
     ) -> dict:
         """
         Run out-of-sample backtest on held-out data the model NEVER trained on.
@@ -953,13 +978,19 @@ class TrainingPipeline:
             close_holdout: Close price array aligned with X_holdout (optional).
             transaction_cost_bps: Round-trip transaction cost in basis points.
             slippage_bps: Estimated slippage per side in basis points.
+            asset_class: 'equity' or 'crypto' — controls annualization and slippage.
 
         Returns:
-            Dict with sharpe, max_drawdown, n_trades, monte_carlo results.
+            Dict with sharpe, max_drawdown, n_trades, monte_carlo results, precision, expectancy.
         """
         from backtesting.monte_carlo import monte_carlo_simulation
 
         hold_bars = 5  # Holding period per trade
+
+        # Asset-specific slippage: crypto has 10-50 bps vs equity 5-10 bps
+        if asset_class == "crypto":
+            slippage_bps = max(slippage_bps, 15.0)  # Minimum 15 bps for crypto
+
         cost_per_trade = (transaction_cost_bps + 2 * slippage_bps) / 10_000.0
 
         # Handle NaN in holdout features
@@ -1025,8 +1056,10 @@ class TrainingPipeline:
         std_ret = np.std(trade_returns, ddof=1) if len(trade_returns) > 1 else 1.0
 
         # Correct annualization: each trade spans hold_bars periods.
-        # With non-overlapping trades, there are (252 / hold_bars) trades per year.
-        trades_per_year = 252.0 / hold_bars
+        # With non-overlapping trades, there are (trading_days / hold_bars) trades per year.
+        # Asset-class aware: crypto trades 365 days, equities 252
+        trading_days = 365.0 if asset_class == "crypto" else 252.0
+        trades_per_year = trading_days / hold_bars
         sharpe = float(mean_ret / std_ret * np.sqrt(trades_per_year)) if std_ret > 0 else 0.0
 
         # Max drawdown from sequential non-overlapping trade returns
@@ -1034,6 +1067,14 @@ class TrainingPipeline:
         peak = np.maximum.accumulate(equity)
         drawdowns = (equity - peak) / np.where(peak > 0, peak, 1.0)
         max_drawdown = float(abs(np.min(drawdowns))) if len(drawdowns) > 0 else 0.0
+
+        # Compute precision (fraction of directional predictions that were correct)
+        decoded_trades = [t for t in all_trades if t["signal"] != 0]
+        correct_direction = sum(1 for t in decoded_trades if t["return"] > 0)
+        precision = float(correct_direction / len(decoded_trades)) if decoded_trades else 0.0
+
+        # Compute expectancy (average P&L per trade)
+        expectancy = float(mean_ret)
 
         # Monte Carlo simulation on independent trades
         mc_results = {"probability_of_profit": 0.0, "median_return": 0.0, "p5_return": 0.0}
@@ -1065,6 +1106,8 @@ class TrainingPipeline:
             "max_drawdown": max_drawdown,
             "n_trades": n_trades,
             "holdout_accuracy": holdout_accuracy,
+            "precision": precision,
+            "expectancy": expectancy,
             "monte_carlo": mc_results,
         }
 
@@ -1073,6 +1116,7 @@ class TrainingPipeline:
         feature_data: dict[str, pd.DataFrame],
         feature_cols: list[str],
         n_splits: int = 3,
+        asset_class: str = "equity",
     ) -> dict:
         """
         Genuine expanding-window walk-forward validation.
@@ -1237,7 +1281,8 @@ class TrainingPipeline:
             wf_returns = np.array([t["return"] for t in all_wf_trades])
             wf_mean = np.mean(wf_returns)
             wf_std = np.std(wf_returns, ddof=1) if len(wf_returns) > 1 else 1.0
-            trades_per_year = 252.0 / hold_bars
+            trading_days = 365.0 if asset_class == "crypto" else 252.0
+            trades_per_year = trading_days / hold_bars
             wf_sharpe = float(wf_mean / wf_std * np.sqrt(trades_per_year)) if wf_std > 0 else 0.0
             wf_total_return = float(np.prod(1.0 + wf_returns) - 1.0)
 
